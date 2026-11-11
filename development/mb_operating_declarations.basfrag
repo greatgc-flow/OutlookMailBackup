@@ -1,5 +1,6 @@
-' Operating state is separate from mail files. Old SafeV2 root binding is retained.
-Private Const MBS_DATA_LEAF As String = "_MailBackup_Data"
+' Versionless names for new roots; prior absolute SafeV2 bindings stay in place.
+Private Const MBS_DATA_LEAF As String = "State"
+Private Const MBS_DATA_LEAF_LEGACY As String = "_MailBackup_Data"
 Private Const MB_OWNER_PREVIOUS As String = "OutlookMailBackup.SafeV3.3"
 Private Const MB_OWNER_LEGACY As String = "OutlookMailBackup.SafeV2"
 Private gStateRoot As String

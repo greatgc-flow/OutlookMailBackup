@@ -24,7 +24,7 @@ Public Sub MB_ChooseLegacyFolder()
     legacy = MBH_NormalizePath(legacy)
     If Not gFSO.FolderExists(legacy) Then Err.Raise MB_ERR + 260, , "The legacy folder is unavailable."
     If MB_PathWithin(legacy, managed) Then
-        Err.Raise MB_ERR + 261, , "Select the original archive, outside the managed SafeV2 tree."
+        Err.Raise MB_ERR + 261, , "Select the original archive, outside the managed backup tree."
     End If
     Set folder = gFSO.GetFolder(legacy)
     If (CLng(folder.Attributes) And 1024) <> 0 Then

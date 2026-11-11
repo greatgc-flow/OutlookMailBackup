@@ -1,5 +1,5 @@
 ' ============================================================================
-' Outlook Mail Backup 3.4.0 - one standard module, Windows classic Outlook
+' Outlook Mail Backup 3.5.0 - one standard module, Windows classic Outlook
 ' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
 '
 ' START -- ONE VISIBLE MACRO
@@ -12,20 +12,27 @@
 ' 4. Select a base/account directory only when no usable remembered path exists.
 '    Setup, safe recovery, year/month maintenance, legacy linking and adaptive
 '    backup are automatic. There is no separate sequence of public commands.
-' 5. The same macro while busy requests cancellation. STOP.txt in SafeV2 also
-'    cancels. Wait for cleanup; avoid VBA End/Reset while a run owns OS handles.
+' 5. The same macro while busy requests cancellation. STOP.txt in MailBackup
+'    (the selected managed root) also cancels. Wait for handle cleanup.
 '
-' DIRECTORIES -- KEEP THE ORIGINAL SafeV2 ABSOLUTE ROOT
-'   <selected base>\SafeV2\_MailBackup_Data\
+' DIRECTORIES -- NEW ROOTS USE VERSIONLESS ROLE NAMES
+'   <selected base>\MailBackup\State\
 '       journal.tsv / moves.tsv / account-roots.tsv / stages.tsv
 '       coverage_*.tsv / source_audit_*.tsv / archive_audit_*.tsv
 '       baseline_*.tsv / setup_*.tsv / reconcile_*.tsv / runs\<run>\
 '   <selected account>\yyyy\mm\<message>.msg
-'   <selected account>\_MailBackup_Recovery\
+'   <selected account>\_Recovery\
 '       recovery-owner.tsv / snapshots\ / chunks\ / stage-intents.tsv
 '       restore-intents.tsv / reconcile_*.tsv / recovery-events.tsv / overlays\
-' _MailBackup_Data is the ACTIVE operating directory. Prior _state TSV files
-' migrate once, with verified copies; _state itself is retained as history.
+' State is the active operating directory; _Recovery holds independent metadata.
+' Existing SafeV2/_MailBackup_Data/_MailBackup_Recovery bindings are read in place.
+' Prior _state TSVs migrate by verified copy; their original history is retained.
+' No user-specific drive or absolute output directory is embedded in this module.
+' New MBS4 journal rows use account-relative file paths. At the I/O boundary,
+' they expand against one exact account-root binding; old MBS2/MBS3 rows remain
+' readable without rewrite. Roots, recovery/move proof and out-of-root bindings
+' still use explicit absolute paths. Relative records do not authorize moving
+' a bound archive by hand or silently changing its ownership/history.
 ' Root-level owner.txt, operating-format.tsv and operating-store.tsv, plus the
 ' account's _mb_account.tsv, retain ownership/binding outside the primary state.
 ' One AUTO managed root belongs to one Outlook StoreID. Another store requires
@@ -110,7 +117,7 @@
 ' Separate attachment extraction defaults OFF; embedded attachments remain in MSG.
 '
 ' LEGACY / RESTORED MAIL COMPATIBILITY
-' Existing verified MSGs are reused without MailItem.SaveAs. MBS2 and MBS3 index
+' Existing verified MSGs are reused without MailItem.SaveAs. MBS2/MBS3/MBS4 index
 ' records remain readable. Original file names and sent-time keys are CANDIDATE
 ' hints only; matched sender/recipients/headers/body/HTML/RTF and supported ordinary
 ' attachment bytes/inline metadata must pass the declared comparison policy.
@@ -136,7 +143,8 @@
 ' when its mail date is older than the legacy cutoff. Equal content reuses an
 ' existing file; ambiguous, missing or corrupt prior proof remains REVIEW.
 ' This is forward reuse of old outputs. Old writers do not understand new state:
-' owner.txt is upgraded to reject known older SafeV2 writers. Do not alternate
+' owner.txt is upgraded to Schema4 before relative rows; older writers reject it.
+' Do not alternate
 ' macro versions; an arbitrary original script cannot be retroactively controlled.
 '
 ' ADAPTIVE COVERAGE / INDEPENDENT AUDITS
@@ -181,13 +189,13 @@
 ' without a useful revision stamp; rotating audits reduce, not eliminate, this risk.
 ' Reparse/device paths and >235-unit paths are refused; account roots <=80 units.
 ' Windows classic Outlook only; new Outlook, Mac and server automation unsupported.
-' Reports: _MailBackup_Data\runs\<run>\summary.txt and checked audit/recovery logs.
+' Reports: MailBackup\State\runs\<run>\summary.txt and checked audit/recovery logs.
 ' Helper/expert procedures are PRIVATE; none needs to be run by the user.
 ' ============================================================================
 
-Private Const MB_VERSION As String = "3.4.0"
-Private Const MB_OWNER As String = "OutlookMailBackup.SafeV3.4"
-Private Const MB_OUTPUT_ROOT As String = "C:\0.GC\-.MailBackup"
+Private Const MB_VERSION As String = "3.5.0"
+Private Const MB_OWNER As String = "OutlookMailBackup.Schema4"
+Private Const MB_OWNER_V34 As String = "OutlookMailBackup.SafeV3.4"
 Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False
 Private Const MB_ATTACHMENT_EXTENSIONS As String = "*"
 ' Alternative: "pdf;doc;docx;xls;xlsx;ppt;pptx;zip;txt;csv"

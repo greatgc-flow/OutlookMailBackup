@@ -6,7 +6,7 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
     Dim fso As Object, stream As Object, base As String, runFolder As String
     Dim testDetail As String, envOK As Boolean, helperOK As Boolean, moveOK As Boolean
     Dim plainOK As Boolean, htmlOK As Boolean, propertyOK As Boolean, localeOK As Boolean
-    Dim recoveryOK As Boolean
+    Dim recoveryOK As Boolean, relativeOK As Boolean
     Dim started As Double, failures As Long, savedCalendar As Long, calendarEntered As Boolean
     Dim n As Long, errorText As String, ownsBusy As Boolean
     reportPath = "": detail = ""
@@ -50,6 +50,16 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
         If Not localeOK Then failures = failures + 1
     Else
         MBT_ReportRow reportPath, "LOCALE_GREGORIAN_UTC", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    If helperOK And Not gCancel Then
+        started = Timer
+        relativeOK = MBX_RelativeSelfTest(MBH_JoinPath(runFolder, "account"), testDetail)
+        If gCancel Then relativeOK = False: testDetail = testDetail & " Cancellation requested."
+        MBT_ReportRow reportPath, "RELATIVE_JOURNAL_CODEC", MBT_PassFail(relativeOK), MBT_Elapsed(started), testDetail
+        If Not relativeOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "RELATIVE_JOURNAL_CODEC", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
     End If
 
     If helperOK And Not gCancel Then
@@ -106,7 +116,7 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
     MBT_ReportRow reportPath, "REAL_ARCHIVE_COMPATIBILITY", "NOT_RUN", 0, "No original mail or archive files were used by these tests."
     MBT_ReportRow reportPath, "SPECIAL_ATTACHMENTS_AND_ALL_MAPI", "NOT_RUN", 0, "Synthetic tests cover ordinary by-value attachments only."
     MBT_ReportRow reportPath, "100000_ITEM_PERFORMANCE", "NOT_RUN", 0, "No large real-account workload was executed."
-    MBT_RunAcceptanceReport = envOK And helperOK And localeOK And propertyOK And moveOK And recoveryOK And plainOK And htmlOK And Not gCancel
+    MBT_RunAcceptanceReport = envOK And helperOK And localeOK And relativeOK And propertyOK And moveOK And recoveryOK And plainOK And htmlOK And Not gCancel
     detail = "Built-in native checks: " & MBT_PassFail(MBT_RunAcceptanceReport) & _
              "; failed checks=" & CStr(failures) & ". Four operational gates remain NOT_RUN."
     MBT_ReportRow reportPath, "RUN_RESULT", MBT_PassFail(MBT_RunAcceptanceReport), 0, detail

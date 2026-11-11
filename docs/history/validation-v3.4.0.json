@@ -1,0 +1,200 @@
+{
+  "scope": "Recorded v3.4.0 release checks. Python models and source checks are not Outlook VBA compilation or runtime verification.",
+  "artifact": {
+    "name": "OutlookMailBackup.bas",
+    "version": "3.4.0",
+    "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
+    "bytes": 666337,
+    "lines": 13274,
+    "public_macros": [
+      "MB_01_RunBackup"
+    ]
+  },
+  "reproduce": {
+    "build": "python tools/build.py --check",
+    "models": "python tools/test.py",
+    "dependencies": "Python 3.10+ standard library"
+  },
+  "new_models": {
+    "settings": {
+      "tests": 43,
+      "result": "PASS",
+      "source": "development/v34_settings_models.py"
+    },
+    "revision": {
+      "tests": 35,
+      "result": "PASS",
+      "source": "development/v34_revision_models.py"
+    },
+    "metrics": {
+      "tests": 27,
+      "result": "PASS",
+      "source": "development/v34_metrics_models.py"
+    },
+    "fidelity": {
+      "tests": 28,
+      "result": "PASS",
+      "source": "development/v34_fidelity_models.py"
+    },
+    "recovery_merge": {
+      "tests": 44,
+      "result": "PASS",
+      "source": "development/v34_recovery_merge_models.py"
+    },
+    "recovery_proof": {
+      "tests": 41,
+      "result": "PASS",
+      "source": "development/v34_recovery_proof_models.py"
+    },
+    "policy_upgrade": {
+      "tests": 25,
+      "result": "PASS",
+      "source": "development/v34_policy_upgrade_models.py"
+    }
+  },
+  "new_models_total": 243,
+  "new_models_passed": 243,
+  "recorded_release_grammar": {
+    "check": "ANTLR grammar over every declaration/procedure unit, plus full-module packaging/linkage.",
+    "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
+    "bytes": 666337,
+    "results": [
+      {
+        "platform": {
+          "vba7": true,
+          "win64": false,
+          "win32": true,
+          "mac": false
+        },
+        "units": 478,
+        "ll_fallbacks": 277,
+        "errors": [],
+        "seconds": 136.048
+      },
+      {
+        "platform": {
+          "vba7": true,
+          "win64": true,
+          "win32": true,
+          "mac": false
+        },
+        "units": 478,
+        "ll_fallbacks": 277,
+        "errors": [],
+        "seconds": 63.775
+      },
+      {
+        "platform": {
+          "vba7": false,
+          "win64": false,
+          "win32": true,
+          "mac": false
+        },
+        "units": 478,
+        "ll_fallbacks": 277,
+        "errors": [],
+        "seconds": 59.163
+      }
+    ],
+    "office_compile": "NOT_RUN"
+  },
+  "recorded_release_static": {
+    "32": {
+      "check": "static symbol linkage and packaging, NOT VBA compile",
+      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
+      "bytes": 666337,
+      "lines": 13274,
+      "platform": "vba7_32",
+      "non_crlf_newlines": 0,
+      "max_line": 326,
+      "max_line_continuations": 18,
+      "excessive_continuations_at": [],
+      "undefined_mb_symbols": [],
+      "undefined_module_globals": [],
+      "duplicate_procedures": [],
+      "public_macros": [
+        "MB_01_RunBackup"
+      ],
+      "standalone_end": false
+    },
+    "64": {
+      "check": "static symbol linkage and packaging, NOT VBA compile",
+      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
+      "bytes": 666337,
+      "lines": 13274,
+      "platform": "vba7_64",
+      "non_crlf_newlines": 0,
+      "max_line": 326,
+      "max_line_continuations": 18,
+      "excessive_continuations_at": [],
+      "undefined_mb_symbols": [],
+      "undefined_module_globals": [],
+      "duplicate_procedures": [],
+      "public_macros": [
+        "MB_01_RunBackup"
+      ],
+      "standalone_end": false
+    },
+    "legacy": {
+      "check": "static symbol linkage and packaging, NOT VBA compile",
+      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
+      "bytes": 666337,
+      "lines": 13274,
+      "platform": "legacy32",
+      "non_crlf_newlines": 0,
+      "max_line": 306,
+      "max_line_continuations": 18,
+      "excessive_continuations_at": [],
+      "undefined_mb_symbols": [],
+      "undefined_module_globals": [],
+      "duplicate_procedures": [],
+      "public_macros": [
+        "MB_01_RunBackup"
+      ],
+      "standalone_end": false
+    }
+  },
+  "grammar_and_static_reproducibility": "These recorded release checks used a separate ANTLR grammar environment. The grammar runtime, generated parser and historical check scripts are not bundled here; tools/test.py only runs the seven Python model/source-contract suites.",
+  "recorded_retained_regressions": {
+    "v33_integrity": 31,
+    "recovery": 18,
+    "v33_audit": 16,
+    "operating": {
+      "passed": 17,
+      "superseded_skipped": 1
+    },
+    "v33_store_binding": 12,
+    "v33_stage_repair": 10,
+    "names": 17,
+    "assertion_suites": {
+      "acceptance": 732,
+      "compatibility": 85,
+      "year_month": 140,
+      "v31_integrity": 18015,
+      "legacy_with_V3_V2_compatibility": 96,
+      "locale": 256,
+      "identity": 61
+    }
+  },
+  "retained_regression_reproducibility": "Historical regression results are recorded for context. Those older suites are not included in this initial repository package and are not counted in the 243 reproducible release tests.",
+  "implemented_native_disposable_checks": "Windows-only, invoked by the single macro before real archive work; includes ancillary-only loss and interrupted overlay resume plus fidelity cases",
+  "not_run": [
+    "Actual Outlook VBA compiler/import",
+    "Outlook/MAPI real archive compatibility",
+    "Win32/HKCU/FSO runtime",
+    "Native disposable selftests in Outlook",
+    "Real100000item end-to-end performance",
+    "Actual power-loss/filesystem hardware durability",
+    "Full arbitrary MAPI fidelity"
+  ],
+  "known_deliberate_review_boundaries": [
+    "Conflicting historical expected bytes",
+    "Unknown checked schemas/orphan semantic references",
+    "Unproven partial stage records",
+    "Divergent or odd-byte move/journal history",
+    "Legacy interrupted restore with unbound preserved proof",
+    "Foreign StoreID and conflicting ownership",
+    "Unmatched old mail under conservative cutoff",
+    "UserProperties equality and unsupported special attachments"
+  ]
+}

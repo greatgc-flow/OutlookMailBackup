@@ -109,18 +109,23 @@ Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
             gScope = folder.FolderPath
         End If
     Else
-        gScope = "Every committed file indexed in SafeV2"
+        gScope = "Every committed file in the selected managed archive"
     End If
     baseRoot = MBP_ResolveBackupRoot(gSelectedBase)
     If Len(baseRoot) = 0 Then
         gCancel = True
         GoTo CleanUp
     End If
+    ' Recheck after selection: the derived root/ancestors may have changed
+    ' since preflight. No link target may be initialized as an owned archive.
+    MBP_NoReparse baseRoot, gFSO
     MBH_EnsureDirectory baseRoot
+    MBP_NoReparse MBH_JoinPath(baseRoot, "backup.lock"), gFSO
     MBH_AcquireRunLock MBH_JoinPath(baseRoot, "backup.lock")
     lockHeld = True
     gRoot = baseRoot
     gBaseRoot = baseRoot
+    MBP_NoReparse baseRoot, gFSO
     MB_CheckOwnership gRoot
     gLegacyRoot = MBP_ResolveLegacyRoot(gSelectedBase, gBaseRoot)
     If gFSO.FileExists(MBH_JoinPath(baseRoot, "STOP.txt")) Then
@@ -439,10 +444,10 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
         value = ts.ReadAll
         ts.Close
         If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
-           value <> MB_OWNER_PREVIOUS & vbCrLf Then
+           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf Then
             Err.Raise MB_ERR + 10, "MB_CheckOwnership", "Output owner marker is invalid: " & p
         End If
-        If value = MB_OWNER_LEGACY & vbCrLf Or value = MB_OWNER_PREVIOUS & vbCrLf Then
+        If value <> MB_OWNER & vbCrLf Then
             ' Preserve the old marker, then reject unsupported downgrade writers.
             If Not gFSO.FileExists(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt")) Then
                 Set ts = gFSO.CreateTextFile(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt"), False, True)
@@ -455,12 +460,12 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
     For Each f In gFSO.GetFolder(rootPath).Files
         If LCase$(f.Name) <> "backup.lock" Then
             Err.Raise MB_ERR + 11, "MB_CheckOwnership", _
-                      "Unowned output folder contains files. Choose a new empty SafeV2 folder."
+                      "Unowned output folder contains files. Choose a new empty managed backup folder."
         End If
     Next f
     For Each subFolder In gFSO.GetFolder(rootPath).SubFolders
         Err.Raise MB_ERR + 12, "MB_CheckOwnership", _
-                  "Unowned output folder contains directories. Choose a new empty SafeV2 folder."
+                  "Unowned output folder contains directories. Choose a new empty managed backup folder."
     Next subFolder
     Set ts = gFSO.CreateTextFile(p, False, True)
     ts.WriteLine MB_OWNER
@@ -618,14 +623,7 @@ End Sub
 Private Sub MB_LoadIndexRow(ByVal line As String, ByVal rowNumber As Long)
     Dim f As Variant, errNo As Long, errText As String
     On Error GoTo Invalid
-    If Left$(line, 6) = "MBS3" & vbTab & "N" Or Left$(line, 6) = "MBS3" & vbTab & "T" Or _
-       Left$(line, 6) = "MBS3" & vbTab & "R" Then
-        f = MB_ReadCheckedLine(line, 17)
-        If CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    Else
-        f = MB_ReadCheckedLine(line, 16)
-        If CStr(f(0)) <> "MBS2" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    End If
+    f = MBR_ParseIndexFields(line)
     If Not MB_IsHexKey(f(2)) Or Not MB_IsHexKey(f(5)) Or Not MB_IsHexKey(f(6)) Then
         Err.Raise MB_ERR + 25, , "Invalid index key/hash."
     End If
@@ -662,12 +660,17 @@ Private Sub MB_RecordCommit(ByVal kind As String, ByVal key As String, ByVal rel
     Dim payload As String, fields As Variant, indexKey As String
     On Error GoTo Failed
     If kind = "N" Or kind = "T" Or kind = "R" Then
-        fields = Array("MBS3", kind, key, relativePath, Format$(bytes, "0"), digest, _
+        fields = Array("MBS4", kind, key, MBX_AccountRelative(relativePath, accountRoot), Format$(bytes, "0"), digest, _
                        q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation, accountRoot)
+    ElseIf kind = "L" Then
+        fields = Array("MBS4", kind, key, MBX_AccountRelative(relativePath, originalName), Format$(bytes, "0"), digest, _
+                       q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), "", validation, originalName)
     Else
         fields = Array("MBS2", kind, key, relativePath, Format$(bytes, "0"), digest, _
                        q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation)
     End If
+    ' Reject an incompatible repeat before it becomes durable journal history.
+    MBR_RejectIndexConflict fields
     payload = MB_EncodeFields(fields)
     MB_OpenJournal
     MB_WriteCheckedLine gJournal, payload

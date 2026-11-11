@@ -189,7 +189,7 @@ Private Function MBY_ValidateAccountRoot(ByVal path As String, ByVal storeId As 
     If Not gFSO.FolderExists(path) Then Err.Raise MB_ERR + 320, , "The account folder is unavailable."
     If MBL_IsFileSystemRoot(path) Then Err.Raise MB_ERR + 321, , "Select an account folder, not a drive/share root."
     If MB_PathWithin(path, MBY_StateRoot()) Then
-        Err.Raise MB_ERR + 322, , "Account folders must be outside the managed SafeV2 state tree."
+        Err.Raise MB_ERR + 322, , "Account folders must be outside the managed backup state tree."
     End If
     MBY_NoReparse path, True
     For Each key In mbyRoots.Keys
@@ -255,8 +255,10 @@ Failed:
 End Sub
 
 Private Sub MBY_CheckRecoveryAccountBinding(ByVal account As String, ByVal storeId As String)
-    Dim path As String, row As Variant
-    path = MBH_JoinPath(MBH_JoinPath(account, MBR_FOLDER), MBR_OWNER_FILE)
+    Dim path As String, row As Variant, recoveryRoot As String
+    recoveryRoot = MBR_ExistingRecoveryPath(account, gFSO)
+    If Len(recoveryRoot) = 0 Then Exit Sub
+    path = MBH_JoinPath(recoveryRoot, MBR_OWNER_FILE)
     If Not gFSO.FileExists(path) Then Exit Sub
     row = MB_ReadCheckedLine(MBP_ReadOneLine(path, gFSO), 5)
     If CStr(row(0)) <> "MBRECOVERY1" Or CStr(row(4)) <> "1" Then _
@@ -269,7 +271,7 @@ End Sub
 
 Private Function MBY_AccountBindingUsable(ByVal path As String, ByVal storeId As String, _
                                           ByRef exactBinding As Boolean) As Boolean
-    Dim recoveryOwner As String
+    Dim recoveryOwner As String, recoveryRoot As String
     On Error GoTo Unusable
     exactBinding = False
     path = MBH_NormalizePath(path)
@@ -278,8 +280,12 @@ Private Function MBY_AccountBindingUsable(ByVal path As String, ByVal storeId As
     MBY_NoReparse path, True
     MBY_CheckMarker path, storeId, False
     MBY_CheckRecoveryAccountBinding path, storeId
-    recoveryOwner = MBH_JoinPath(MBH_JoinPath(path, MBR_FOLDER), MBR_OWNER_FILE)
-    exactBinding = gFSO.FileExists(MBH_JoinPath(path, MBY_ACCOUNT_MARKER)) Or gFSO.FileExists(recoveryOwner)
+    recoveryRoot = MBR_ExistingRecoveryPath(path, gFSO)
+    exactBinding = gFSO.FileExists(MBH_JoinPath(path, MBY_ACCOUNT_MARKER))
+    If Len(recoveryRoot) > 0 Then
+        recoveryOwner = MBH_JoinPath(recoveryRoot, MBR_OWNER_FILE)
+        If gFSO.FileExists(recoveryOwner) Then exactBinding = True
+    End If
     MBY_AccountBindingUsable = True
 Unusable:
 End Function

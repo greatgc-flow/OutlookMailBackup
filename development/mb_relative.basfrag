@@ -1,0 +1,112 @@
+' Account-relative on-disk file references. Runtime paths remain absolute.
+' MBS4 retains one exact account-root binding and stores only the file's path
+' below it. It is NOT permission to relocate an archive or rewrite old proof.
+' Older MBS2/MBS3 rows are read unchanged; only new commits use this format.
+Private Function MBX_AccountPath(ByVal relative As String, ByVal accountRoot As String) As String
+    Dim value As String, part As Variant
+    If Len(relative) = 0 Or Left$(relative, 1) = "\" Or _
+       InStr(relative, "/") > 0 Or InStr(relative, ":") > 0 Then _
+        Err.Raise MB_ERR + 1180, , "An account-relative file path is required."
+    value = MBH_NormalizePath(accountRoot)
+    If MBL_IsFileSystemRoot(value) Then Err.Raise MB_ERR + 1181, , "Account binding cannot be a drive or share root."
+    For Each part In Split(relative, "\")
+        ' JoinPath rejects empty/dot/dot-dot, device names, ADS and unsafe text.
+        value = MBH_JoinPath(value, CStr(part))
+    Next part
+    MBX_AccountPath = MBY_CanonicalFilePath(value, accountRoot)
+End Function
+
+Private Function MBX_RelativeRejected(ByVal relative As String, ByVal accountRoot As String) As Boolean
+    Dim ignored As String
+    On Error GoTo Rejected
+    ignored = MBX_AccountPath(relative, accountRoot)
+    Exit Function
+Rejected:
+    MBX_RelativeRejected = True
+End Function
+
+Private Function MBX_RelativeSelfTest(ByVal boundAccountRoot As String, ByRef detail As String) As Boolean
+    ' Pure codec/path checks under the caller's owned test directory. No MSG,
+    ' directory or metadata file is created, opened, moved or rewritten here.
+    Dim root As String, relative As String, absolute As String, payload As String, line As String
+    Dim row As Variant, expanded As Variant, kind As Variant, unsafe As Variant
+    On Error GoTo Failed
+    detail = ""
+    root = MBH_NormalizePath(boundAccountRoot)
+    relative = "2026\11\" & ChrW$(&HD55C) & ChrW$(&HAE00) & "_%09_" & _
+               ChrW$(&HD83D) & ChrW$(&HDE00) & ".msg"
+    absolute = MBX_AccountPath(relative, root)
+    If MBX_AccountRelative(absolute, root) <> relative Then _
+        Err.Raise MB_ERR + 1184, , "Unicode/percent relative path did not round-trip."
+    For Each kind In Array("N", "T", "R", "L")
+        row = Array("MBS4", CStr(kind), String$(64, "a"), relative, "100", String$(64, "b"), _
+                    String$(64, "c"), "synthetic-store", "synthetic-entry", "synthetic-folder", _
+                    "20261111_010000", "20261110_235959", "subject%09" & vbTab & "text", "0", "", "policy", root)
+        If CStr(kind) = "R" Then row(14) = "M|" & String$(64, "d")
+        payload = MB_EncodeFields(row)
+        line = payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+        row = MBR_ParseIndexFields(line)
+        If LBound(row) <> 0 Or UBound(row) <> 16 Then Err.Raise MB_ERR + 1184, , "Relative wire field count changed."
+        expanded = MBX_ExpandIndexFields(row)
+        If CStr(expanded(3)) <> absolute Then Err.Raise MB_ERR + 1184, , "Expanded path differs from the account binding."
+        If CStr(kind) = "L" Then
+            If UBound(expanded) <> 15 Or CStr(expanded(0)) <> "MBS2" Or CStr(expanded(14)) <> root Then _
+                Err.Raise MB_ERR + 1184, , "Relative legacy expansion changed its 16-field contract."
+        Else
+            If UBound(expanded) <> 16 Or CStr(expanded(0)) <> "MBS3" Or CStr(expanded(16)) <> root Then _
+                Err.Raise MB_ERR + 1184, , "Relative N/T/R expansion changed its 17-field contract."
+        End If
+        If MB_EncodeFields(row) <> payload Then Err.Raise MB_ERR + 1184, , "Expansion modified the checked wire array."
+        If MB_EncodeFields(MBR_ParseIndexFields(line)) <> payload Then _
+            Err.Raise MB_ERR + 1184, , "Relative checked line did not remain readable."
+    Next kind
+    For Each unsafe In Array("", ".", "..", "..\x.msg", "2026\..\x.msg", "2026\.\x.msg", _
+                             "2026/11/x.msg", "2026\\x.msg", "file.msg:stream", root & "\x.msg")
+        If Not MBX_RelativeRejected(CStr(unsafe), root) Then _
+            Err.Raise MB_ERR + 1184, , "Unsafe relative path was accepted: " & CStr(unsafe)
+    Next unsafe
+    detail = "PASS: relative Unicode/percent paths, checked N/T/R/L wire rows, immutable expansion and unsafe-path rejection."
+    MBX_RelativeSelfTest = True
+    Exit Function
+Failed:
+    detail = "FAIL: " & CStr(Err.Number) & " - " & Err.Description
+End Function
+
+Private Function MBX_AccountRelative(ByVal path As String, ByVal accountRoot As String) As String
+    Dim canonical As String, root As String, relative As String
+    root = MBH_NormalizePath(accountRoot)
+    canonical = MBY_CanonicalFilePath(path, root)
+    If StrComp(canonical, root, vbTextCompare) = 0 Or Not MB_PathWithin(canonical, root) Then _
+        Err.Raise MB_ERR + 1181, , "File must be below the bound account root."
+    relative = Mid$(canonical, Len(root) + 2)
+    If StrComp(MBX_AccountPath(relative, root), canonical, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1182, , "Account-relative file path did not round-trip."
+    MBX_AccountRelative = relative
+End Function
+
+Private Function MBX_ExpandIndexFields(ByVal row As Variant) As Variant
+    Dim fields() As Variant, i As Long, kind As String, root As String
+    If CStr(row(0)) <> "MBS4" Then
+        MBX_ExpandIndexFields = row
+        Exit Function
+    End If
+    If LBound(row) <> 0 Or UBound(row) <> 16 Then _
+        Err.Raise MB_ERR + 1183, , "Relative journal row requires exactly 17 fields."
+    kind = CStr(row(1))
+    If kind <> "N" And kind <> "T" And kind <> "R" And kind <> "L" Then _
+        Err.Raise MB_ERR + 1183, , "Unknown relative journal record kind."
+    root = MBH_NormalizePath(CStr(row(16)))
+    ' Copy into a separate array: the checked serialized row remains immutable.
+    If kind = "L" Then ReDim fields(0 To 15) Else ReDim fields(0 To 16)
+    For i = 0 To UBound(fields)
+        fields(i) = row(i)
+    Next i
+    fields(3) = MBX_AccountPath(CStr(row(3)), root)
+    If kind = "L" Then
+        If Len(CStr(row(14))) <> 0 Then Err.Raise MB_ERR + 1183, , "Relative legacy row has a duplicate root binding."
+        fields(0) = "MBS2": fields(14) = root
+    Else
+        fields(0) = "MBS3": fields(16) = root
+    End If
+    MBX_ExpandIndexFields = fields
+End Function

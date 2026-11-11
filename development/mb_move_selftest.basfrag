@@ -31,7 +31,7 @@ Private Function MBT_YearMonthSelfTest(ByRef resultDetail As String) As Boolean
     testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBYM_" & gFSO.GetTempName)
     gFSO.CreateFolder testBase
     owned = True
-    gRoot = MBH_JoinPath(testBase, "state"): gBaseRoot = gRoot
+    gRoot = MBH_JoinPath(testBase, MBP_MANAGED_LEAF): gBaseRoot = gRoot
     account = MBH_JoinPath(testBase, "account")
     MB_EnsureDir gRoot: MB_EnsureDir account
     MB_EnsureDir MBH_JoinPath(gRoot, "_state")
