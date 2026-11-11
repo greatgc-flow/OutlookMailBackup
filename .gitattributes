@@ -1,0 +1,7 @@
+# Keep the importable Outlook VBA artifact byte-for-byte, including CRLF.
+* text=auto eol=lf
+*.bas -text
+*.basfrag text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
