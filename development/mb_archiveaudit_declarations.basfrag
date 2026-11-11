@@ -1,0 +1,20 @@
+' Physical file audit does not require a surviving Outlook source item.
+Private Const MBA_FILE_BUDGET As Long = 500
+Private Const MBA_RETRY_BUDGET As Long = 100
+Private gArchiveAuditEntries As Object
+Private gArchiveAuditIssues As Object
+Private gArchiveAuditCheckedPaths As Object
+Private gArchiveAuditVisited As Object
+Private gArchiveAuditStatePath As String
+Private gArchiveAuditCursor As String
+Private gArchiveAuditStore As String
+Private gArchiveAuditAccount As String
+Private gArchiveAuditChecked As Long
+Private gArchiveAuditPassed As Long
+Private gArchiveAuditFailed As Long
+Private gArchiveAuditPending As Long
+Private gArchiveAuditFilesRead As Long
+Private gArchiveAuditReferenceReview As Long
+Private gArchiveAuditStateIssues As Long
+Private gArchiveAuditTotal As Long
+Private gArchiveAuditCommitted As Boolean

@@ -1,0 +1,10 @@
+from pathlib import Path
+import re,hashlib,json
+PARTS = ['mb_main_declarations.basfrag', 'mb_declarations.basfrag', 'mb_paths_declarations.basfrag', 'mb_legacy_declarations.basfrag', 'mb_reuse_declarations.basfrag', 'mb_yearmonth_declarations.basfrag', 'mb_move_declarations.basfrag', 'mb_layout_integration_declarations.basfrag', 'mb_auto_declarations.basfrag', 'mb_acceptance_declarations.basfrag', 'mb_locale_declarations.basfrag', 'mb_names_declarations.basfrag', 'mb_identity_declarations.basfrag', 'mb_window_declarations.basfrag', 'mb_operating_declarations.basfrag', 'mb_recovery_declarations.basfrag', 'mb_archiveaudit_declarations.basfrag', 'mb_revision_declarations.basfrag', 'mb_metrics_declarations.basfrag', 'mb_fidelity_declarations.basfrag', 'mb_auto.basfrag', 'mb_acceptance.basfrag', 'mb_main.basfrag', 'mb_paths.basfrag', 'mb_legacy.basfrag', 'mb_reuse.basfrag', 'mb_yearmonth.basfrag', 'mb_move.basfrag', 'mb_layout_integration.basfrag', 'mb_move_selftest.basfrag', 'mb_scan.basfrag', 'mb_helpers.basfrag', 'mb_locale.basfrag', 'mb_names.basfrag', 'mb_identity.basfrag', 'mb_window.basfrag', 'mb_operating.basfrag', 'mb_recovery.basfrag', 'mb_archiveaudit.basfrag', 'mb_operating_selftest.basfrag', 'mb_store_binding.basfrag', 'mb_stage_repair.basfrag', 'mb_revision.basfrag', 'mb_metrics.basfrag', 'mb_fidelity.basfrag', 'mb_recovery_merge.basfrag', 'mb_recovery_proofs.basfrag']
+s='Attribute VB_Name = "OutlookMailBackup"\nOption Explicit\n\n'+'\n\n'.join(Path(x).read_text() for x in PARTS)
+s=re.sub(r'^Public (Sub|Function|Const) (MBH_|MBP_|MBQ_)',r'Private \1 \2',s,flags=re.M)
+s=re.sub(r'^Public (Sub|Function) (MB_(?:Stamp|EncodeFields|WriteCheckedLine|SourceKey|LogEvent|ContinueWork))\b',r'Private \1 \2',s,flags=re.M)
+s=re.sub(r'^Public (Sub|Function) (?!MB_01_RunBackup\b)', r'Private \1 ', s, flags=re.M)
+data=s.replace('\r\n','\n').replace('\n','\r\n').encode('ascii')
+Path('OutlookMailBackup.bas').write_bytes(data)
+print(json.dumps({'bytes':len(data),'lines':len(s.splitlines()),'sha256':hashlib.sha256(data).hexdigest()}))

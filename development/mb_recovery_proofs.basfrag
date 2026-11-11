@@ -1,0 +1,412 @@
+' ========== Preserve current non-index proof across snapshot restoration =====
+' The caller guards the immutable pre-restore raw copy against its manifest.
+' A conflict stops recovery with both originals preserved. No archive payload is
+' read, moved or re-baselined here; only checked operating history is combined.
+Private Sub MBR_MergeProofFile(ByVal leaf As String, ByVal priorRaw As String, _
+                               ByVal accountRoot As String, ByVal storeId As String, _
+                               Optional ByVal stageMirrorRaw As String = "")
+    Dim target As String, stage As String, writer As Object, rows As Object, origins As Object, bad As Object
+    Dim context As Variant, key As Variant, payload As String, f As Variant, old As Variant
+    Dim reason As String, kind As String, n As Long, detail As String, i As Long
+    On Error GoTo Failed
+    If Not MBR_IsStateLeaf(leaf) Then Err.Raise MB_ERR + 1160, , "Unsafe recovery proof leaf."
+    leaf = LCase$(leaf)
+    If leaf = "journal.tsv" Then Err.Raise MB_ERR + 1160, , "Index history requires its separate semantic merger."
+    target = MB_StatePath(leaf)
+    kind = leaf
+    If Left$(leaf, 9) = "baseline_" Then kind = "BASELINE"
+    If Left$(leaf, 13) = "source_audit_" Then kind = "SOURCE"
+    If Left$(leaf, 14) = "archive_audit_" Then kind = "ARCHIVE"
+    If kind <> "moves.tsv" And kind <> "stages.tsv" And kind <> "account-roots.tsv" And _
+       kind <> "BASELINE" And kind <> "SOURCE" And kind <> "ARCHIVE" Then
+        If Not MBR_CheckedStateValid(priorRaw, reason) Then
+            MBR_Log "WARNING", "RECOVERY_CURRENT_SETTINGS_RETAINED_RAW", leaf, priorRaw, 0, reason
+            Exit Sub
+        End If
+        kind = "OTHER"
+    End If
+    stage = MBH_NewStagePath(target)
+    Set writer = gFSO.CreateTextFile(stage, True, True)
+    If kind = "moves.tsv" Then
+        MBR_MergeMoveProof target, priorRaw, writer
+    Else
+        Set rows = CreateObject("Scripting.Dictionary"): rows.CompareMode = vbTextCompare
+        Set origins = CreateObject("Scripting.Dictionary"): origins.CompareMode = vbTextCompare
+        Set bad = CreateObject("Scripting.Dictionary"): bad.CompareMode = vbTextCompare
+        If kind <> "OTHER" Then MBR_CollectProof target, leaf, kind, rows, origins, bad, context, 1, accountRoot, storeId
+        MBR_CollectProof priorRaw, leaf, kind, rows, origins, bad, context, 2, accountRoot, storeId
+        If kind = "stages.tsv" Then
+            If Len(stageMirrorRaw) > 0 Then
+                If StrComp(stageMirrorRaw, priorRaw, vbTextCompare) = 0 Then _
+                    Err.Raise MB_ERR + 1161, , "One stage copy cannot claim two independent proof origins."
+                MBR_CollectProof stageMirrorRaw, leaf, kind, rows, origins, bad, context, 4, accountRoot, storeId
+            End If
+            For Each key In bad.Keys
+                f = MBM_Unpack(CStr(bad(key)), 3)
+                If Not rows.Exists(CStr(f(0))) Then Err.Raise MB_ERR + 1161, , "Damaged stage has no independent complete proof."
+                If CStr(rows(CStr(f(0)))) <> CStr(f(1)) Or _
+                   (CLng(origins(CStr(f(0)))) And (7 Xor CLng(f(2)))) = 0 Then _
+                    Err.Raise MB_ERR + 1161, , "Damaged stage payload is not exactly proved by another independent copy."
+            Next key
+        ElseIf kind = "account-roots.tsv" Then
+            MBR_CheckMergedRoots rows, accountRoot, storeId
+        End If
+        If kind = "OTHER" Then
+            ' Ordinary append logs retain their exact record order, independent
+            ' of any Dictionary enumeration behavior.
+            For i = 1 To rows.Count
+                MB_WriteCheckedLine writer, CStr(rows(CStr(i)))
+            Next i
+        Else
+            For Each key In rows.Keys
+                MB_WriteCheckedLine writer, CStr(rows(key))
+            Next key
+        End If
+        If kind = "SOURCE" Then
+            If IsEmpty(context) Then Err.Raise MB_ERR + 1162, , "Source audit has no complete bound context."
+            MB_WriteCheckedLine writer, MB_EncodeFields(Array("MBSOURCEAUDIT1", context(0), context(1), context(2), _
+                "", "CURSOR", "", MBC_UtcStamp(MBC_UtcNow()), gRunId))
+        ElseIf kind = "ARCHIVE" Then
+            If IsEmpty(context) Then Err.Raise MB_ERR + 1162, , "Archive audit has no complete bound context."
+            MB_WriteCheckedLine writer, MB_EncodeFields(Array("MBARCHIVEAUDIT1", context(0), context(1), context(2), _
+                "CURSOR", "", "", "", "", "", "", "", "", "CURSOR", "", MBC_UtcStamp(MBC_UtcNow()), gRunId))
+        End If
+    End If
+    writer.Close: Set writer = Nothing
+    MBM_FlushPath stage
+    MBR_PublishOverlayStage stage, target
+    MBR_Log "INFO", "RECOVERY_CURRENT_PROOF_MERGED", leaf, target, 0, _
+        "Pre-restore proof retained; unresolved audits restart with an empty cursor."
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not writer Is Nothing Then writer.Close
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBR_MergeProofFile", detail
+End Sub
+
+Private Function MBR_NextProofLine(ByVal stream As Object) As String
+    If stream Is Nothing Then Exit Function
+    Do Until stream.AtEndOfStream
+        MBR_NextProofLine = stream.ReadLine
+        If Len(MBR_NextProofLine) > 0 Then Exit Function
+    Loop
+    MBR_NextProofLine = ""
+End Function
+
+Private Sub MBR_MergeMoveProof(ByVal restored As String, ByVal currentRaw As String, ByVal writer As Object)
+    Dim leftStream As Object, rightStream As Object, a As String, b As String, chosen As Variant
+    Dim fa As Variant, fb As Variant, oldOps As Object, oldRedirects As Object, cached As Boolean
+    Dim n As Long, detail As String, rowNumber As Long
+#If VBA7 Then
+    Dim leftGuard As LongPtr, rightGuard As LongPtr
+#Else
+    Dim leftGuard As Long, rightGuard As Long
+#End If
+    On Error GoTo Failed
+    Set oldOps = mbmOps: Set oldRedirects = mbmRedirects: cached = True
+    Set mbmOps = CreateObject("Scripting.Dictionary"): mbmOps.CompareMode = vbBinaryCompare
+    Set mbmRedirects = CreateObject("Scripting.Dictionary"): mbmRedirects.CompareMode = vbTextCompare
+    If gFSO.FileExists(restored) Then
+        MBY_NoReparse restored, True: leftGuard = MBH_GuardFile(restored)
+        If CDbl(gFSO.GetFile(restored).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 1163, , "Restored move history is truncated."
+        Set leftStream = gFSO.OpenTextFile(restored, 1, False, -1)
+    End If
+    MBY_NoReparse currentRaw, True: rightGuard = MBH_GuardFile(currentRaw)
+    If CDbl(gFSO.GetFile(currentRaw).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 1163, , "Current move history is truncated."
+    Set rightStream = gFSO.OpenTextFile(currentRaw, 1, False, -1)
+    Do
+        a = MBR_NextProofLine(leftStream): b = MBR_NextProofLine(rightStream)
+        If Len(a) = 0 And Len(b) = 0 Then Exit Do
+        rowNumber = rowNumber + 1
+        If rowNumber Mod 256 = 0 Then
+            If Not MB_ContinueWork() Then Err.Raise MB_ERR + 1181, , "Recovery proof merge cancelled; original proofs are preserved."
+        End If
+        If Len(a) > 0 Then fa = MB_ReadCheckedLine(a, 11): a = MB_EncodeFields(fa)
+        If Len(b) > 0 Then fb = MB_ReadCheckedLine(b, 11): b = MB_EncodeFields(fb)
+        If Len(a) > 0 And Len(b) > 0 Then
+            If a <> b Then Err.Raise MB_ERR + 1164, , "Move histories diverge; an unordered union would invent transitions."
+        End If
+        If Len(b) > 0 Then chosen = fb Else chosen = fa
+        ' Replay exactly one longest ordered extension under isolated real caches.
+        ' Do not call MBM_LoadMoves/MBM_Recover: merging never performs a move.
+        MBM_ValidateMoveRow chosen
+        MBM_CacheMove chosen
+        MB_WriteCheckedLine writer, MB_EncodeFields(chosen)
+    Loop
+    GoTo Cleanup
+Failed:
+    n = Err.Number: detail = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not leftStream Is Nothing Then leftStream.Close
+    If Not rightStream Is Nothing Then rightStream.Close
+    MBH_CloseGuard leftGuard: MBH_CloseGuard rightGuard
+    If cached Then Set mbmOps = oldOps: Set mbmRedirects = oldRedirects
+    On Error GoTo 0
+    If n <> 0 Then Err.Raise n, "MBR_MergeMoveProof", detail
+    If gFatal Then Err.Raise MB_ERR + 1165, , "Move proof guard cleanup failed."
+End Sub
+
+Private Sub MBR_ProofContext(ByVal f As Variant, ByVal leaf As String, ByVal kind As String, ByRef context As Variant)
+    Dim expectedLeaf As String, account As String, owner As String
+    If StrComp(MBH_NormalizePath(CStr(f(1))), gRoot, vbTextCompare) <> 0 Or Len(CStr(f(2))) = 0 Then _
+        Err.Raise MB_ERR + 1166, , "Proof belongs to another archive or has no store."
+    account = MBH_NormalizePath(CStr(f(3))): owner = CStr(f(2))
+    If MB_PathWithin(account, gRoot) Or MBL_IsFileSystemRoot(account) Then _
+        Err.Raise MB_ERR + 1166, , "Invalid proof account binding."
+    If kind = "BASELINE" Then
+        expectedLeaf = "baseline_" & Left$(MBH_HashText(MB_EncodeFields(Array(gRoot, account, owner))), 32) & ".tsv"
+    Else
+        expectedLeaf = LCase$(kind) & "_audit_" & Left$(MBH_HashText(MB_EncodeFields(Array(owner, LCase$(account)))), 32) & ".tsv"
+    End If
+    If StrComp(leaf, expectedLeaf, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1166, , "Proof filename disagrees with its store/account binding."
+    If IsEmpty(context) Then
+        context = Array(gRoot, owner, account)
+    ElseIf StrComp(CStr(context(1)), owner, vbBinaryCompare) <> 0 Or _
+           StrComp(CStr(context(2)), account, vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 1166, , "Proof copies belong to different account contexts."
+    End If
+End Sub
+
+Private Function MBR_StageProofIdentity(ByVal f As Variant) As String
+    Dim stage As String, final As String, held As String, phase As String, bytes As Double, p As String
+    MBR_StageProofIdentity = MBSR_Identity(f)
+    stage = MBH_NormalizePath(CStr(f(2))): final = MBH_NormalizePath(CStr(f(3)))
+    p = CStr(gFSO.GetParentFolderName(final))
+    final = MBY_CanonicalFilePath(final, p)
+    stage = MBY_CanonicalFilePath(stage, p)
+    If StrComp(CStr(gFSO.GetParentFolderName(stage)), p, vbTextCompare) <> 0 Or _
+       Left$(LCase$(CStr(gFSO.GetFileName(stage))), 4) <> "~mb_" Or _
+       StrComp(stage, final, vbTextCompare) = 0 Or MB_PathWithin(final, gRoot) Then _
+        Err.Raise MB_ERR + 1167, , "Stage proof has unsafe output/stage paths."
+    phase = CStr(f(4)): bytes = MB_ByteCount(CStr(f(6))): held = CStr(f(7))
+    Select Case phase
+        Case "RESERVE", "ABORTED"
+            If Len(CStr(f(5))) > 0 Or bytes <> 0 Or Len(held) > 0 Then _
+                Err.Raise MB_ERR + 1168, , "Unpublished empty phase contains contradictory bytes."
+        Case "PREPARED", "PUBLISHED", "RECOVERED", "CANDIDATE", "HOLD_PREPARE", "HELD"
+            If Not MB_IsHexKey(CStr(f(5))) Then Err.Raise MB_ERR + 1168, , "Stage proof has no expected digest."
+            If phase = "HOLD_PREPARE" Or phase = "HELD" Then
+                held = MBY_CanonicalFilePath(held, p)
+                If StrComp(held, stage & ".held", vbTextCompare) <> 0 Then _
+                    Err.Raise MB_ERR + 1168, , "Stage preservation suffix is invalid."
+            ElseIf Len(held) > 0 Then
+                Err.Raise MB_ERR + 1168, , "Publication phase unexpectedly includes a held path."
+            End If
+        Case Else
+            Err.Raise MB_ERR + 1168, , "Unknown stage phase cannot authorize recovery."
+    End Select
+End Function
+
+Private Sub MBR_ValidateAuditProof(ByVal f As Variant, ByVal kind As String, ByRef terminal As Boolean)
+    Dim stamp As Date, ignored As Double, p As String
+    If kind = "SOURCE" Then
+        If CStr(f(0)) <> "MBSOURCEAUDIT1" Then Err.Raise MB_ERR + 1169, , "Wrong source-audit schema."
+        stamp = MBC_ParseUtcStamp(CStr(f(7)))
+        If Len(CStr(f(8))) = 0 Then Err.Raise MB_ERR + 1169, , "Source audit has no run identity."
+        Select Case CStr(f(5))
+            Case "CURSOR"
+                If Len(CStr(f(4))) > 0 Then Err.Raise MB_ERR + 1169, , "Source cursor contains a message identity."
+                If Len(CStr(f(6))) > 0 Then
+                    If Not MB_IsHexKey(CStr(f(6))) Then Err.Raise MB_ERR + 1169, , "Invalid source cursor."
+                End If
+                terminal = True
+            Case "REVIEW", "OK", "ABSENT"
+                If Not MB_IsHexKey(CStr(f(4))) Then Err.Raise MB_ERR + 1169, , "Invalid source-audit identity."
+            Case Else
+                Err.Raise MB_ERR + 1169, , "Unknown source-audit status."
+        End Select
+    Else
+        If CStr(f(0)) <> "MBARCHIVEAUDIT1" Then Err.Raise MB_ERR + 1170, , "Wrong archive-audit schema."
+        stamp = MBC_ParseUtcStamp(CStr(f(15)))
+        If Len(CStr(f(16))) = 0 Then Err.Raise MB_ERR + 1170, , "Archive audit has no run identity."
+        If CStr(f(4)) = "CURSOR" Then
+            If CStr(f(13)) <> "CURSOR" Then Err.Raise MB_ERR + 1170, , "Incomplete archive cursor."
+            If Len(CStr(f(5))) > 0 Then
+                If Not MB_IsHexKey(CStr(f(5))) Then Err.Raise MB_ERR + 1170, , "Invalid archive cursor."
+            End If
+            terminal = True
+        ElseIf CStr(f(4)) = "RESULT" Then
+            If CStr(f(13)) <> "REVIEW" And CStr(f(13)) <> "OK" Then _
+                Err.Raise MB_ERR + 1170, , "Unknown archive-audit status."
+            If Not MB_IsHexKey(CStr(f(5))) Or Not MB_IsHexKey(CStr(f(8))) Then _
+                Err.Raise MB_ERR + 1170, , "Invalid archive expected digest/identity."
+            ignored = MB_ByteCount(CStr(f(7)))
+            p = MBY_CanonicalFilePath(CStr(f(6)), CStr(f(9)))
+            If CStr(f(10)) <> "0" And CStr(f(10)) <> "1" Then Err.Raise MB_ERR + 1170, , "Invalid archived type flag."
+            If MBA_ProofId(p, CStr(f(7)), CStr(f(8))) <> CStr(f(5)) Then _
+                Err.Raise MB_ERR + 1170, , "Archive audit changed its expected-byte identity."
+            Select Case CStr(f(12))
+                Case "COMMITTED_INDEX", "MSG_ONLY_REBASELINED", "VERIFIED_PUBLICATION"
+                Case Else
+                    Err.Raise MB_ERR + 1170, , "Unknown archived proof provenance."
+            End Select
+        Else
+            Err.Raise MB_ERR + 1170, , "Unknown archive-audit row type."
+        End If
+    End If
+    If Not MBC_ValidDate(stamp) Then Err.Raise MB_ERR + 1171, , "Audit observation has no valid UTC timestamp."
+End Sub
+
+Private Sub MBR_CollectProof(ByVal path As String, ByVal leaf As String, ByVal kind As String, _
+                              ByVal rows As Object, ByVal origins As Object, ByVal bad As Object, _
+                              ByRef context As Variant, ByVal origin As Long, _
+                              ByVal accountRoot As String, ByVal storeId As String)
+    Dim reader As Object, line As String, f As Variant, prior As Variant, raw As Variant
+    Dim payload As String, identity As String, key As String, p As String, stamp As Date
+    Dim terminal As Boolean, count As Long, n As Long, detail As String, localBindings As Object, rowNumber As Long
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True: guard = MBH_GuardFile(path)
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 1172, , "Proof history is truncated."
+    Set reader = gFSO.OpenTextFile(path, 1, False, -1)
+    Set localBindings = CreateObject("Scripting.Dictionary"): localBindings.CompareMode = vbTextCompare
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine
+        rowNumber = rowNumber + 1
+        If rowNumber Mod 256 = 0 Then
+            If Not MB_ContinueWork() Then Err.Raise MB_ERR + 1181, , "Recovery proof merge cancelled; original proofs are preserved."
+        End If
+        If Len(line) > 0 Then
+            If terminal Then Err.Raise MB_ERR + 1173, , "Data follows an audit snapshot terminator."
+            If kind = "stages.tsv" Then
+                If Not MBSR_CheckedRecord(line, payload, identity) Then
+                    If Not MBSR_UnprovenPayload(line, payload, identity) Then _
+                        Err.Raise MB_ERR + 1161, , "Truncated/unknown stage cannot be merged safely."
+                    key = CStr(origin) & "|" & identity
+                    If bad.Exists(key) Then
+                        prior = MBM_Unpack(CStr(bad(key)), 3)
+                        If CStr(prior(1)) <> payload Then Err.Raise MB_ERR + 1174, , "Conflicting damaged stage payloads."
+                    End If
+                    bad(key) = MB_EncodeFields(Array(identity, payload, CStr(origin)))
+                Else
+                    f = MB_ReadCheckedLine(line, 10): identity = MBR_StageProofIdentity(f)
+                    key = "STAGE_PATH|" & LCase$(MBH_NormalizePath(CStr(f(2))))
+                    If origins.Exists(key) Then
+                        If StrComp(CStr(origins(key)), MBH_NormalizePath(CStr(f(3))), vbTextCompare) <> 0 Then _
+                            Err.Raise MB_ERR + 1174, , "A stage identity names conflicting destinations."
+                    End If
+                    origins(key) = MBH_NormalizePath(CStr(f(3)))
+                    If rows.Exists(identity) Then
+                        If CStr(rows(identity)) <> payload Then Err.Raise MB_ERR + 1174, , "Same stage/sequence has conflicting checked payloads."
+                        origins(identity) = CLng(origins(identity)) Or origin
+                    Else
+                        rows(identity) = payload: origins(identity) = origin
+                    End If
+                End If
+            Else
+                Select Case kind
+                    Case "BASELINE", "SOURCE": count = 9
+                    Case "ARCHIVE": count = 17
+                    Case "account-roots.tsv": count = 4
+                    Case Else
+                        raw = Split(line, vbTab): count = UBound(raw) - 1
+                        If count < 1 Then Err.Raise MB_ERR + 1175, , "Unchecked state row."
+                End Select
+                f = MB_ReadCheckedLine(line, count): payload = MB_EncodeFields(f)
+                Select Case kind
+                    Case "BASELINE"
+                        MBR_ProofContext f, leaf, kind, context
+                        If CStr(f(0)) <> "MBBASE1" Or CStr(f(8)) <> "MSG_ONLY_REBASELINED" Or _
+                           Not MB_IsHexKey(CStr(f(6))) Or MB_ByteCount(CStr(f(5))) <= 0 Then _
+                            Err.Raise MB_ERR + 1176, , "Invalid immutable MSG baseline."
+                        stamp = MBC_ParseUtcStamp(CStr(f(7)))
+                        If Not MBC_ValidDate(stamp) Then Err.Raise MB_ERR + 1176, , "Baseline has no valid UTC capture time."
+                        p = MBY_CanonicalFilePath(CStr(f(4)), CStr(f(3))): key = LCase$(p)
+                        If rows.Exists(key) Then
+                            prior = MBM_Unpack(CStr(rows(key)), 9)
+                            If CStr(prior(6)) <> CStr(f(6)) Or MB_ByteCount(CStr(prior(5))) <> MB_ByteCount(CStr(f(5))) Then _
+                                Err.Raise MB_ERR + 1177, , "Baseline path has conflicting historical expected bytes."
+                        Else
+                            rows(key) = payload
+                        End If
+                    Case "SOURCE", "ARCHIVE"
+                        MBR_ProofContext f, leaf, kind, context
+                        MBR_ValidateAuditProof f, kind, terminal
+                        If kind = "SOURCE" Then
+                            If CStr(f(5)) = "REVIEW" Then rows(CStr(f(4))) = payload
+                        ElseIf CStr(f(13)) = "REVIEW" Then
+                            key = CStr(f(5))
+                            If rows.Exists(key) Then
+                                prior = MBM_Unpack(CStr(rows(key)), 17)
+                                If CStr(prior(12)) <> "COMMITTED_INDEX" Then rows(key) = payload
+                            Else
+                                rows(key) = payload
+                            End If
+                        End If
+                        ' Unknown OK/ABSENT observations cannot remove REVIEW
+                        ' obligations recovered from either compact snapshot.
+                    Case "account-roots.tsv"
+                        If CStr(f(0)) <> "MBAC3" Or Len(CStr(f(1))) = 0 Or _
+                           StrComp(MBH_NormalizePath(CStr(f(3))), MBY_StateRoot(), vbTextCompare) <> 0 Then _
+                            Err.Raise MB_ERR + 1178, , "Account-map binding is invalid."
+                        key = LCase$(CStr(f(1))): p = MBH_NormalizePath(CStr(f(2)))
+                        If Len(p) > 80 Or MB_PathWithin(p, MBY_StateRoot()) Or MBL_IsFileSystemRoot(p) Then _
+                            Err.Raise MB_ERR + 1178, , "Account-map path is unsafe."
+                        ' Per-file append history may legitimately rebind a store.
+                        localBindings(key) = MB_EncodeFields(Array("MBAC3", key, p, MBY_StateRoot()))
+                    Case Else
+                        rows(CStr(rows.Count + 1)) = payload
+                End Select
+            End If
+        End If
+    Loop
+    If kind = "SOURCE" Or kind = "ARCHIVE" Then
+        If Not terminal Then Err.Raise MB_ERR + 1173, , "Audit snapshot has no terminal cursor."
+    End If
+    If kind = "account-roots.tsv" Then
+        For Each raw In localBindings.Keys
+            f = MBM_Unpack(CStr(localBindings(raw)), 4)
+            If rows.Exists(CStr(raw)) Then
+                prior = MBM_Unpack(CStr(rows(raw)), 4)
+                If StrComp(CStr(prior(2)), CStr(f(2)), vbTextCompare) <> 0 Then
+                    ' Current later binding must independently agree with its
+                    ' selected owner or marker; conflicting unknown roots stop.
+                    If StrComp(CStr(f(1)), storeId, vbTextCompare) <> 0 Or _
+                       StrComp(CStr(f(2)), accountRoot, vbTextCompare) <> 0 Then MBY_CheckMarker CStr(f(2)), CStr(f(1)), True
+                End If
+            End If
+            rows(CStr(raw)) = CStr(localBindings(raw))
+        Next raw
+    End If
+    GoTo Cleanup
+Failed:
+    n = Err.Number: detail = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not reader Is Nothing Then reader.Close
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    If n <> 0 Then Err.Raise n, "MBR_CollectProof", detail
+    If gFatal Then Err.Raise MB_ERR + 1179, , "Proof guard cleanup failed."
+End Sub
+
+Private Sub MBR_CheckMergedRoots(ByVal rows As Object, ByVal accountRoot As String, ByVal storeId As String)
+    Dim a As Variant, b As Variant, fa As Variant, fb As Variant, path As String
+    For Each a In rows.Keys
+        fa = MBM_Unpack(CStr(rows(a)), 4): path = CStr(fa(2))
+        MBY_NoReparse path, False
+        If StrComp(CStr(fa(1)), storeId, vbTextCompare) = 0 Then
+            If StrComp(path, accountRoot, vbTextCompare) <> 0 Then _
+                Err.Raise MB_ERR + 1180, , "Recovered current-store mapping conflicts with selected account ownership."
+        Else
+            MBY_CheckMarker path, CStr(fa(1)), True
+        End If
+        For Each b In rows.Keys
+            If StrComp(CStr(a), CStr(b), vbTextCompare) <> 0 Then
+                fb = MBM_Unpack(CStr(rows(b)), 4)
+                If MB_PathWithin(path, CStr(fb(2))) Or MB_PathWithin(CStr(fb(2)), path) Then _
+                    Err.Raise MB_ERR + 1180, , "Recovered mappings overlap different stores."
+            End If
+        Next b
+    Next a
+End Sub

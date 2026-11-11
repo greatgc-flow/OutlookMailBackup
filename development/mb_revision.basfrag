@@ -1,0 +1,138 @@
+' ==================== Verified same-source version changes ==================
+' Source identity (StoreID + EntryID) does not prove content equality. It chooses
+' one previously accepted file proof in O(1); that proof's immutable expected
+' SHA/size and bounded content comparison decide reuse, new version, or REVIEW.
+' The ordinary restored-identity search may still find an older equal version
+' after CHANGED, so editing and later reverting content need not duplicate MSGs.
+Private Sub MBV_Reset()
+    Set gRevisionHeads = Nothing
+    gRevisionCompared = 0: gRevisionReused = 0: gRevisionDifferent = 0: gRevisionReview = 0
+End Sub
+
+Private Sub MBV_CacheRecord(ByVal f As Variant)
+    Dim kind As String
+    kind = CStr(f(1))
+    If kind <> "M" And kind <> "N" And kind <> "L" And kind <> "R" Then Exit Sub
+    If gRevisionHeads Is Nothing Then
+        Set gRevisionHeads = CreateObject("Scripting.Dictionary")
+        gRevisionHeads.CompareMode = vbBinaryCompare
+    End If
+    ' Called only after MBX_CacheRecord accepts the complete semantic record.
+    ' Last accepted journal order reflects the last observed source revision;
+    ' provider timestamps may move backwards and must not choose this head.
+    gRevisionHeads(CStr(f(6))) = MBX_IndexKey(kind, CStr(f(2)))
+End Sub
+
+Private Function MBV_RequiresCurrentPolicy(ByVal sourceKey As String) As Boolean
+    Dim key As String, fields As Variant
+    If gRevisionHeads Is Nothing Then Exit Function
+    If Not gRevisionHeads.Exists(sourceKey) Then Exit Function
+    key = CStr(gRevisionHeads(sourceKey))
+    If Not gIndex.Exists(key) Then MBV_RequiresCurrentPolicy = True: Exit Function
+    fields = MB_IndexFields(key)
+    If Left$(key, 2) = "L|" Then
+        MBV_RequiresCurrentPolicy = (CStr(fields(3)) <> MB_LEGACY_VALIDATION)
+    Else
+        MBV_RequiresCurrentPolicy = (CStr(fields(3)) <> MB_NEW_CONTENT_VALIDATION)
+    End If
+    ' Evaluate only the current inventory's source. Historical orphan records
+    ' do not force all live mail into perpetual full scans. A retained current
+    ' BASIC/limited or old-policy proof cannot hide behind a newer checkpoint.
+End Function
+
+Private Function MBV_TryKnownRevision(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                                      ByVal revision As String, ByRef reason As String) As Long
+    Dim key As String, fields As Variant, meta As Variant, current As Variant
+    Dim path As String, root As String, digest As String, bytes As Double, result As Long
+    Dim expectedPath As String, expectedRoot As String, expectedHash As String, expectedBytes As Double
+    Dim n As Long, detail As String, targetKey As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    reason = ""
+    If gRevisionHeads Is Nothing Then Exit Function
+    If Not gRevisionHeads.Exists(CStr(q(7))) Then Exit Function
+    key = CStr(gRevisionHeads(CStr(q(7))))
+    If Not gIndex.Exists(key) Then Err.Raise MB_ERR + 1100, , "Known source head has no accepted file proof."
+    meta = MBX_Meta(key)
+    If CStr(meta(2)) <> CStr(q(7)) Or CStr(meta(0)) <> MBX_StoreToken(CStr(q(1))) Then _
+        Err.Raise MB_ERR + 1101, , "Known source head belongs to another source or store."
+    fields = MB_IndexFields(key)
+    expectedHash = CStr(fields(2)): expectedBytes = MB_ByteCount(CStr(fields(1)))
+    expectedPath = MBX_IndexedPath(key, fields, True)
+    expectedRoot = MBM_ResolvedRoot(MBX_IndexedOriginal(key, fields), expectedHash, MBX_IndexedRoot(key))
+    gRevisionCompared = gRevisionCompared + 1
+    guard = MBH_GuardFile(expectedPath)
+    result = MBI_CheckCandidate(mail, key, path, root, digest, bytes, reason)
+    If result = 3 Then MBV_TryKnownRevision = MBV_CANCELLED: GoTo Finished
+    If result = 2 Then GoTo NeedsReview
+    If result <> 0 And result <> 1 Then Err.Raise MB_ERR + 1102, , "Unknown same-source comparison result."
+    ' The comparator writes ByRef outputs. They never replace the saved expected
+    ' proof, including when it reports explicitly different current content.
+    If StrComp(path, expectedPath, vbTextCompare) <> 0 Or _
+       StrComp(root, expectedRoot, vbTextCompare) <> 0 Or digest <> expectedHash Or bytes <> expectedBytes Then _
+        Err.Raise MB_ERR + 1103, , "Known source file reference changed during comparison."
+    If Not MB_SourceStable(mail, q, revision) Then
+        reason = "The current source changed during known-revision comparison.": GoTo NeedsReview
+    End If
+    targetKey = "M|" & revision
+    If result = 0 Then
+        ' A provider hiding a content change behind the SAME current M revision
+        ' must not cause that immutable key to be overwritten with new bytes.
+        If gIndex.Exists(targetKey) Then
+            reason = "Current content differs but its provider revision already has a file proof; preserve both facts for review."
+            GoTo NeedsReview
+        End If
+        MBH_CloseGuard guard
+        gRevisionDifferent = gRevisionDifferent + 1
+        MB_LogEvent "INFO", "KNOWN_SOURCE_NEW_VERSION", q(7), expectedPath, 0, _
+            "Prior expected bytes still verify; current bounded content is explicitly different. Old file remains preserved."
+        MBV_TryKnownRevision = MBV_CHANGED
+        Exit Function
+    End If
+    If gIndex.Exists(targetKey) Then
+        current = MB_IndexFields(targetKey)
+        If CStr(current(2)) <> expectedHash Or MB_ByteCount(CStr(current(1))) <> expectedBytes Or _
+           StrComp(MBX_IndexedPath(targetKey, current, True), expectedPath, vbTextCompare) <> 0 Then
+            reason = "Current revision already points to a different file proof; automatic replacement is blocked."
+            GoTo NeedsReview
+        End If
+        ' An already-current key needs no self-referencing R journal row.
+    Else
+        MB_RecordCommit "R", revision, expectedPath, expectedBytes, expectedHash, q, mail.Subject, _
+                        0, key, MB_NEW_CONTENT_VALIDATION, expectedRoot
+        gIdentityAliases = gIdentityAliases + 1
+    End If
+    MBH_CloseGuard guard
+    gRevisionReused = gRevisionReused + 1
+    MB_LogEvent "INFO", "KNOWN_SOURCE_REUSED_NO_SAVEAS", q(7), expectedPath, 0, _
+        "Current bounded content matches the guarded prior source proof; metadata revision linked without MSG export."
+    MBV_TryKnownRevision = MBV_REUSED
+    Exit Function
+NeedsReview:
+    If Len(reason) = 0 Then reason = "Known source content or prior file proof is not fully verifiable."
+    gRevisionReview = gRevisionReview + 1
+    If gCancel Then MBV_TryKnownRevision = MBV_CANCELLED Else MBV_TryKnownRevision = MBV_REVIEW
+Finished:
+    MBH_CloseGuard guard
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    If gFatal Then Err.Raise n, "MBV_TryKnownRevision", detail
+    reason = "Known source revision requires review: " & detail
+    gRevisionReview = gRevisionReview + 1
+    If gCancel Then MBV_TryKnownRevision = MBV_CANCELLED Else MBV_TryKnownRevision = MBV_REVIEW
+End Function
+
+Private Function MBV_Summary() As String
+    MBV_Summary = vbCrLf & "Known-source version comparisons: " & CStr(gRevisionCompared) & _
+        "; reused without SaveAs: " & CStr(gRevisionReused) & _
+        "; explicitly different version candidates: " & CStr(gRevisionDifferent) & _
+        "; review: " & CStr(gRevisionReview)
+End Function

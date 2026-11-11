@@ -1,0 +1,15 @@
+' One visible command. Persistent setup states are bound to account + archive.
+Private gAutoNeedsRegistration As Boolean
+Private gAutoStoreId As String
+Private gAutoAccount As String
+Private gAutoKey As String
+Private gAutoSetupPhase As String
+Private gAutoSetupNote As String
+Private gAutoRegistrationSummary As String
+Private gAutoReviewCount As Long
+Private gAutoFailureCount As Long
+Private gAutoFileReview As Long
+Private gAutoLegacyReview As Long
+Private gAutoSetupSeconds As Double
+Private gAutoTestReport As String
+

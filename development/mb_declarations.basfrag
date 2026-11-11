@@ -1,0 +1,57 @@
+' MailBackup helper declarations. Insert before ALL procedures in the final module.
+' Windows classic Outlook; VBA7 32/64-bit. CNG-managed hash objects require Windows 7+.
+' No added VBA references: Scripting.FileSystemObject / Dictionary are late bound.
+Public Const MBH_MAX_PATH_UNITS As Long = 235
+Private Const MBH_ERR_BASE As Long = vbObjectError + 7100
+Private Const MBH_GENERIC_READ As Long = &H80000000
+Private Const MBH_GENERIC_WRITE As Long = &H40000000
+Private Const MBH_FILE_SHARE_READ As Long = &H1
+Private Const MBH_CREATE_NEW As Long = 1
+Private Const MBH_OPEN_EXISTING As Long = 3
+Private Const MBH_OPEN_ALWAYS As Long = 4
+Private Const MBH_FILE_ATTRIBUTE_NORMAL As Long = &H80
+Private Const MBH_FILE_FLAG_SEQUENTIAL_SCAN As Long = &H8000000
+Private Const MBH_ERROR_FILE_EXISTS As Long = 80
+Private Const MBH_ERROR_ALREADY_EXISTS As Long = 183
+Private MBH_Stages As Object
+Private MBH_FileSystemCache As Object
+Private MBH_NormalizedPaths As Object
+Private MBH_PathCacheHits As Double
+Private MBH_PathCacheMisses As Double
+Private MBH_OpenHashes As Long
+
+#If VBA7 Then
+Private MBH_Algorithm As LongPtr
+Private MBH_RunLock As LongPtr
+Private Type MBH_HashContext
+    Handle As LongPtr
+End Type
+Private Declare PtrSafe Function MBH_BCryptOpenAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptOpenAlgorithmProvider" (ByRef phAlgorithm As LongPtr, ByVal pszAlgId As LongPtr, ByVal pszImplementation As LongPtr, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function MBH_BCryptCreateHash Lib "bcrypt.dll" Alias "BCryptCreateHash" (ByVal hAlgorithm As LongPtr, ByRef phHash As LongPtr, ByVal pbHashObject As LongPtr, ByVal cbHashObject As Long, ByVal pbSecret As LongPtr, ByVal cbSecret As Long, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function MBH_BCryptHashData Lib "bcrypt.dll" Alias "BCryptHashData" (ByVal hHash As LongPtr, ByVal pbInput As LongPtr, ByVal cbInput As Long, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function MBH_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hHash As LongPtr, ByVal pbOutput As LongPtr, ByVal cbOutput As Long, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function MBH_BCryptDestroyHash Lib "bcrypt.dll" Alias "BCryptDestroyHash" (ByVal hHash As LongPtr) As Long
+Private Declare PtrSafe Function MBH_BCryptCloseAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptCloseAlgorithmProvider" (ByVal hAlgorithm As LongPtr, ByVal dwFlags As Long) As Long
+Private Declare PtrSafe Function MBH_CreateFileW Lib "kernel32" Alias "CreateFileW" (ByVal lpFileName As LongPtr, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As LongPtr, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As LongPtr) As LongPtr
+Private Declare PtrSafe Function MBH_ReadFile Lib "kernel32" Alias "ReadFile" (ByVal hFile As LongPtr, ByRef lpBuffer As Any, ByVal nNumberOfBytesToRead As Long, ByRef lpNumberOfBytesRead As Long, ByVal lpOverlapped As LongPtr) As Long
+Private Declare PtrSafe Function MBH_CloseHandle Lib "kernel32" Alias "CloseHandle" (ByVal hObject As LongPtr) As Long
+Private Declare PtrSafe Function MBH_MoveFileW Lib "kernel32" Alias "MoveFileW" (ByVal lpExistingFileName As LongPtr, ByVal lpNewFileName As LongPtr) As Long
+Private Declare PtrSafe Function MBH_DeleteFileW Lib "kernel32" Alias "DeleteFileW" (ByVal lpFileName As LongPtr) As Long
+#Else
+Private MBH_Algorithm As Long
+Private MBH_RunLock As Long
+Private Type MBH_HashContext
+    Handle As Long
+End Type
+Private Declare Function MBH_BCryptOpenAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptOpenAlgorithmProvider" (ByRef phAlgorithm As Long, ByVal pszAlgId As Long, ByVal pszImplementation As Long, ByVal dwFlags As Long) As Long
+Private Declare Function MBH_BCryptCreateHash Lib "bcrypt.dll" Alias "BCryptCreateHash" (ByVal hAlgorithm As Long, ByRef phHash As Long, ByVal pbHashObject As Long, ByVal cbHashObject As Long, ByVal pbSecret As Long, ByVal cbSecret As Long, ByVal dwFlags As Long) As Long
+Private Declare Function MBH_BCryptHashData Lib "bcrypt.dll" Alias "BCryptHashData" (ByVal hHash As Long, ByVal pbInput As Long, ByVal cbInput As Long, ByVal dwFlags As Long) As Long
+Private Declare Function MBH_BCryptFinishHash Lib "bcrypt.dll" Alias "BCryptFinishHash" (ByVal hHash As Long, ByVal pbOutput As Long, ByVal cbOutput As Long, ByVal dwFlags As Long) As Long
+Private Declare Function MBH_BCryptDestroyHash Lib "bcrypt.dll" Alias "BCryptDestroyHash" (ByVal hHash As Long) As Long
+Private Declare Function MBH_BCryptCloseAlgorithmProvider Lib "bcrypt.dll" Alias "BCryptCloseAlgorithmProvider" (ByVal hAlgorithm As Long, ByVal dwFlags As Long) As Long
+Private Declare Function MBH_CreateFileW Lib "kernel32" Alias "CreateFileW" (ByVal lpFileName As Long, ByVal dwDesiredAccess As Long, ByVal dwShareMode As Long, ByVal lpSecurityAttributes As Long, ByVal dwCreationDisposition As Long, ByVal dwFlagsAndAttributes As Long, ByVal hTemplateFile As Long) As Long
+Private Declare Function MBH_ReadFile Lib "kernel32" Alias "ReadFile" (ByVal hFile As Long, ByRef lpBuffer As Any, ByVal nNumberOfBytesToRead As Long, ByRef lpNumberOfBytesRead As Long, ByVal lpOverlapped As Long) As Long
+Private Declare Function MBH_CloseHandle Lib "kernel32" Alias "CloseHandle" (ByVal hObject As Long) As Long
+Private Declare Function MBH_MoveFileW Lib "kernel32" Alias "MoveFileW" (ByVal lpExistingFileName As Long, ByVal lpNewFileName As Long) As Long
+Private Declare Function MBH_DeleteFileW Lib "kernel32" Alias "DeleteFileW" (ByVal lpFileName As Long) As Long
+#End If

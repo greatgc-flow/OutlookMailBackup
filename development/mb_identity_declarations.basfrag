@@ -1,0 +1,10 @@
+' Restored identities are aliases of bounded, content-verified existing bytes.
+' R uses the MBS3 absolute-path/root schema and the ordinary M|revision cache.
+' Candidate subjects are exact Unicode strings; hashes select, never prove.
+Private Const MBI_MAX_CANDIDATES As Long = 128
+Private gIdentityBuckets As Object
+Private gIdentitySeen As Object
+Private gIdentityHeaders As Object
+Private gIdentityAliases As Long
+Private gIdentityHeaderReads As Long
+Private gIdentityHeaderHits As Long

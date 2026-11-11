@@ -1,0 +1,802 @@
+' =================== Year/month organization and recovery ==================
+' Callers hold gRoot's run lock and initialize gFSO/gDirs/gEvents/gRunDir.
+' A preview is complete only when its checked END row has been closed/flushed.
+' Apply revalidates the entire plan before the first file move.
+' MoveFileExW uses WRITE_THROUGH only: no REPLACE_EXISTING, no COPY_ALLOWED.
+' The account tree and already committed managed files are the only sources.
+' No old MSG is saved again. Identical duplicates are retained as separate files.
+
+Private Sub MBM_Reset()
+    Set mbmOps = Nothing: Set mbmRedirects = Nothing
+    mbmLoaded = False
+    gMovePlanned = 0: gMoveKept = 0: gMoveSkipped = 0
+    gMoveApplied = 0: gMoveAlready = 0: gMoveRestored = 0
+    gMoveRecovered = 0: gMoveReview = 0: gMovePlanReview = 0: gMovePlanPath = ""
+End Sub
+
+Private Sub MBM_AcquireAccountLock(ByVal accountRoot As String)
+    Dim path As String, winError As Long, n As Long, detail As String, registered As Boolean
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    On Error GoTo Failed
+    accountRoot = MBH_NormalizePath(accountRoot)
+    If mbmAccountLocks Is Nothing Then
+        Set mbmAccountLocks = CreateObject("Scripting.Dictionary")
+        mbmAccountLocks.CompareMode = vbTextCompare
+    End If
+    If mbmAccountLocks.Exists(accountRoot) Then Exit Sub
+    MBM_CheckAncestors accountRoot
+    path = MBH_JoinPath(accountRoot, "_mb_account.lock")
+    If gFSO.FileExists(path) Then
+        If (CLng(gFSO.GetFile(path).Attributes) And 1024) <> 0 Then
+            Err.Raise MB_ERR + 404, , "Account lock cannot be a link/reparse point."
+        End If
+    End If
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ Or MBH_GENERIC_WRITE, 0, 0, _
+                            MBH_OPEN_ALWAYS, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        Err.Raise MB_ERR + 400, "MBM_AcquireAccountLock", _
+                  "Account archive is busy or unavailable. Win32=" & CStr(winError) & "; " & accountRoot
+    End If
+    mbmAccountLocks.Add accountRoot, handle
+    registered = True
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    If Not registered And handle <> 0 And handle <> -1 Then MBH_CloseHandle handle
+    Err.Raise n, "MBM_AcquireAccountLock", detail
+End Sub
+
+Private Sub MBM_ReleaseAccountLocks()
+    Dim key As Variant, failed As String, winError As Long
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    If mbmAccountLocks Is Nothing Then Exit Sub
+    For Each key In mbmAccountLocks.Keys
+#If VBA7 Then
+        handle = CLngPtr(mbmAccountLocks(key))
+#Else
+        handle = CLng(mbmAccountLocks(key))
+#End If
+        If MBH_CloseHandle(handle) = 0 Then
+            winError = Err.LastDllError
+            failed = failed & " " & CStr(key) & " (" & CStr(winError) & ")"
+        Else
+            mbmAccountLocks.Remove key
+        End If
+    Next key
+    If mbmAccountLocks.Count = 0 Then Set mbmAccountLocks = Nothing
+    If Len(failed) > 0 Then Err.Raise MB_ERR + 401, "MBM_ReleaseAccountLocks", "Cannot release account locks:" & failed
+End Sub
+
+Private Sub MBM_CheckAncestors(ByVal directory As String)
+    Dim current As String, parent As String, folder As Object
+    current = MBH_NormalizePath(directory)
+    Do
+        Set folder = gFSO.GetFolder(current)
+        If (CLng(folder.Attributes) And 1024) <> 0 Then
+            Err.Raise MB_ERR + 402, "MBM_CheckAncestors", "Link/reparse directories are not moved: " & current
+        End If
+        If MBL_IsFileSystemRoot(current) Then Exit Do
+        parent = CStr(gFSO.GetParentFolderName(current))
+        If Len(parent) = 0 Or StrComp(parent, current, vbTextCompare) = 0 Then Exit Do
+        current = parent
+    Loop
+End Sub
+
+Private Function MBM_File(ByVal path As String, ByVal boundRoot As String, _
+                          Optional ByVal requireExisting As Boolean = True) As String
+    Dim f As Object
+    path = MBH_NormalizePath(path): boundRoot = MBH_NormalizePath(boundRoot)
+    If Not MB_PathWithin(path, boundRoot) Or StrComp(path, boundRoot, vbTextCompare) = 0 Then
+        Err.Raise MB_ERR + 403, "MBM_File", "A move path is outside its recorded root."
+    End If
+    If requireExisting Then
+        MBM_CheckAncestors CStr(gFSO.GetParentFolderName(path))
+        Set f = gFSO.GetFile(path)
+        If (CLng(f.Attributes) And 1024) <> 0 Then
+            Err.Raise MB_ERR + 404, "MBM_File", "Link/reparse files are not moved: " & path
+        End If
+    End If
+    MBM_File = path
+End Function
+
+Private Function MBM_JournalPath() As String
+    MBM_JournalPath = MB_StatePath("moves.tsv")
+End Function
+
+Private Sub MBM_FlushPath(ByVal path As String)
+    Dim winError As Long, closeError As Long
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_WRITE, 3, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        Err.Raise MB_ERR + 405, "MBM_FlushPath", "Cannot open durable move state. Win32=" & CStr(winError)
+    End If
+    If MBM_FlushFileBuffers(handle) = 0 Then winError = Err.LastDllError
+    If MBH_CloseHandle(handle) = 0 Then closeError = Err.LastDllError
+    If winError <> 0 Or closeError <> 0 Then
+        Err.Raise MB_ERR + 406, "MBM_FlushPath", _
+                  "Cannot flush/close move state. Win32=" & CStr(winError) & "/" & CStr(closeError)
+    End If
+End Sub
+
+Private Function MBM_Unpack(ByVal value As String, ByVal count As Long) As Variant
+    Dim fields As Variant, i As Long
+    fields = Split(value, vbTab)
+    If UBound(fields) <> count - 1 Then Err.Raise MB_ERR + 407, , "Invalid move state field count."
+    For i = 0 To UBound(fields)
+        fields(i) = MB_Unescape(CStr(fields(i)))
+    Next i
+    MBM_Unpack = fields
+End Function
+
+Private Function MBM_RedirectKey(ByVal path As String, ByVal digest As String) As String
+    ' One old path can be reused by different files after its original moved.
+    ' Keep every content version's route; a new route must not erase the old one.
+    MBM_RedirectKey = LCase$(MBH_NormalizePath(path)) & "|" & LCase$(digest)
+End Function
+
+Private Sub MBM_SetRedirect(ByVal source As String, ByVal target As String, _
+                             ByVal digest As String, ByVal targetRoot As String)
+    Dim targetKey As String
+    ' A reverse move supersedes only this hash's old forward edge.
+    ' Other files that previously occupied the same pathname retain their route.
+    targetKey = MBM_RedirectKey(target, digest)
+    If mbmRedirects.Exists(targetKey) Then mbmRedirects.Remove targetKey
+    mbmRedirects(MBM_RedirectKey(source, digest)) = MB_EncodeFields(Array(target, digest, targetRoot))
+End Sub
+
+Private Function MBM_ResolvePath(ByVal original As String, ByVal expectedHash As String) As String
+    Dim path As String, fields As Variant, seen As Object, key As String
+    path = MBH_NormalizePath(original)
+    If Not mbmLoaded Then Err.Raise MB_ERR + 408, , "Move journal must be loaded before resolving files."
+    key = MBM_RedirectKey(path, expectedHash)
+    If Not mbmRedirects.Exists(key) Then
+        MBM_ResolvePath = path
+        Exit Function
+    End If
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = vbTextCompare
+    Do While mbmRedirects.Exists(key)
+        If seen.Exists(path) Then Err.Raise MB_ERR + 409, , "Cycle in move history; no export permitted."
+        seen.Add path, True
+        fields = MBM_Unpack(CStr(mbmRedirects(key)), 3)
+        If CStr(fields(1)) <> expectedHash Then Err.Raise MB_ERR + 455, , "Move redirect hash mismatch."
+        path = CStr(fields(0))
+        key = MBM_RedirectKey(path, expectedHash)
+    Loop
+    MBM_ResolvePath = path
+End Function
+
+Private Function MBM_ResolvedRoot(ByVal original As String, ByVal expectedHash As String, _
+                                   ByVal fallbackRoot As String) As String
+    Dim path As String, fields As Variant, root As String, seen As Object, key As String
+    path = MBH_NormalizePath(original): root = MBH_NormalizePath(fallbackRoot)
+    If Not mbmLoaded Then Err.Raise MB_ERR + 408, , "Move journal must be loaded before resolving files."
+    key = MBM_RedirectKey(path, expectedHash)
+    If Not mbmRedirects.Exists(key) Then
+        MBM_ResolvedRoot = root
+        Exit Function
+    End If
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = vbTextCompare
+    Do While mbmRedirects.Exists(key)
+        If seen.Exists(path) Then Err.Raise MB_ERR + 409, , "Cycle in move history; no export permitted."
+        seen.Add path, True
+        fields = MBM_Unpack(CStr(mbmRedirects(key)), 3)
+        If CStr(fields(1)) <> expectedHash Then Err.Raise MB_ERR + 455, , "Move redirect hash mismatch."
+        path = CStr(fields(0)): root = CStr(fields(2))
+        key = MBM_RedirectKey(path, expectedHash)
+    Loop
+    MBM_ResolvedRoot = root
+End Function
+
+Private Function MBM_OperationId(ByVal planId As String, ByVal source As String, _
+                                  ByVal target As String, ByVal digest As String) As String
+    MBM_OperationId = MBH_HashText(MB_EncodeFields(Array("MBMOVE3", planId, _
+                           LCase$(source), LCase$(target), digest)))
+End Function
+
+Private Sub MBM_ValidateMoveRow(ByVal f As Variant)
+    Dim p As String, root As String, sourceRoot As String
+    If f(0) <> "MBMOVE3" Then Err.Raise MB_ERR + 410, , "Wrong move journal schema."
+    If Not MB_IsHexKey(CStr(f(1))) Or Not MB_IsHexKey(CStr(f(2))) Or _
+       Not MB_IsHexKey(CStr(f(9))) Then Err.Raise MB_ERR + 411, , "Invalid move ID/hash."
+    If f(3) <> "PREPARE" And f(3) <> "COMMIT" And f(3) <> "ABORT" And _
+       f(3) <> "UNDO_PREPARE" And f(3) <> "UNDO_COMMIT" And f(3) <> "UNDO_ABORT" Then
+        Err.Raise MB_ERR + 412, , "Unknown move phase."
+    End If
+    root = MBH_NormalizePath(CStr(f(4)))
+    sourceRoot = MBH_NormalizePath(CStr(f(5)))
+    If StrComp(sourceRoot, root, vbTextCompare) <> 0 And _
+       StrComp(sourceRoot, gRoot, vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 444, , "Move source root is outside this archive."
+    End If
+    p = MBM_File(CStr(f(6)), sourceRoot, False)
+    p = MBM_File(CStr(f(7)), root, False)
+    If StrComp(CStr(f(6)), CStr(f(7)), vbTextCompare) = 0 Then
+        Err.Raise MB_ERR + 413, , "Move source and destination are equal."
+    End If
+    If MB_ByteCount(CStr(f(8))) < 0 Then Err.Raise MB_ERR + 414, , "Invalid move byte count."
+    If CStr(f(1)) <> MBM_OperationId(CStr(f(2)), CStr(f(6)), CStr(f(7)), CStr(f(9))) Then
+        Err.Raise MB_ERR + 415, , "Move operation identity mismatch."
+    End If
+End Sub
+
+Private Sub MBM_CacheMove(ByVal f As Variant)
+    Dim prior As Variant, phase As String, i As Long
+    phase = CStr(f(3))
+    If mbmOps.Exists(CStr(f(1))) Then
+        prior = MBM_Unpack(CStr(mbmOps(CStr(f(1)))), 11)
+        For i = 0 To 9
+            If i <> 3 Then
+                If CStr(prior(i)) <> CStr(f(i)) Then Err.Raise MB_ERR + 416, , "Move operation fields changed."
+            End If
+        Next i
+    ElseIf phase <> "PREPARE" Then
+        Err.Raise MB_ERR + 417, , "Move record has no prior PREPARE."
+    End If
+    If phase = "COMMIT" Then
+        If Not mbmOps.Exists(CStr(f(1))) Then Err.Raise MB_ERR + 417, , "COMMIT has no PREPARE."
+        If prior(3) <> "PREPARE" Then Err.Raise MB_ERR + 418, , "Unexpected forward COMMIT."
+        MBM_SetRedirect CStr(f(6)), CStr(f(7)), CStr(f(9)), CStr(f(4))
+    ElseIf phase = "UNDO_COMMIT" Then
+        If prior(3) <> "UNDO_PREPARE" Then Err.Raise MB_ERR + 419, , "Unexpected undo COMMIT."
+        MBM_SetRedirect CStr(f(7)), CStr(f(6)), CStr(f(9)), CStr(f(5))
+    ElseIf phase = "UNDO_PREPARE" Then
+        If prior(3) <> "COMMIT" And prior(3) <> "UNDO_ABORT" Then
+            Err.Raise MB_ERR + 420, , "Only a completed move can be undone."
+        End If
+    ElseIf phase = "PREPARE" And mbmOps.Exists(CStr(f(1))) Then
+        If prior(3) <> "ABORT" And prior(3) <> "UNDO_COMMIT" Then
+            Err.Raise MB_ERR + 421, , "Unexpected repeated PREPARE."
+        End If
+    ElseIf phase = "ABORT" Then
+        If prior(3) <> "PREPARE" Then Err.Raise MB_ERR + 422, , "Unexpected move ABORT."
+    ElseIf phase = "UNDO_ABORT" Then
+        If prior(3) <> "UNDO_PREPARE" Then Err.Raise MB_ERR + 423, , "Unexpected undo ABORT."
+    End If
+    mbmOps(CStr(f(1))) = MB_EncodeFields(f)
+End Sub
+
+Private Sub MBM_AppendMove(ByVal fields As Variant, ByVal phase As String)
+    Dim stream As Object, payload As String, path As String, n As Long, detail As String
+    On Error GoTo Failed
+    fields(3) = phase: fields(10) = MB_Stamp(Now)
+    MBM_ValidateMoveRow fields
+    payload = MB_EncodeFields(fields)
+    path = MBM_JournalPath()
+    Set stream = gFSO.OpenTextFile(path, 8, True, -1)
+    MB_WriteCheckedLine stream, payload
+    stream.Close
+    Set stream = Nothing
+    MBM_FlushPath path
+    MBM_CacheMove fields
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    gFatal = True
+    gFatalText = "Move journal cannot be persisted: " & detail
+    Err.Raise n, "MBM_AppendMove", gFatalText
+End Sub
+
+Private Sub MBM_VerifyFile(ByVal path As String, ByVal root As String, _
+                            ByVal expectedBytes As String, ByVal expectedHash As String)
+    path = MBM_File(path, root, True)
+    If CDbl(gFSO.GetFile(path).Size) <> MB_ByteCount(expectedBytes) Then
+        Err.Raise MB_ERR + 424, , "Move source/destination size changed: " & path
+    End If
+    If MBH_HashFile(path) <> expectedHash Then
+        Err.Raise MB_ERR + 425, , "Move source/destination hash changed: " & path
+    End If
+End Sub
+
+Private Sub MBM_Recover(ByVal f As Variant)
+    Dim source As String, target As String, sourceRoot As String, targetRoot As String
+    Dim reverse As Boolean, sourceExists As Boolean, targetExists As Boolean
+    reverse = (f(3) = "UNDO_PREPARE")
+    source = CStr(f(6)): target = CStr(f(7))
+    sourceRoot = CStr(f(5)): targetRoot = CStr(f(4))
+    If reverse Then
+        source = CStr(f(7)): target = CStr(f(6))
+        sourceRoot = CStr(f(4)): targetRoot = CStr(f(5))
+    End If
+    MBM_AcquireAccountLock CStr(f(4))
+    sourceExists = gFSO.FileExists(source): targetExists = gFSO.FileExists(target)
+    If sourceExists And Not targetExists Then
+        MBM_VerifyFile source, sourceRoot, CStr(f(8)), CStr(f(9))
+        If reverse Then MBM_AppendMove f, "UNDO_ABORT" Else MBM_AppendMove f, "ABORT"
+    ElseIf targetExists And Not sourceExists Then
+        MBM_VerifyFile target, targetRoot, CStr(f(8)), CStr(f(9))
+        If reverse Then MBM_AppendMove f, "UNDO_COMMIT" Else MBM_AppendMove f, "COMMIT"
+        gMoveRecovered = gMoveRecovered + 1
+    Else
+        gMoveReview = gMoveReview + 1
+        Err.Raise MB_ERR + 426, "MBM_Recover", _
+                  "Unresolved interrupted move (both paths exist or both are missing): " & source & " => " & target
+    End If
+End Sub
+
+Private Sub MBM_LoadMoves()
+    Dim stream As Object, line As String, f As Variant, path As String, key As Variant
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    mbmLoaded = False
+    Set mbmOps = CreateObject("Scripting.Dictionary")
+    Set mbmRedirects = CreateObject("Scripting.Dictionary")
+    mbmOps.CompareMode = vbBinaryCompare: mbmRedirects.CompareMode = vbTextCompare
+    path = MBM_JournalPath()
+    If gFSO.FileExists(path) Then
+        If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 427, , "Move journal is truncated (odd UTF-16 byte count)."
+        Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+        Do Until stream.AtEndOfStream
+            If Not MB_ContinueWork() Then GoTo Cancelled
+            line = stream.ReadLine
+            If Len(line) > 0 Then
+                f = MB_ReadCheckedLine(line, 11)
+                MBM_ValidateMoveRow f
+                MBM_CacheMove f
+            End If
+        Loop
+        stream.Close
+        Set stream = Nothing
+    End If
+    For Each key In mbmOps.Keys
+        If Not MB_ContinueWork() Then GoTo Cancelled
+        f = MBM_Unpack(CStr(mbmOps(key)), 11)
+        If f(3) = "PREPARE" Or f(3) = "UNDO_PREPARE" Then MBM_Recover f
+    Next key
+    mbmLoaded = True
+    Exit Sub
+Cancelled:
+    If Not stream Is Nothing Then stream.Close
+    mbmLoaded = False
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    gFatal = True
+    gFatalText = "Move history requires recovery/review; new exports are blocked. " & detail
+    Err.Raise n, "MBM_LoadMoves", gFatalText
+End Sub
+
+Private Function MBM_Destination(ByVal source As String, ByVal parent As String, _
+                                  ByVal reserved As Object) As String
+    Dim leaf As String, stem As String, extension As String, suffix As String
+    Dim candidate As String, budget As Long, n As Long, identity As String
+    leaf = CStr(gFSO.GetFileName(source))
+    extension = CStr(gFSO.GetExtensionName(source))
+    If Len(extension) > 0 Then extension = "." & extension
+    stem = CStr(gFSO.GetBaseName(source))
+    identity = Left$(MBH_HashText(LCase$(source)), 16)
+    budget = MBH_MAX_PATH_UNITS - Len(parent) - 1
+    If Len(leaf) > budget Then
+        suffix = "__" & identity
+        leaf = MBH_SafeComponent(stem, budget - Len(extension) - Len(suffix), "file") & suffix & extension
+    End If
+    candidate = MBH_JoinPath(parent, leaf)
+    If StrComp(candidate, source, vbTextCompare) = 0 Then
+        MBM_Destination = source
+        Exit Function
+    End If
+    If Not gFSO.FileExists(candidate) And Not gFSO.FolderExists(candidate) And Not reserved.Exists(candidate) Then
+        reserved.Add candidate, True
+        MBM_Destination = candidate
+        Exit Function
+    End If
+    For n = 0 To 99999
+        suffix = "__" & identity
+        If n > 0 Then suffix = suffix & "_" & Format$(n, "00000")
+        leaf = MBH_SafeComponent(stem, budget - Len(extension) - Len(suffix), "file") & suffix & extension
+        candidate = MBH_JoinPath(parent, leaf)
+        If Not gFSO.FileExists(candidate) And Not gFSO.FolderExists(candidate) And Not reserved.Exists(candidate) Then
+            reserved.Add candidate, True
+            MBM_Destination = candidate
+            Exit Function
+        End If
+    Next n
+    Err.Raise MB_ERR + 428, , "Cannot reserve a distinct year/month destination."
+End Function
+
+Private Sub MBM_PlanItem(ByVal output As Object, ByVal planId As String, ByVal accountRoot As String, _
+                          ByVal sourceRoot As String, ByVal source As String, ByVal reserved As Object, _
+                          ByVal seen As Object, Optional ByVal knownDate As Date = 0, _
+                          Optional ByVal expectedHash As String = "")
+    Dim stamp As Date, reason As String, parent As String, target As String, f As Object
+    Dim kind As String, bytes As String, digest As String, beforeDate As Date
+    Dim n As Long, detail As String
+    On Error GoTo Review
+    source = MBM_File(source, sourceRoot, True)
+    If seen.Exists(source) Then Exit Sub
+    seen.Add source, True
+    stamp = knownDate
+    If stamp = 0 Then
+        If Not MBY_FileMonth(source, stamp, reason) Then
+            kind = "SKIP"
+            If LCase$(Right$(source, 4)) = ".msg" Or Len(expectedHash) > 0 Then reason = "REVIEW: " & reason
+            GoTo Record
+        End If
+    End If
+    If Not MB_ValidDate(stamp) Then Err.Raise MB_ERR + 429, , "No valid archive date."
+    parent = MBY_MonthDirectory(accountRoot, stamp)
+    target = MBM_Destination(source, parent, reserved)
+    Set f = gFSO.GetFile(source)
+    bytes = Format$(CDbl(f.Size), "0")
+    If StrComp(target, source, vbTextCompare) = 0 Then
+        If Len(expectedHash) > 0 And Not gAutoMaintenance Then
+            If MBH_HashFile(source) <> expectedHash Then
+                Err.Raise MB_ERR + 430, , "Previously indexed file hash does not match."
+            End If
+        End If
+        kind = "KEEP": reason = "Already in the correct year/month folder."
+        GoTo Record
+    End If
+    beforeDate = CDate(f.DateLastModified)
+    digest = MBH_HashFile(source)
+    If Len(expectedHash) > 0 Then
+        If digest <> expectedHash Then Err.Raise MB_ERR + 430, , "Previously indexed file hash does not match."
+    End If
+    Set f = gFSO.GetFile(source)
+    If Format$(CDbl(f.Size), "0") <> bytes Or CDate(f.DateLastModified) <> beforeDate Then
+        Err.Raise MB_ERR + 431, , "File changed while the organization plan was being built."
+    End If
+    kind = "MOVE": reason = "Same-volume move only; preserve original bytes."
+    GoTo Record
+Review:
+    n = Err.Number: detail = Err.Description
+    If gFatal Then Err.Raise n, "MBM_PlanItem", detail
+    kind = "SKIP": target = "": digest = "": reason = "REVIEW: " & detail
+Record:
+    If Len(bytes) = 0 Then bytes = "0"
+    MB_WriteCheckedLine output, MB_EncodeFields(Array("MBPLAN3", planId, kind, accountRoot, _
+                         sourceRoot, source, target, bytes, digest, MB_Stamp(stamp), reason))
+    Select Case kind
+        Case "MOVE": gMovePlanned = gMovePlanned + 1
+        Case "KEEP": gMoveKept = gMoveKept + 1
+        Case Else
+            gMoveSkipped = gMoveSkipped + 1
+            If Left$(reason, 7) = "REVIEW:" Then gMovePlanReview = gMovePlanReview + 1
+    End Select
+End Sub
+
+Private Function MBM_BuildPlan(ByVal accountRoot As String, ByVal planPath As String, _
+                                Optional ByVal extraFiles As Variant) As Long
+    Dim output As Object, pending As Collection, folder As Object, child As Object, f As Object
+    Dim reserved As Object, seen As Object, folders As Object, planId As String, current As String
+    Dim extra As Variant, path As String, n As Long, detail As String, ordinal As Long
+    On Error GoTo Failed
+    If Not mbmLoaded Then MBM_LoadMoves
+    If gCancel Then Exit Function
+    If Not mbmLoaded Then Err.Raise MB_ERR + 408, , "Move history is incomplete."
+    accountRoot = MBH_NormalizePath(accountRoot)
+    If MB_PathWithin(accountRoot, gRoot) Then Err.Raise MB_ERR + 432, , "Choose the account folder outside the managed state tree."
+    MBM_AcquireAccountLock accountRoot
+    gMovePlanned = 0: gMoveKept = 0: gMoveSkipped = 0: gMovePlanReview = 0
+    planPath = MBH_NormalizePath(planPath)
+    If Not MB_PathWithin(planPath, gRunDir) Then Err.Raise MB_ERR + 433, , "Plan must be in this run directory."
+    planId = MBH_HashText("MBPLAN3|" & gRunId & "|" & accountRoot & "|" & planPath)
+    Set reserved = CreateObject("Scripting.Dictionary"): reserved.CompareMode = vbTextCompare
+    Set seen = CreateObject("Scripting.Dictionary"): seen.CompareMode = vbTextCompare
+    Set folders = CreateObject("Scripting.Dictionary"): folders.CompareMode = vbTextCompare
+    Set pending = New Collection: pending.Add accountRoot
+    Set output = gFSO.CreateTextFile(planPath, False, True)
+    MB_WriteCheckedLine output, MB_EncodeFields(Array("MBPLAN3", planId, "HEADER", accountRoot, _
+                         "", "", "", "0", "", "", "SentOn month; original filename date prefix preferred."))
+    ' Known indexed dates/hashes take precedence over filename heuristics.
+    If Not IsMissing(extraFiles) Then
+        If IsObject(extraFiles) Then
+            For Each extra In extraFiles
+                If Not MB_ContinueWork() Then GoTo Cancelled
+                path = MBH_NormalizePath(CStr(extra(0)))
+                If MB_PathWithin(path, accountRoot) Then
+                    MBM_PlanItem output, planId, accountRoot, accountRoot, path, reserved, seen, CDate(extra(1)), CStr(extra(2))
+                Else
+                    If Not MB_PathWithin(path, MBH_JoinPath(gRoot, "messages")) And _
+                       Not MB_PathWithin(path, MBH_JoinPath(gRoot, "attachments")) Then
+                        Err.Raise MB_ERR + 434, , "Extra organization source is outside committed managed namespaces."
+                    End If
+                    MBM_PlanItem output, planId, accountRoot, gRoot, path, reserved, seen, CDate(extra(1)), CStr(extra(2))
+                End If
+            Next extra
+        End If
+    End If
+    Do While pending.Count > 0
+        If Not MB_ContinueWork() Then GoTo Cancelled
+        current = CStr(pending(pending.Count)): pending.Remove pending.Count
+        If Not folders.Exists(current) And Not MB_PathWithin(current, gRoot) Then
+            folders.Add current, True
+            MBM_CheckAncestors current
+            If Not MBL_HasOwner(current) Then
+                Set folder = gFSO.GetFolder(current)
+                For Each f In folder.Files
+                    If Not MB_ContinueWork() Then GoTo Cancelled
+                    path = CStr(f.Path)
+                    If Left$(LCase$(CStr(f.Name)), 4) <> "_mb_" Then
+                        MBM_PlanItem output, planId, accountRoot, accountRoot, path, reserved, seen
+                    End If
+                Next f
+                For Each child In folder.SubFolders
+                    pending.Add MBH_NormalizePath(CStr(child.Path))
+                Next child
+            End If
+        End If
+    Loop
+    ordinal = gMovePlanned + gMoveKept + gMoveSkipped
+    MB_WriteCheckedLine output, MB_EncodeFields(Array("MBPLAN3", planId, "END", accountRoot, _
+                         "", "", "", CStr(ordinal), "", "", "Plan complete; no files have moved."))
+    output.Close: Set output = Nothing
+    MBM_FlushPath planPath
+    gMovePlanPath = planPath
+    MBM_BuildPlan = gMovePlanned
+    Exit Function
+Cancelled:
+    output.Close: Set output = Nothing
+    gMovePlanPath = ""
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not output Is Nothing Then output.Close
+    On Error GoTo 0
+    gMovePlanPath = ""
+    Err.Raise n, "MBM_BuildPlan", detail
+End Function
+
+Private Sub MBM_ValidatePlan(ByVal planPath As String, ByRef planId As String, ByRef accountRoot As String)
+    Dim readStream As Object, line As String, fields As Variant, header As Boolean, footer As Boolean
+    Dim count As Long, sourceRoot As String, p As String, targets As Object, sources As Object
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    gMovePlanned = 0: gMoveKept = 0: gMoveSkipped = 0: gMovePlanReview = 0
+    planPath = MBH_NormalizePath(planPath)
+    If Not MBS_PlanPathAllowed(planPath) Then Err.Raise MB_ERR + 435, , "Plan is not in this archive's run history."
+    If CDbl(gFSO.GetFile(planPath).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 436, , "Organization plan is truncated."
+    Set targets = CreateObject("Scripting.Dictionary"): targets.CompareMode = vbTextCompare
+    Set sources = CreateObject("Scripting.Dictionary"): sources.CompareMode = vbTextCompare
+    Set readStream = gFSO.OpenTextFile(planPath, 1, False, -1)
+    Do Until readStream.AtEndOfStream
+        If Not MB_ContinueWork() Then GoTo Cancelled
+        line = readStream.ReadLine
+        If Len(line) > 0 Then
+            If footer Then Err.Raise MB_ERR + 437, , "Unexpected records after plan END."
+            fields = MB_ReadCheckedLine(line, 11)
+            If fields(0) <> "MBPLAN3" Then Err.Raise MB_ERR + 438, , "Unknown organization plan schema."
+            If Not header Then
+                If fields(2) <> "HEADER" Or Not MB_IsHexKey(CStr(fields(1))) Then Err.Raise MB_ERR + 439, , "Invalid plan header."
+                planId = CStr(fields(1)): accountRoot = MBH_NormalizePath(CStr(fields(3)))
+                If MB_PathWithin(accountRoot, gRoot) Then Err.Raise MB_ERR + 432, , "Invalid account root in plan."
+                header = True
+            Else
+                If fields(1) <> planId Or StrComp(CStr(fields(3)), accountRoot, vbTextCompare) <> 0 Then
+                    Err.Raise MB_ERR + 440, , "Plan identity/root changed between rows."
+                End If
+                If fields(2) = "END" Then
+                    If MB_ByteCount(CStr(fields(7))) <> CDbl(count) Then Err.Raise MB_ERR + 441, , "Plan END count mismatch."
+                    footer = True
+                Else
+                    count = count + 1
+                    If fields(2) <> "MOVE" And fields(2) <> "KEEP" And fields(2) <> "SKIP" Then
+                        Err.Raise MB_ERR + 442, , "Unknown plan action."
+                    End If
+                    Select Case CStr(fields(2))
+                        Case "MOVE": gMovePlanned = gMovePlanned + 1
+                        Case "KEEP": gMoveKept = gMoveKept + 1
+                        Case "SKIP"
+                            gMoveSkipped = gMoveSkipped + 1
+                            If Left$(CStr(fields(10)), 7) = "REVIEW:" Then gMovePlanReview = gMovePlanReview + 1
+                    End Select
+                    If fields(2) <> "SKIP" Then
+                        sourceRoot = MBH_NormalizePath(CStr(fields(4)))
+                        p = MBM_File(CStr(fields(5)), sourceRoot, False)
+                        If sources.Exists(p) Then Err.Raise MB_ERR + 443, , "Duplicate source in organization plan."
+                        sources.Add p, True
+                        If StrComp(sourceRoot, accountRoot, vbTextCompare) <> 0 Then
+                            If StrComp(sourceRoot, gRoot, vbTextCompare) <> 0 Then Err.Raise MB_ERR + 444, , "Unexpected source root."
+                            If Not MB_PathWithin(p, MBH_JoinPath(gRoot, "messages")) And _
+                               Not MB_PathWithin(p, MBH_JoinPath(gRoot, "attachments")) Then
+                                Err.Raise MB_ERR + 434, , "Unexpected managed source namespace."
+                            End If
+                        End If
+                        p = MBM_File(CStr(fields(6)), accountRoot, False)
+                        If targets.Exists(p) Then Err.Raise MB_ERR + 445, , "Duplicate target in organization plan."
+                        targets.Add p, True
+                        If fields(2) = "MOVE" Then
+                            If Not MB_IsHexKey(CStr(fields(8))) Then Err.Raise MB_ERR + 446, , "Invalid planned file hash."
+                            If StrComp(CStr(fields(5)), CStr(fields(6)), vbTextCompare) = 0 Then Err.Raise MB_ERR + 413, , "MOVE paths are equal."
+                        Else
+                            If StrComp(CStr(fields(5)), CStr(fields(6)), vbTextCompare) <> 0 Then Err.Raise MB_ERR + 447, , "KEEP paths differ."
+                        End If
+                        If StrComp(CStr(gFSO.GetParentFolderName(CStr(fields(6)))), _
+                           MBY_MonthDirectory(accountRoot, MB_ParseStamp(CStr(fields(9)))), vbTextCompare) <> 0 Then
+                            Err.Raise MB_ERR + 448, , "Target does not match its recorded year/month."
+                        End If
+                        If MB_ByteCount(CStr(fields(7))) < 0 Then Err.Raise MB_ERR + 414, , "Invalid planned file size."
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    readStream.Close: Set readStream = Nothing
+    If Not header Or Not footer Then Err.Raise MB_ERR + 449, , "Organization plan is incomplete; no files may move."
+    Exit Sub
+Cancelled:
+    If Not readStream Is Nothing Then readStream.Close
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not readStream Is Nothing Then readStream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBM_ValidatePlan", detail
+End Sub
+
+Private Sub MBM_DoMove(ByVal fields As Variant, ByVal reverse As Boolean)
+    Dim source As String, target As String, sourceRoot As String, targetRoot As String
+    Dim winError As Long, preparePhase As String, commitPhase As String
+    source = CStr(fields(6)): target = CStr(fields(7))
+    sourceRoot = CStr(fields(5)): targetRoot = CStr(fields(4))
+    preparePhase = "PREPARE": commitPhase = "COMMIT"
+    If reverse Then
+        source = CStr(fields(7)): target = CStr(fields(6))
+        sourceRoot = CStr(fields(4)): targetRoot = CStr(fields(5))
+        preparePhase = "UNDO_PREPARE": commitPhase = "UNDO_COMMIT"
+    End If
+    MBM_VerifyFile source, sourceRoot, CStr(fields(8)), CStr(fields(9))
+    If gFSO.FileExists(target) Or gFSO.FolderExists(target) Then
+        Err.Raise MB_ERR + 450, , "Destination is occupied; both files are preserved: " & target
+    End If
+    MB_EnsureDir CStr(gFSO.GetParentFolderName(target))
+    MBM_CheckAncestors CStr(gFSO.GetParentFolderName(target))
+    MBM_AppendMove fields, preparePhase
+    If MBM_MoveFileExW(StrPtr(source), StrPtr(target), 8) = 0 Then
+        winError = Err.LastDllError
+        ' Keep PREPARE as pending: the next load resolves actual filesystem state.
+        Err.Raise MB_ERR + 451, "MBM_DoMove", _
+                  "Same-volume no-overwrite move failed. Win32=" & CStr(winError) & "; " & source & " => " & target
+    End If
+    MBM_VerifyFile target, targetRoot, CStr(fields(8)), CStr(fields(9))
+    If gFSO.FileExists(source) Then Err.Raise MB_ERR + 452, , "Source still exists after move; recovery required."
+    MBM_AppendMove fields, commitPhase
+End Sub
+
+Private Sub MBM_ApplyPlan(ByVal planPath As String)
+    Dim planId As String, accountRoot As String, readStream As Object, line As String
+    Dim p As Variant, fields As Variant, prior As Variant, key As String
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    gMoveApplied = 0: gMoveAlready = 0
+    If Not mbmLoaded Then MBM_LoadMoves
+    If gCancel Then Exit Sub
+    If Not mbmLoaded Then Err.Raise MB_ERR + 408, , "Move history is incomplete."
+    MBM_ValidatePlan planPath, planId, accountRoot
+    If gCancel Then Exit Sub
+    MBM_AcquireAccountLock accountRoot
+    Set readStream = gFSO.OpenTextFile(planPath, 1, False, -1)
+    Do Until readStream.AtEndOfStream
+        If Not MB_ContinueWork() Then Exit Do
+        line = readStream.ReadLine
+        If Len(line) > 0 Then
+            p = MB_ReadCheckedLine(line, 11)
+            If p(2) = "MOVE" Then
+                key = MBM_OperationId(planId, CStr(p(5)), CStr(p(6)), CStr(p(8)))
+                fields = Array("MBMOVE3", key, planId, "PREPARE", accountRoot, CStr(p(4)), _
+                               CStr(p(5)), CStr(p(6)), CStr(p(7)), CStr(p(8)), MB_Stamp(Now))
+                If mbmOps.Exists(key) Then
+                    prior = MBM_Unpack(CStr(mbmOps(key)), 11)
+                    If prior(3) = "COMMIT" Or prior(3) = "UNDO_ABORT" Then
+                        MBM_VerifyFile CStr(p(6)), accountRoot, CStr(p(7)), CStr(p(8))
+                        gMoveAlready = gMoveAlready + 1
+                        GoTo NextRow
+                    End If
+                End If
+                MBM_DoMove fields, False
+                gMoveApplied = gMoveApplied + 1
+            End If
+        End If
+NextRow:
+    Loop
+    readStream.Close: Set readStream = Nothing
+    gMovePlanPath = planPath
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not readStream Is Nothing Then readStream.Close
+    On Error GoTo 0
+    gMoveReview = gMoveReview + 1
+    gFatal = True
+    gFatalText = "Organization stopped; preserve the plan and move journal. " & detail
+    Err.Raise n, "MBM_ApplyPlan", gFatalText
+End Sub
+
+Private Sub MBM_UndoPlan(ByVal planPath As String)
+    Dim planId As String, accountRoot As String, readStream As Object, line As String
+    Dim p As Variant, fields As Variant, key As String, n As Long, detail As String
+    On Error GoTo Failed
+    gMoveRestored = 0: gMoveAlready = 0
+    If Not mbmLoaded Then MBM_LoadMoves
+    If gCancel Then Exit Sub
+    If Not mbmLoaded Then Err.Raise MB_ERR + 408, , "Move history is incomplete."
+    MBM_ValidatePlan planPath, planId, accountRoot
+    If gCancel Then Exit Sub
+    MBM_AcquireAccountLock accountRoot
+    ' Every planned target was unoccupied and reserved; no target is a planned
+    ' source. Therefore forward plan order is also safe for restoring the files.
+    Set readStream = gFSO.OpenTextFile(planPath, 1, False, -1)
+    Do Until readStream.AtEndOfStream
+        If Not MB_ContinueWork() Then Exit Do
+        line = readStream.ReadLine
+        If Len(line) > 0 Then
+            p = MB_ReadCheckedLine(line, 11)
+            If p(2) = "MOVE" Then
+                key = MBM_OperationId(planId, CStr(p(5)), CStr(p(6)), CStr(p(8)))
+                If mbmOps.Exists(key) Then
+                    fields = MBM_Unpack(CStr(mbmOps(key)), 11)
+                    If fields(3) = "COMMIT" Or fields(3) = "UNDO_ABORT" Then
+                        MBM_DoMove fields, True
+                        gMoveRestored = gMoveRestored + 1
+                    ElseIf fields(3) = "UNDO_COMMIT" Then
+                        MBM_VerifyFile CStr(fields(6)), CStr(fields(5)), CStr(fields(8)), CStr(fields(9))
+                        gMoveAlready = gMoveAlready + 1
+                    End If
+                End If
+            End If
+        End If
+    Loop
+    readStream.Close: Set readStream = Nothing
+    gMovePlanPath = planPath
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not readStream Is Nothing Then readStream.Close
+    On Error GoTo 0
+    gMoveReview = gMoveReview + 1
+    gFatal = True
+    gFatalText = "Undo stopped; occupied/changed originals are preserved. " & detail
+    Err.Raise n, "MBM_UndoPlan", gFatalText
+End Sub
+
+
+Private Function MBM_PlanAccountRoot(ByVal planPath As String) As String
+    Dim planId As String, root As String
+    MBM_ValidatePlan planPath, planId, root
+    If Not gCancel Then MBM_PlanAccountRoot = root
+End Function
+
+Private Sub MBM_RequirePlanAccount(ByVal planPath As String, ByVal expectedRoot As String)
+    Dim root As String
+    root = MBM_PlanAccountRoot(planPath)
+    If gCancel Then Exit Sub
+    If StrComp(root, MBH_NormalizePath(expectedRoot), vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 453, , "The saved plan belongs to a different account folder. Create a new preview."
+    End If
+End Sub
+
+Private Function MBM_Summary() As String
+    MBM_Summary = "Year/month files: planned moves=" & CStr(gMovePlanned) & _
+                  "; already organized=" & CStr(gMoveKept) & _
+                  "; unchanged=" & CStr(gMoveSkipped) & "; plan review=" & CStr(gMovePlanReview) & vbCrLf & _
+                  "Moved=" & CStr(gMoveApplied) & "; prior moves verified=" & CStr(gMoveAlready) & _
+                  "; restored=" & CStr(gMoveRestored) & "; recovered=" & CStr(gMoveRecovered) & _
+                  "; move errors=" & CStr(gMoveReview)
+    If Len(gMovePlanPath) > 0 Then MBM_Summary = MBM_Summary & vbCrLf & "Plan: " & gMovePlanPath
+End Function

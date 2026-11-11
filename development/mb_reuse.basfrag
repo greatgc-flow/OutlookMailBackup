@@ -1,0 +1,266 @@
+' =================== Existing-export references and policy ==================
+Public Sub MB_RegisterLegacyAll()
+    ' No MailItem.SaveAs or persistent separate-attachment export in this mode.
+    ' Only verified references / logs are written; temporary attachment bytes
+    ' may be written and removed to compare ordinary attachment payloads.
+    MB_Run "REGISTER_LEGACY", False, True, False
+End Sub
+
+Public Sub MB_ChooseLegacyFolder()
+    Dim selectedBase As String, managed As String, legacy As String, held As Boolean
+    Dim n As Long, detail As String, cleanup As String, folder As Object
+    If gBusy Then
+        MsgBox "A backup/verification is already running. Finish or cancel it first.", vbInformation
+        Exit Sub
+    End If
+    On Error GoTo Failed
+    gBusy = True
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    managed = MBP_ResolveBackupRoot(selectedBase)
+    If Len(managed) = 0 Then GoTo CleanUp
+    legacy = MBP_PickExistingFolder("Choose the folder containing the OLD exported MSG files.", _
+                                   MBP_ResolveLegacyRoot(selectedBase, managed))
+    If Len(legacy) = 0 Then GoTo CleanUp
+    legacy = MBH_NormalizePath(legacy)
+    If Not gFSO.FolderExists(legacy) Then Err.Raise MB_ERR + 260, , "The legacy folder is unavailable."
+    If MB_PathWithin(legacy, managed) Then
+        Err.Raise MB_ERR + 261, , "Select the original archive, outside the managed SafeV2 tree."
+    End If
+    Set folder = gFSO.GetFolder(legacy)
+    If (CLng(folder.Attributes) And 1024) <> 0 Then
+        Err.Raise MB_ERR + 262, , "A reparse-point legacy root cannot be selected."
+    End If
+    MBH_EnsureDirectory managed
+    MBH_AcquireRunLock MBH_JoinPath(managed, "backup.lock")
+    held = True
+    MB_CheckOwnership managed
+    MBP_PersistBackupRoot selectedBase
+    MBP_PersistLegacyRoot managed, legacy
+    GoTo CleanUp
+Failed:
+    n = Err.Number: detail = Err.Description
+CleanUp:
+    On Error Resume Next
+    If held Then
+        Err.Clear
+        MBH_ReleaseRunLock
+        If Err.Number <> 0 Then cleanup = " Lock release: " & Err.Description
+    End If
+    Err.Clear
+    MBH_ReleaseCrypto
+    If Err.Number <> 0 Then cleanup = cleanup & " Crypto release: " & Err.Description
+    Set folder = Nothing: Set gFSO = Nothing
+    gBusy = False
+    On Error GoTo 0
+    If n <> 0 Or Len(cleanup) > 0 Then
+        MsgBox "Cannot finish choosing the old archive." & vbCrLf & detail & cleanup, vbExclamation
+    ElseIf Len(legacy) > 0 Then
+        MsgBox "Old archive remembered: " & legacy & vbCrLf & _
+               "Run MB_RegisterLegacyAll to link verified files without exporting mail again.", vbInformation
+    End If
+End Sub
+
+Private Function MB_PathWithin(ByVal path As String, ByVal root As String) As Boolean
+    Dim prefix As String
+    path = MBH_NormalizePath(path): root = MBH_NormalizePath(root)
+    If StrComp(path, root, vbTextCompare) = 0 Then MB_PathWithin = True: Exit Function
+    prefix = root
+    If Right$(prefix, 1) <> "\" Then prefix = prefix & "\"
+    MB_PathWithin = (StrComp(Left$(path, Len(prefix)), prefix, vbTextCompare) = 0)
+End Function
+
+Private Function MB_LegacyBoundPath(ByVal path As String, ByVal root As String) As String
+    ' Structural validation only: missing/offline files remain indexed tombstones.
+    ' Runtime verification separately checks existence, reparse points and bytes.
+    path = MBH_NormalizePath(path): root = MBH_NormalizePath(root)
+    If StrComp(path, root, vbTextCompare) = 0 Or Not MB_PathWithin(path, root) Then
+        Err.Raise MB_ERR + 263, , "Legacy path is outside its recorded archive root."
+    End If
+    If LCase$(Right$(path, 4)) <> ".msg" Then
+        Err.Raise MB_ERR + 264, , "A legacy reference must point to a MSG file."
+    End If
+    MB_LegacyBoundPath = path
+End Function
+
+Private Function MB_LegacyOwnerKey(ByVal path As String, ByVal digest As String) As String
+    If Not MB_IsHexKey(digest) Then Err.Raise MB_ERR + 271, , "Invalid legacy owner file hash."
+    ' A path can be reused after a verified move. Bind ownership to its recorded
+    ' bytes as well, so a later different file at that path is not the old file.
+    MB_LegacyOwnerKey = LCase$(MBH_NormalizePath(path)) & "|" & digest
+End Function
+
+Private Sub MB_CacheLegacy(ByVal key As String, ByVal path As String, ByVal bytes As String, _
+                           ByVal digest As String, ByVal root As String, ByVal sourceKey As String, _
+                           ByVal validation As String)
+    Dim canonical As String, owner As String
+    canonical = MB_LegacyBoundPath(path, root)
+    If validation <> MB_LEGACY_VALIDATION And validation <> MB_LEGACY_VALIDATION_V2 And _
+       validation <> MB_LEGACY_VALIDATION_V1 Then _
+        Err.Raise MB_ERR + 265, , "Unknown legacy validation policy."
+    If MB_ByteCount(bytes) <= 0 Then Err.Raise MB_ERR + 266, , "Empty legacy MSG reference."
+    owner = MB_LegacyOwnerKey(canonical, digest)
+    If gLegacyOwners.Exists(owner) Then
+        If CStr(gLegacyOwners(owner)) <> sourceKey Then
+            Err.Raise MB_ERR + 267, , "One legacy file is already assigned to a different source item."
+        End If
+    End If
+    gLegacyOwners(owner) = sourceKey
+    gLegacyBindings(key) = MB_EncodeFields(Array(MBH_NormalizePath(root), sourceKey))
+    gLegacySources(sourceKey) = key
+    gIndex(key) = MB_EncodeFields(Array(canonical, bytes, digest, validation))
+End Sub
+
+Private Sub MB_LoadLegacyRow(ByVal f As Variant)
+    If CStr(f(13)) <> "0" Then Err.Raise MB_ERR + 268, , "Legacy reference has an attachment ordinal."
+    If MB_SourceKey(CStr(f(7)), CStr(f(8))) <> CStr(f(6)) Then
+        Err.Raise MB_ERR + 269, , "Legacy source identity checksum does not match."
+    End If
+    MB_CacheLegacy "L|" & CStr(f(2)), CStr(f(3)), CStr(f(4)), CStr(f(5)), _
+                   CStr(f(14)), CStr(f(6)), CStr(f(15))
+End Sub
+
+Private Function MB_LegacyBinding(ByVal key As String) As Variant
+    Dim fields As Variant
+    fields = Split(CStr(gLegacyBindings(key)), vbTab)
+    If UBound(fields) <> 1 Then Err.Raise MB_ERR + 270, , "Invalid legacy root binding."
+    fields(0) = MB_Unescape(CStr(fields(0)))
+    fields(1) = MB_Unescape(CStr(fields(1)))
+    MB_LegacyBinding = fields
+End Function
+
+Private Function MB_ReuseLegacy(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                                 ByVal revision As String, ByRef reason As String) As Long
+    ' 0=no candidate; 1=reused/adopted; 2=review, never SaveAs; 3=cancel.
+    Dim key As String, path As String, root As String, digest As String, bytes As Double
+    Dim fields As Variant, binding As Variant, result As Long, n As Long, detail As String
+    Dim ownerKey As String, expectedDigest As String, expectedBytes As Double
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    reason = ""
+    If gLegacySources.Exists(CStr(q(7))) Then
+        key = CStr(gLegacySources(CStr(q(7))))
+        fields = MB_IndexFields(key): binding = MB_LegacyBinding(key)
+        root = MBM_ResolvedRoot(CStr(fields(0)), CStr(fields(2)), CStr(binding(0)))
+        path = MBX_IndexedPath(key, fields, True)
+        If Not gFSO.FileExists(path) Then
+            reason = "A previously linked old MSG is unavailable. Restore it or review the legacy reference."
+            GoTo NeedsReview
+        End If
+        bytes = CDbl(gFSO.GetFile(path).Size)
+        If bytes <> MB_ByteCount(CStr(fields(1))) Then
+            reason = "A previously linked old MSG has changed size.": GoTo NeedsReview
+        End If
+        digest = MBH_HashFile(path)
+        If digest <> CStr(fields(2)) Then
+            reason = "A previously linked old MSG has changed SHA-256.": GoTo NeedsReview
+        End If
+        If key = "L|" & revision And CStr(fields(3)) = MB_LEGACY_VALIDATION And _
+           Not MBW_RequireContentCheck(CStr(q(7))) Then
+            MB_ReuseLegacy = 1
+            Exit Function
+        End If
+        ' Changed revisions and V1 records flow through the same guarded final
+        ' check as a new adoption. Preserve the original expected bytes/hash;
+        ' MBL_VerifyCandidate overwrites its ByRef result arguments.
+    Else
+        root = MBY_AccountRoot(CStr(q(1)))
+        If Len(root) = 0 Then MB_ReuseLegacy = 3: Exit Function
+        result = MBL_TryMatch(mail, path, digest, bytes, reason, root)
+        If result = 0 Then
+            MB_ReuseLegacy = 0
+            Exit Function
+        ElseIf result = 3 Then
+            MB_ReuseLegacy = 3
+            Exit Function
+        ElseIf result <> 1 Then
+            GoTo NeedsReview
+        End If
+    End If
+    path = MB_LegacyBoundPath(path, root)
+    expectedDigest = digest: expectedBytes = bytes
+    ownerKey = MB_LegacyOwnerKey(path, expectedDigest)
+    If gLegacyOwners.Exists(ownerKey) Then
+        If CStr(gLegacyOwners(ownerKey)) <> CStr(q(7)) Then
+            reason = "This old MSG is already linked to a different mailbox item."
+            GoTo NeedsReview
+        End If
+    End If
+    ' Earlier candidates may have yielded to Outlook or external processes.
+    ' Recheck the chosen file while denying write/delete, and keep that guard
+    ' until its L reference has actually been committed.
+    guard = MBH_GuardFile(path)
+    If Not MBL_VerifyCandidate(mail, path, root, digest, bytes, reason) Then GoTo NeedsReview
+    If digest <> expectedDigest Or bytes <> expectedBytes Then
+        reason = "Chosen legacy file changed since it was selected or last recorded.": GoTo NeedsReview
+    End If
+    If Not MB_SourceStable(mail, q, revision) Then
+        reason = "The source changed during legacy verification.": GoTo NeedsReview
+    End If
+    MB_RecordCommit "L", revision, path, bytes, digest, q, mail.Subject, 0, root, MB_LEGACY_VALIDATION
+    MBH_CloseGuard guard
+    MB_LogEvent "INFO", "LEGACY_LINKED_NO_SAVEAS", q(7), path, 0, _
+                "Original MSG kept in place; current source verified and indexed."
+    MB_ReuseLegacy = 1
+    Exit Function
+NeedsReview:
+    MBH_CloseGuard guard
+    If gCancel Then
+        MB_ReuseLegacy = 3
+    Else
+        MB_ReuseLegacy = 2
+    End If
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    If gFatal Then Err.Raise n, "MB_ReuseLegacy", detail
+    reason = "Legacy verification failed: " & detail
+    If gCancel Then
+        MB_ReuseLegacy = 3
+    Else
+        MB_ReuseLegacy = 2
+    End If
+End Function
+
+Private Function MB_NewExportAllowed(ByVal mail As Outlook.MailItem, ByRef reason As String, _
+                                     Optional ByVal verifiedKnownChange As Boolean = False) As Boolean
+    Dim folder As Outlook.Folder, root As String, stats As Variant
+    If gMode = "BENCHMARK" Then MB_NewExportAllowed = True: Exit Function
+    If gJournalIssues > 0 Then
+        reason = "The journal has invalid rows; new SaveAs is blocked until the history is reviewed."
+        Exit Function
+    End If
+    If Not gLegacyScanComplete Then
+        reason = "The old archive scan did not complete; an absent candidate is not trustworthy."
+        Exit Function
+    End If
+    Set folder = mail.Parent
+    root = MBY_GetMappedRoot(folder.StoreID)
+    If Len(root) = 0 Or Not gLegacyAccountStats.Exists(root) Then
+        reason = "No complete legacy catalog for this account."
+        Exit Function
+    End If
+    stats = gLegacyAccountStats(root)
+    ' The old-archive cutoff protects UNKNOWN historical mail from duplicates.
+    ' A stable same-source revision with an unchanged prior hash and explicitly
+    ' different bounded content is a new version, even at an old received date.
+    ' Global index/catalog completion still applies above this narrow bypass.
+    If verifiedKnownChange Then MB_NewExportAllowed = True: Exit Function
+    If CLng(stats(1)) > 0 Then
+        reason = "Some old MSGs in this account have no readable filename/SentOn lookup; unmatched mail needs review."
+        Exit Function
+    End If
+    If CLng(stats(0)) > 0 Then
+        If MB_EffectiveDate(mail) <= CDate(stats(2)) Then
+            reason = "No verified old-file match; this message predates the old archive's latest write. Automatic re-export is blocked."
+            Exit Function
+        End If
+    End If
+    MB_NewExportAllowed = True
+End Function

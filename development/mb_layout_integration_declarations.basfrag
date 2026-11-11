@@ -1,0 +1,15 @@
+' MBS3 adds an immutable absolute account-root binding for N/T output records.
+' M/A keys remain the lookup namespace so MBS2 backups are still reusable.
+Private gExternalRoots As Object
+Private gRecordMeta As Object
+Private gStoreTokens As Object
+Private gManagedFilePaths As Object
+Private gLegacyAccountStats As Object
+Private gArchiveRoots As Collection
+Private gFilePlan As String
+Private gFileAccount As String
+Private gFileDetail As String
+Private gReuseBlocked As Boolean
+Private gReuseReason As String
+
+Private gFileExtraReview As Long

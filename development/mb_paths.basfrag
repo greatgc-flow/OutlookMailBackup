@@ -1,0 +1,530 @@
+' ================= Persistent filesystem folder selection ==================
+' MB_OUTPUT_ROOT is a historical default, never evidence of a saved selection.
+' A remembered, available base is reused without showing a folder dialog.
+' Unmanaged bases keep their existing files; managed writes use a SafeV2 child.
+' Resolve does not create the managed root or save settings. The caller must
+' acquire its run lock and validate ownership before persisting the choice.
+' Settings API: HKCU\Software\VB and VBA Program Settings\OutlookMailBackup.
+
+Private Sub MBP_Reset()
+    mbpLocatorPath = "": mbpLocatorHash = "": mbpLocatorStore = ""
+    mbpLocatorManaged = "": mbpLocatorAccount = ""
+    mbpLocatorObserved = False
+End Sub
+
+Private Sub MBP_NoReparse(ByVal path As String, ByVal fso As Object)
+    ' Folder resolution precedes gRoot initialization; use the supplied FSO.
+    Dim current As String, parent As String, entry As Object
+    current = MBH_NormalizePath(path)
+    Do
+        Set entry = Nothing
+        If fso.FileExists(current) Then
+            Set entry = fso.GetFile(current)
+        ElseIf fso.FolderExists(current) Then
+            Set entry = fso.GetFolder(current)
+        End If
+        If Not entry Is Nothing Then
+            If (CLng(entry.Attributes) And 1024) <> 0 Then _
+                Err.Raise MB_ERR + 215, , "Saved path traverses a link/reparse point: " & current
+        End If
+        If MBL_IsFileSystemRoot(current) Then Exit Do
+        parent = CStr(fso.GetParentFolderName(current))
+        If Len(parent) = 0 Or StrComp(parent, current, vbTextCompare) = 0 Then Exit Do
+        current = parent
+    Loop
+End Sub
+
+Private Function MBP_ReadOneLine(ByVal path As String, ByVal fso As Object) As String
+    Dim stream As Object, value As String, n As Long, detail As String
+    On Error GoTo Failed
+    MBP_NoReparse path, fso
+    If CDbl(fso.GetFile(path).Size) Mod 2 <> 0 Then _
+        Err.Raise MB_ERR + 216, , "Saved binding has an incomplete UTF-16 byte: " & path
+    Set stream = fso.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 216, , "Saved binding is empty: " & path
+    value = stream.ReadLine
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 216, , "Saved binding has extra data: " & path
+    stream.Close: Set stream = Nothing
+    MBP_ReadOneLine = value
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBP_ReadOneLine", detail
+End Function
+
+Private Function MBP_LocatorFile(ByVal storeId As String) As String
+    Dim base As String
+    If Len(storeId) = 0 Then Err.Raise MB_ERR + 217, , "A StoreID is required for the backup locator."
+    base = MBH_NormalizePath(Environ$("LOCALAPPDATA"))
+    base = MBH_JoinPath(MBH_JoinPath(base, MBP_SETTINGS_APP), "locations")
+    MBP_LocatorFile = MBH_JoinPath(base, "base_" & MBH_HashText(LCase$(storeId)) & ".tsv")
+End Function
+
+Private Function MBP_ReadLocator(ByVal storeId As String, ByRef base As String, _
+                                 ByRef managed As String, ByRef issue As String) As Boolean
+    Dim fso As Object, row As Variant, digest As String
+    On Error GoTo Unusable
+    base = "": managed = "": issue = ""
+    mbpLocatorStore = storeId
+    mbpLocatorPath = MBP_LocatorFile(storeId)
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    MBP_NoReparse mbpLocatorPath, fso
+    mbpLocatorHash = "": mbpLocatorObserved = True
+    If Not fso.FileExists(mbpLocatorPath) Then Exit Function
+    digest = MBH_HashFile(mbpLocatorPath)
+    mbpLocatorHash = digest
+    row = MB_ReadCheckedLine(MBP_ReadOneLine(mbpLocatorPath, fso), 5)
+    If CStr(row(0)) <> MBP_LOCATOR_SCHEMA Or StrComp(CStr(row(1)), storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 218, , "Backup locator schema or StoreID does not match."
+    base = MBH_NormalizePath(CStr(row(2)))
+    managed = MBH_NormalizePath(CStr(row(3)))
+    If StrComp(base, managed, vbTextCompare) <> 0 Then
+        If StrComp(MBH_JoinPath(base, MBP_MANAGED_LEAF), managed, vbTextCompare) <> 0 Then _
+            Err.Raise MB_ERR + 218, , "Backup locator does not bind its base to the managed root."
+    End If
+    If MBH_HashFile(mbpLocatorPath) <> digest Then _
+        Err.Raise MB_ERR + 218, , "Backup locator changed while being read."
+    mbpLocatorManaged = managed
+    mbpLocatorAccount = ""
+    If Len(CStr(row(4))) > 0 Then mbpLocatorAccount = MBH_NormalizePath(CStr(row(4)))
+    MBP_ReadLocator = True
+    Exit Function
+Unusable:
+    issue = "The independent backup locator needs review; its existing bytes are retained. " & Err.Description
+    base = "": managed = ""
+    mbpLocatorManaged = "": mbpLocatorAccount = ""
+End Function
+
+Private Sub MBP_PersistLocator(ByVal storeId As String, ByVal selectedBase As String, ByVal managed As String, _
+                               Optional ByVal account As String = "")
+    Dim fso As Object, folder As String, lockPath As String, stage As String, preserved As String
+    Dim contents As String, currentHash As String, nextHash As String, stream As Object
+    Dim n As Long, detail As String, flags As Long, releaseError As Long
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    On Error GoTo Failed
+    If Not mbpLocatorObserved Or StrComp(mbpLocatorStore, storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 219, , "The backup locator was not observed before selecting this root."
+    If StrComp(mbpLocatorPath, MBP_LocatorFile(storeId), vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 219, , "The per-user locator path changed during selection."
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    MBP_NoReparse mbpLocatorPath, fso
+    folder = CStr(fso.GetParentFolderName(mbpLocatorPath))
+    MBH_EnsureDirectory folder
+    lockPath = MBH_JoinPath(folder, "locations.lock")
+    MBP_NoReparse lockPath, fso
+    handle = MBH_CreateFileW(StrPtr(lockPath), MBH_GENERIC_READ Or MBH_GENERIC_WRITE, 0, 0, _
+                             MBH_OPEN_ALWAYS, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If handle = -1 Then Err.Raise MB_ERR + 220, , "Backup locations are busy. Win32=" & CStr(Err.LastDllError)
+    If fso.FileExists(mbpLocatorPath) Then currentHash = MBH_HashFile(mbpLocatorPath)
+    If currentHash <> mbpLocatorHash Then _
+        Err.Raise MB_ERR + 221, , "The saved backup location changed in another run. Re-run to read the new binding."
+    If Len(account) = 0 And StrComp(mbpLocatorManaged, managed, vbTextCompare) = 0 Then account = mbpLocatorAccount
+    If Len(account) > 0 Then account = MBH_NormalizePath(account)
+    contents = MBS_Checked(Array(MBP_LOCATOR_SCHEMA, LCase$(storeId), _
+                           MBH_NormalizePath(selectedBase), MBH_NormalizePath(managed), account))
+    stage = MBH_JoinPath(folder, "_mb_locator_" & fso.GetTempName)
+    Set stream = fso.CreateTextFile(stage, False, True)
+    stream.Write contents: stream.Close: Set stream = Nothing
+    MBM_FlushPath stage
+    nextHash = MBH_HashFile(stage)
+    If currentHash = nextHash Then
+        fso.DeleteFile stage, False: stage = ""
+    Else
+        If Len(currentHash) > 0 Then
+            preserved = MBH_JoinPath(folder, "preserved")
+            MBP_NoReparse preserved, fso
+            MBH_EnsureDirectory preserved
+            preserved = MBH_JoinPath(preserved, currentHash & ".tsv")
+            MBP_NoReparse preserved, fso
+            If Not fso.FileExists(preserved) Then fso.CopyFile mbpLocatorPath, preserved, False
+            MBM_FlushPath preserved
+            If MBH_HashFile(preserved) <> currentHash Or MBH_HashFile(mbpLocatorPath) <> currentHash Then _
+                Err.Raise MB_ERR + 222, , "The prior backup locator could not be preserved exactly."
+        End If
+        flags = 8
+        If Len(currentHash) > 0 Then flags = flags Or 1
+        If MBM_MoveFileExW(StrPtr(stage), StrPtr(mbpLocatorPath), flags) = 0 Then _
+            Err.Raise MB_ERR + 223, , "Cannot publish backup locator. Win32=" & CStr(Err.LastDllError)
+        stage = ""
+        MBM_FlushPath mbpLocatorPath
+        If MBH_HashFile(mbpLocatorPath) <> nextHash Then _
+            Err.Raise MB_ERR + 224, , "Published backup locator hash differs."
+    End If
+    mbpLocatorHash = nextHash
+    mbpLocatorManaged = MBH_NormalizePath(managed): mbpLocatorAccount = account
+    If MBH_CloseHandle(handle) = 0 Then Err.Raise MB_ERR + 225, , "Cannot release backup-locator lock."
+    handle = 0
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If handle <> 0 And handle <> -1 Then
+        If MBH_CloseHandle(handle) = 0 Then releaseError = Err.LastDllError
+    End If
+    ' A failed stage and every differing/corrupt old locator are retained.
+    On Error GoTo 0
+    If releaseError <> 0 Then detail = detail & " Locator lock release failed: " & CStr(releaseError)
+    Err.Raise n, "MBP_PersistLocator", detail
+End Sub
+
+Private Function MBP_LocatedAccount(ByVal storeId As String, ByVal managed As String) As String
+    If StrComp(mbpLocatorStore, storeId, vbTextCompare) <> 0 Then Exit Function
+    If StrComp(mbpLocatorManaged, managed, vbTextCompare) <> 0 Then Exit Function
+    MBP_LocatedAccount = mbpLocatorAccount
+End Function
+
+Private Function MBP_OwnerAccountHint(ByVal storeId As String, ByVal managed As String) As String
+    Dim candidate As String
+    On Error GoTo Unknown
+    candidate = MBP_LocatedAccount(storeId, managed)
+    If Len(candidate) = 0 Then candidate = MBP_GetSettingText(MBS_AccountSettingKey(storeId, managed), "")
+    If Len(candidate) > 0 Then MBP_OwnerAccountHint = MBH_NormalizePath(candidate)
+Unknown:
+End Function
+
+Private Sub MBP_RememberLocatedAccount(ByVal storeId As String, ByVal account As String)
+    ' The locator is a recovery hint, not authority to override an account owner.
+    MBY_CheckMarker account, storeId, True
+    MBP_PersistLocator storeId, gSelectedBase, gRoot, account
+End Sub
+
+Private Function MBP_GetSettingText(ByVal key As String, _
+                                    Optional ByVal fallback As String = "") As String
+    On Error GoTo Failed
+    MBP_GetSettingText = GetSetting(MBP_SETTINGS_APP, MBP_SETTINGS_SECTION, key, fallback)
+    Exit Function
+Failed:
+    Err.Raise MB_ERR + 201, "MBP_GetSettingText", _
+              "Cannot read the remembered backup setting: " & Err.Description
+End Function
+
+Private Sub MBP_SaveSettingText(ByVal key As String, ByVal value As String)
+    Dim saved As String
+    On Error GoTo Failed
+    saved = GetSetting(MBP_SETTINGS_APP, MBP_SETTINGS_SECTION, key, "")
+    If StrComp(saved, value, vbBinaryCompare) = 0 Then Exit Sub
+    SaveSetting MBP_SETTINGS_APP, MBP_SETTINGS_SECTION, key, value
+    saved = GetSetting(MBP_SETTINGS_APP, MBP_SETTINGS_SECTION, key, "")
+    If StrComp(saved, value, vbBinaryCompare) <> 0 Then
+        Err.Raise MB_ERR + 202, , "The setting did not read back correctly."
+    End If
+    Exit Sub
+Failed:
+    Err.Raise MB_ERR + 203, "MBP_SaveSettingText", _
+              "Cannot remember the selected backup folder: " & Err.Description
+End Sub
+
+Private Function MBP_ResolveBackupRoot(ByRef selectedBase As String) As String
+    Dim candidate As String, managed As String, reason As String, savedBase As String
+    Dim locatedBase As String, locatedRoot As String, locatorIssue As String, hasLocator As Boolean
+    Dim savedRoot As String, savedReason As String, storeId As String, conflict As Boolean
+    MBP_Reset
+    storeId = Application.Session.DefaultStore.StoreID
+    savedBase = MBP_GetSettingText(MBP_BASE_KEY, "")
+    hasLocator = MBP_ReadLocator(storeId, locatedBase, locatedRoot, locatorIssue)
+    selectedBase = ""
+    If hasLocator Then
+        If MBP_TryBackupBase(locatedBase, managed, reason) Then
+            If StrComp(managed, locatedRoot, vbTextCompare) <> 0 Then
+                reason = "The selected base no longer resolves to its saved managed root."
+                managed = ""
+            End If
+        End If
+    End If
+    If Len(savedBase) > 0 Then
+        If MBP_TryBackupBase(savedBase, savedRoot, savedReason) Then
+            If hasLocator Then
+                conflict = (StrComp(savedRoot, locatedRoot, vbTextCompare) <> 0)
+            End If
+        ElseIf hasLocator Then
+            ' An offline remembered archive is not evidence that it may be forgotten.
+            ' A positively foreign-store root is irrelevant to this per-store locator.
+            If InStr(1, savedReason, "[FOREIGN_STORE]", vbBinaryCompare) = 0 Then
+                conflict = (StrComp(savedBase, locatedBase, vbTextCompare) <> 0 And _
+                            StrComp(savedBase, locatedRoot, vbTextCompare) <> 0)
+            End If
+        End If
+    End If
+    If Not conflict Then
+        If Len(managed) > 0 Then
+            selectedBase = locatedBase: MBP_ResolveBackupRoot = managed
+            Exit Function
+        ElseIf Len(savedRoot) > 0 And Not hasLocator Then
+            selectedBase = MBH_NormalizePath(savedBase): MBP_ResolveBackupRoot = savedRoot
+            Exit Function
+        End If
+    End If
+    If conflict Then
+        MsgBox "Two different backup locations are remembered. Choose the archive to use." & vbCrLf & _
+               savedBase & vbCrLf & locatedBase & vbCrLf & _
+               "The prior locator will be preserved before the selected binding is saved.", vbInformation, "Choose backup folder"
+    ElseIf Len(savedBase) > 0 Or hasLocator Or Len(locatorIssue) > 0 Then
+        MsgBox "The remembered backup folder is unavailable or needs review." & vbCrLf & _
+               savedBase & vbCrLf & locatedBase & vbCrLf & reason & vbCrLf & savedReason & vbCrLf & locatorIssue & _
+               vbCrLf & "Choose the existing backup folder. The successful choice will be remembered.", _
+               vbInformation, "Choose backup folder"
+    End If
+    ' No binding remains: ask once, even when a historical hardcoded default exists.
+    MBP_ResolveBackupRoot = MBP_ChooseBackupRoot(selectedBase)
+End Function
+
+Private Function MBP_ChooseBackupRoot(ByRef selectedBase As String) As String
+    Dim candidate As String, managed As String, reason As String, locatedBase As String, locatedRoot As String
+    If Not mbpLocatorObserved Then _
+        MBP_ReadLocator Application.Session.DefaultStore.StoreID, locatedBase, locatedRoot, reason
+    selectedBase = ""
+    Do
+        candidate = MBP_BrowseFileSystemFolder( _
+                    "Choose an existing backup folder. Existing MSG files stay in place.")
+        If Len(candidate) = 0 Then Exit Function
+        If MBP_TryBackupBase(candidate, managed, reason) Then
+            selectedBase = MBH_NormalizePath(candidate)
+            MBP_ChooseBackupRoot = managed
+            Exit Function
+        End If
+        MsgBox reason & vbCrLf & vbCrLf & "Choose another folder, or Cancel.", _
+               vbExclamation, "Cannot use backup folder"
+    Loop
+End Function
+
+Private Function MBP_BrowseFileSystemFolder(ByVal title As String) As String
+    Dim shell As Object, picked As Object, entry As Object
+    Set shell = CreateObject("Shell.Application")
+    ' RETURNONLYFSDIRS + EDITBOX + NEWDIALOGSTYLE. Desktop root allows browsing
+    ' to another drive; supplying a filesystem root would restrict navigation.
+    Set picked = shell.BrowseForFolder(0, title, &H1 Or &H10 Or &H40)
+    If picked Is Nothing Then Exit Function
+    Set entry = picked.Self
+    If Not entry.IsFileSystem Then
+        Err.Raise MB_ERR + 204, "MBP_BrowseFileSystemFolder", _
+                  "Select an ordinary filesystem folder, not a virtual Shell location."
+    End If
+    MBP_BrowseFileSystemFolder = CStr(entry.Path)
+End Function
+
+Private Function MBP_ExactOwner(ByVal rootPath As String, ByVal fso As Object) As Boolean
+    Dim marker As String, stream As Object, value As String, n As Long, detail As String
+    On Error GoTo Failed
+    marker = MBH_JoinPath(rootPath, "owner.txt")
+    If Not fso.FileExists(marker) Then
+        MBP_ExactOwner = MBS_CanRecoverOwner(rootPath, fso)
+        Exit Function
+    End If
+    MBP_NoReparse marker, fso
+    If CDbl(fso.GetFile(marker).Size) Mod 2 <> 0 Then _
+        Err.Raise MB_ERR + 205, , "The existing owner marker has an incomplete UTF-16 byte: " & marker
+    Set stream = fso.OpenTextFile(marker, 1, False, -1)
+    value = stream.ReadAll
+    stream.Close
+    Set stream = Nothing
+    If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf Then
+        Err.Raise MB_ERR + 205, "MBP_ExactOwner", _
+                  "An invalid owner marker already exists: " & marker
+    End If
+    MBP_ExactOwner = True
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBP_ExactOwner", detail
+End Function
+
+Private Sub MBP_CheckUnownedEmpty(ByVal rootPath As String, ByVal fso As Object)
+    Dim entry As Object, folder As Object
+    Set folder = fso.GetFolder(rootPath)
+    For Each entry In folder.Files
+        If LCase$(CStr(entry.Name)) <> "backup.lock" Then
+            Err.Raise MB_ERR + 206, "MBP_CheckUnownedEmpty", _
+                      "The SafeV2 folder already contains unowned files: " & rootPath
+        End If
+    Next entry
+    For Each entry In folder.SubFolders
+        Err.Raise MB_ERR + 207, "MBP_CheckUnownedEmpty", _
+                  "The SafeV2 folder already contains unowned directories: " & rootPath
+    Next entry
+End Sub
+
+Private Function MBP_TryBackupBase(ByVal candidate As String, ByRef managed As String, _
+                                   ByRef reason As String) As Boolean
+    Dim fso As Object, base As String, probeParent As String
+    On Error GoTo Invalid
+    managed = "": reason = ""
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    base = MBH_NormalizePath(candidate)
+    MBP_NoReparse base, fso
+    If Not fso.FolderExists(base) Then
+        Err.Raise MB_ERR + 208, , "The folder does not exist or its drive/share is unavailable."
+    End If
+    If MBP_ExactOwner(base, fso) Then
+        managed = base
+    Else
+        managed = MBH_JoinPath(base, MBP_MANAGED_LEAF)
+        If fso.FileExists(managed) Then
+            Err.Raise MB_ERR + 209, , "A file occupies the managed SafeV2 path: " & managed
+        End If
+        If fso.FolderExists(managed) Then
+            If Not MBP_ExactOwner(managed, fso) Then MBP_CheckUnownedEmpty managed, fso
+        End If
+    End If
+    If Len(managed) > 80 Then
+        Err.Raise MB_ERR + 210, , "The managed output root must be at most 80 UTF-16 characters: " & managed
+    End If
+    MBS_CheckCandidateStore managed, Application.Session.DefaultStore.StoreID, fso
+    probeParent = managed
+    If Not fso.FolderExists(probeParent) Then probeParent = base
+    MBP_ProbeWritable probeParent, fso
+    MBP_TryBackupBase = True
+    Exit Function
+Invalid:
+    reason = "Error " & CStr(Err.Number) & ": " & Err.Description
+    managed = ""
+End Function
+
+Private Sub MBP_ProbeWritable(ByVal folderPath As String, ByVal fso As Object)
+    Dim probe As String, stream As Object, created As Boolean
+    Dim attempt As Long, n As Long, detail As String, cleanup As String
+    On Error GoTo Failed
+    For attempt = 1 To 10
+        probe = MBH_JoinPath(folderPath, "_mb_write_test_" & fso.GetTempName)
+        On Error Resume Next
+        Err.Clear
+        Set stream = fso.CreateTextFile(probe, False, False)
+        n = Err.Number: detail = Err.Description
+        On Error GoTo Failed
+        If n = 0 Then
+            created = True
+            Exit For
+        End If
+        ' 58 means collision: retry without touching the existing file.
+        If n <> 58 Then Err.Raise n, "MBP_ProbeWritable", detail
+    Next attempt
+    If Not created Then Err.Raise MB_ERR + 211, , "Cannot reserve a unique write probe."
+    stream.Write "OutlookMailBackup write probe"
+    stream.Close
+    Set stream = Nothing
+    fso.DeleteFile probe, False
+    created = False
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If created Then
+        Err.Clear
+        fso.DeleteFile probe, False
+        If Err.Number <> 0 Then cleanup = " Probe cleanup failed: " & probe & ": " & Err.Description
+    End If
+    On Error GoTo 0
+    Err.Raise n, "MBP_ProbeWritable", _
+              "The backup folder is not writable: " & folderPath & ". " & detail & cleanup
+End Sub
+
+Private Sub MBP_PersistBackupRoot(ByVal selectedBase As String)
+    ' Called only AFTER owner/store validation and run-lock acquisition succeed.
+    MBP_PersistLocator Application.Session.DefaultStore.StoreID, selectedBase, gRoot
+    MBP_SaveSettingText MBP_BASE_KEY, MBH_NormalizePath(selectedBase)
+End Sub
+
+Private Function MBP_PickExistingFolder(ByVal title As String, _
+                                        ByVal initialPath As String) As String
+    ' Shell.BrowseForFolder has a root restriction, not an initial-selection
+    ' argument. Show the previous path as context without restricting navigation.
+    If Len(initialPath) > 0 Then title = title & vbCrLf & "Previous: " & initialPath
+    MBP_PickExistingFolder = MBP_BrowseFileSystemFolder(title)
+End Function
+
+Private Function MBP_LegacySettingKey(ByVal managedRoot As String) As String
+    MBP_LegacySettingKey = "LegacyRoot_" & _
+                          MBH_HashText(LCase$(MBH_NormalizePath(managedRoot)))
+End Function
+
+Private Function MBP_ResolveLegacyRoot(ByVal selectedBase As String, _
+                                      ByVal managedRoot As String) As String
+    Dim remembered As String, candidate As String, fso As Object
+    remembered = MBP_GetSettingText(MBP_LegacySettingKey(managedRoot), "")
+    If Len(remembered) > 0 Then
+        ' Return the saved mapping even if temporarily offline. The caller must
+        ' fail closed/report it, not silently interpret every old mail as new.
+        MBP_ResolveLegacyRoot = remembered
+        Exit Function
+    End If
+    remembered = MBP_GetSettingText("LastLegacyRoot", "")
+    If Len(remembered) > 0 Then
+        ' Changing the new-output base must not forget a known old archive.
+        ' Preserve this reference even if its drive is temporarily unavailable.
+        ' Choose the existing archive with MB_ChooseLegacyFolder to change it.
+        MBP_ResolveLegacyRoot = remembered
+        Exit Function
+    End If
+    candidate = MBH_NormalizePath(selectedBase)
+    managedRoot = MBH_NormalizePath(managedRoot)
+    If StrComp(candidate, managedRoot, vbTextCompare) = 0 Then
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        If StrComp(CStr(fso.GetFileName(candidate)), MBP_MANAGED_LEAF, vbTextCompare) = 0 Then
+            candidate = CStr(fso.GetParentFolderName(candidate))
+        End If
+    End If
+    MBP_ResolveLegacyRoot = candidate
+End Function
+
+Private Sub MBP_PersistLegacyRoot(ByVal managedRoot As String, ByVal legacyRoot As String)
+    ' Caller verifies readability and its intended base/root mapping first.
+    ' Normal backup runs call this only after a complete successful legacy scan.
+    ' Keep both a managed-root-specific mapping and a cross-root fallback.
+    legacyRoot = MBH_NormalizePath(legacyRoot)
+    MBP_SaveSettingText MBP_LegacySettingKey(managedRoot), legacyRoot
+    MBP_SaveSettingText "LastLegacyRoot", legacyRoot
+End Sub
+
+Public Sub MB_ChooseBackupFolder()
+    Dim selectedBase As String, managed As String, held As Boolean
+    Dim n As Long, detail As String, releaseIssue As String
+    If gBusy Then
+        MsgBox "A backup/verification is already running. Finish or cancel it first.", vbInformation
+        Exit Sub
+    End If
+    On Error GoTo Failed
+    gBusy = True
+    MBP_Reset
+    managed = MBP_ChooseBackupRoot(selectedBase)
+    If Len(managed) = 0 Then GoTo CleanUp
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    MBH_EnsureDirectory managed
+    MBH_AcquireRunLock MBH_JoinPath(managed, "backup.lock")
+    held = True
+    gRoot = managed: gBaseRoot = managed
+    MB_CheckOwnership managed
+    MBS_BindStore Application.Session.DefaultStore.StoreID
+    MBP_PersistBackupRoot selectedBase
+    GoTo CleanUp
+Failed:
+    n = Err.Number: detail = Err.Description
+CleanUp:
+    On Error Resume Next
+    If held Then
+        Err.Clear
+        MBH_ReleaseRunLock
+        If Err.Number <> 0 Then releaseIssue = " Lock release failed: " & Err.Description
+    End If
+    Set gFSO = Nothing
+    gBusy = False
+    On Error GoTo 0
+    If n <> 0 Or Len(releaseIssue) > 0 Then
+        MsgBox "Cannot finish changing the backup folder." & vbCrLf & _
+               detail & releaseIssue, vbExclamation
+    ElseIf Len(managed) > 0 Then
+        MsgBox "Backup folder remembered: " & selectedBase & vbCrLf & _
+               "Managed new exports: " & managed & vbCrLf & _
+               "Future runs reuse this folder while it remains available.", vbInformation
+    End If
+End Sub

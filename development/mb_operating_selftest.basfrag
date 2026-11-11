@@ -1,0 +1,265 @@
+' Disposable native Windows acceptance for metadata snapshot recovery.
+' This test uses synthetic metadata and a synthetic sentinel only. It does not
+' read real mail, change registry settings, or simulate an actual power loss.
+Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
+    Const TEST_STORE As String = "MB_NATIVE_RECOVERY_TEST"
+    Dim fso As Object, stream As Object, files As Object, chunks As Object
+    Dim tempRoot As String, testBase As String, account As String, primary As String
+    Dim ownerPath As String, ownerHash As String, ownerToken As String
+    Dim probePath As String, probeHash As String, journalHash As String
+    Dim sentinelPath As String, sentinelHash As String, text As String, recovery As String
+    Dim manifest As String, reason As String, cleanup As String, errorText As String
+    Dim newerJournalHash As String, overlayIntent As String, syntheticRow As Variant, stamp As String
+    Dim owned As Boolean, initialized As Boolean, rootLocked As Boolean, accountLocked As Boolean
+    Dim passed As Boolean, cleaned As Boolean, n As Long, savedBefore As Long, gateError As Long
+    detail = ""
+    ' Acceptance owns gBusy; a live archive lock or stream is not disposable.
+    If MBH_RunLock <> 0 Then detail = "FAIL: a live root lock prevents the disposable test.": Exit Function
+    If Not mbmAccountLocks Is Nothing Then
+        If mbmAccountLocks.Count > 0 Then detail = "FAIL: live account locks prevent the disposable test.": Exit Function
+    End If
+    If Not gJournal Is Nothing Then detail = "FAIL: a live journal prevents the disposable test.": Exit Function
+    If Not gEvents Is Nothing Then detail = "FAIL: a live event stream prevents the disposable test.": Exit Function
+    On Error GoTo Failed
+    MB_Reset: initialized = True
+    gMode = "SELFTEST_RECOVERY": gPhase = "Testing disposable metadata recovery"
+    gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
+    Set fso = CreateObject("Scripting.FileSystemObject"): Set gFSO = fso
+    Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
+    Set gIndex = CreateObject("Scripting.Dictionary"): gIndex.CompareMode = vbBinaryCompare
+    tempRoot = MBH_NormalizePath(CStr(fso.GetSpecialFolder(2).Path))
+    testBase = MBH_JoinPath(tempRoot, "MBREC_" & fso.GetTempName)
+    ' CreateFolder claims a NEW directory. Never reuse or clean an older test.
+    fso.CreateFolder testBase: owned = True
+    ownerPath = MBH_JoinPath(testBase, "native-owner.txt")
+    ownerToken = "Owned disposable recovery test: " & MBC_UtcStamp(MBC_UtcNow()) & "|" & fso.GetTempName
+    Set stream = fso.CreateTextFile(ownerPath, False, True)
+    stream.Write ownerToken: stream.Close: Set stream = Nothing
+    ownerHash = MBH_HashFile(ownerPath)
+
+    gRoot = MBH_JoinPath(testBase, "state"): gBaseRoot = gRoot
+    account = MBH_JoinPath(testBase, "account")
+    MBH_EnsureDirectory gRoot: MBH_EnsureDirectory account
+    gStateRoot = MB_StatePath(): primary = gStateRoot
+    fso.CreateFolder primary
+    ' The run directory stays outside the deliberately deleted primary folder.
+    gRunId = "native_recovery"
+    gRunDir = MBH_JoinPath(gRoot, "native-run")
+    MBH_EnsureDirectory gRunDir
+    gJournalPath = MB_StatePath("journal.tsv")
+    MBH_AcquireRunLock MBH_JoinPath(gRoot, "backup.lock"): rootLocked = True
+    MBM_AcquireAccountLock account: accountLocked = True
+
+    sentinelPath = MBH_JoinPath(account, "protected-sentinel.bin")
+    Set stream = fso.CreateTextFile(sentinelPath, False, False)
+    stream.Write "Synthetic protected archive bytes. Never metadata."
+    stream.Close: Set stream = Nothing
+    sentinelHash = MBH_HashFile(sentinelPath)
+    Set stream = fso.CreateTextFile(gJournalPath, False, True)
+    stream.Write vbNullString: stream.Close: Set stream = Nothing
+    MBM_FlushPath gJournalPath
+    journalHash = MBH_HashFile(gJournalPath)
+    probePath = MB_StatePath("probe.tsv")
+    ' Cross the 1 MiB boundary to exercise multi-chunk capture/reassembly.
+    text = ChrW$(&HD55C) & ChrW$(&HAE00) & vbTab & "checked Unicode metadata" & vbCrLf & _
+           String$(MBR_CHUNK_BYTES \ 2 + 64, "R")
+    MBS_WriteAtomic probePath, MBS_Checked(Array("MBNATIVETEST1", "probe", text))
+    probeHash = MBH_HashFile(probePath)
+    If CDbl(fso.GetFile(probePath).Size) <= MBR_CHUNK_BYTES Then _
+        Err.Raise MB_ERR + 970, , "Native probe did not cross the recovery chunk boundary."
+    If Not MBR_CheckedStateValid(probePath, reason) Then _
+        Err.Raise MB_ERR + 970, , "Synthetic probe framing is invalid: " & reason
+
+    MBR_SaveSnapshot account, TEST_STORE
+    If gRecoverySnapshotsSaved <> 1 Then Err.Raise MB_ERR + 970, , "Initial snapshot was not published exactly once."
+    recovery = MBR_RecoveryRoot(account, TEST_STORE)
+    manifest = MBR_FindSnapshot(recovery, account, TEST_STORE, files, chunks, True)
+    If Len(manifest) = 0 Then Err.Raise MB_ERR + 970, , "No complete verified native recovery snapshot exists."
+    If files.Count <> 2 Or Not files.Exists("journal.tsv") Or Not files.Exists("probe.tsv") Then _
+        Err.Raise MB_ERR + 970, , "Snapshot did not contain exactly the two synthetic state files."
+    If Not MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then _
+        Err.Raise MB_ERR + 970, , "Cannot prove disposable test ownership before state deletion: " & reason
+    If StrComp(primary, MB_StatePath(), vbTextCompare) <> 0 Or Not MB_PathWithin(primary, testBase) Then _
+        Err.Raise MB_ERR + 970, , "Disposable primary state escaped its owned test tree."
+    ' Only the newly created disposable primary folder is removed. Account
+    ' sentinel, recovery generations and the ownership token remain untouched.
+    fso.DeleteFolder primary, True
+    If fso.FolderExists(primary) Then Err.Raise MB_ERR + 970, , "Disposable primary folder deletion failed."
+    If MBH_HashFile(sentinelPath) <> sentinelHash Then Err.Raise MB_ERR + 970, , "Sentinel changed during state deletion."
+
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If Not gRecoveryForceFull Then Err.Raise MB_ERR + 970, , "Restored metadata did not require full reconciliation."
+    If gRecoveryRebased Then Err.Raise MB_ERR + 970, , "Snapshot restore was mislabeled as MSG-only rebaselining."
+    If gRecoveryRestoredCount <> 2 Then Err.Raise MB_ERR + 970, , "Snapshot restore did not reconstruct two state files."
+    If MBH_HashFile(probePath) <> probeHash Or MBH_HashFile(gJournalPath) <> journalHash Then _
+        Err.Raise MB_ERR + 970, , "Restored metadata bytes differ from their original hashes."
+    If MBH_HashFile(sentinelPath) <> sentinelHash Then Err.Raise MB_ERR + 970, , "Restore modified the protected sentinel."
+    If Len(MBR_PendingIntent(recovery, account, TEST_STORE)) <> 0 Then _
+        Err.Raise MB_ERR + 970, , "Snapshot restore left an unfinished restore intent."
+
+    ' A new process must still require reconciliation while the durable token
+    ' is pending, even when restored state is structurally healthy.
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If Not gRecoveryForceFull Or gRecoveryRestoredCount <> 0 Then _
+        Err.Raise MB_ERR + 970, , "Pending reconciliation did not survive a healthy restart without replaying snapshot files."
+    If MBH_HashFile(probePath) <> probeHash Or MBH_HashFile(gJournalPath) <> journalHash Or _
+       MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Healthy pending-reconciliation restart changed protected bytes."
+    On Error Resume Next
+    Err.Clear: MBR_CompleteReconcile account, TEST_STORE
+    gateError = Err.Number: Err.Clear
+    On Error GoTo Failed
+    If gateError <> MB_ERR + 881 Then Err.Raise MB_ERR + 970, , "Reconciliation accepted an acknowledgement before coverage."
+    ' Synthetic acknowledgement only: this test has no real mail or coverage.
+    ' The production completion gate is deliberately satisfied for this owned
+    ' fixture, then cleared immediately; no actual coverage checkpoint is made.
+    gWindowCommitted = True
+    MBR_CompleteReconcile account, TEST_STORE
+    gWindowCommitted = False
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If gRecoveryForceFull Or gRecoveryRestoredCount <> 0 Then _
+        Err.Raise MB_ERR + 970, , "Completed synthetic reconciliation did not leave a stable healthy restart."
+    If MBH_HashFile(probePath) <> probeHash Or MBH_HashFile(gJournalPath) <> journalHash Or _
+       MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Repeated healthy restore changed protected bytes."
+    ' Normalize the post-acknowledgement snapshot first; an immediately repeated
+    ' snapshot of unchanged metadata must then reuse the complete generation.
+    MBR_SaveSnapshot account, TEST_STORE
+    savedBefore = gRecoverySnapshotsSaved
+    MBR_SaveSnapshot account, TEST_STORE
+    If gRecoverySnapshotsSaved <> savedBefore Then _
+        Err.Raise MB_ERR + 970, , "Unchanged metadata created another recovery generation."
+    ' Ancillary-only loss must not roll a newer valid expected file hash back
+    ' to this older snapshot. This row is SYNTHETIC metadata: no MSG is created,
+    ' opened or represented as a real mail backup by this disposable scenario.
+    manifest = MBR_FindSnapshot(recovery, account, TEST_STORE, files, chunks, True)
+    stamp = MB_Stamp(Now)
+    syntheticRow = Array("MBS3", "N", MBH_HashText("native revision"), _
+        MBH_JoinPath(account, "synthetic-metadata-only.msg"), "37", MBH_HashText("native expected bytes"), _
+        MB_SourceKey(TEST_STORE, "native entry"), TEST_STORE, "native entry", "native folder", stamp, stamp, _
+        "native proof only", "0", "", MB_NEW_CONTENT_VALIDATION, account)
+    Set stream = fso.OpenTextFile(gJournalPath, 8, True, -1)
+    MB_WriteCheckedLine stream, MB_EncodeFields(syntheticRow)
+    stream.Close: Set stream = Nothing: MBM_FlushPath gJournalPath
+    newerJournalHash = MBH_HashFile(gJournalPath)
+    If Not MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then _
+        Err.Raise MB_ERR + 970, , "Disposable tree ownership changed before ancillary deletion."
+    fso.DeleteFile probePath, True
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If MBH_HashFile(gJournalPath) <> newerJournalHash Or MBH_HashFile(probePath) <> probeHash Or _
+       MBH_HashFile(sentinelPath) <> sentinelHash Or gRecoveryMergedRows <> 1 Then _
+        Err.Raise MB_ERR + 970, , "Ancillary-only recovery rolled back newer expected file proof."
+    If Not gRecoveryForceFull Then Err.Raise MB_ERR + 970, , "Merged recovery lost reconciliation requirement."
+
+    ' Model a process ending after START and only the old journal being restored.
+    ' The next call must replay the immutable ORIGINAL overlay, not recapture the
+    ' now-empty partially restored primary and forget its newer valid row.
+    overlayIntent = MBR_CaptureOverlay(recovery, account, TEST_STORE, manifest)
+    MBR_WriteIntent recovery, account, TEST_STORE, overlayIntent, "START"
+    If Not MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then _
+        Err.Raise MB_ERR + 970, , "Disposable tree ownership changed before partial-restore fixture."
+    Set stream = fso.CreateTextFile(gJournalPath, True, True)
+    stream.Write vbNullString: stream.Close: Set stream = Nothing
+    MBM_FlushPath gJournalPath
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If MBH_HashFile(gJournalPath) <> newerJournalHash Or MBH_HashFile(probePath) <> probeHash Or _
+       MBH_HashFile(sentinelPath) <> sentinelHash Or Len(MBR_PendingIntent(recovery, account, TEST_STORE)) <> 0 Then _
+        Err.Raise MB_ERR + 970, , "Interrupted restore did not recover the original overlay's exact later proof."
+    If Not gRecoveryForceFull Then Err.Raise MB_ERR + 970, , "Resumed overlay restore falsely completed coverage."
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If gRecoveryRestoredCount <> 0 Or MBH_HashFile(gJournalPath) <> newerJournalHash Then _
+        Err.Raise MB_ERR + 970, , "Merged healthy repeat rewrote prior expected proof."
+    If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then _
+        Err.Raise MB_ERR + 970, , "Native recovery verification was cancelled or stopped."
+    passed = True
+    GoTo Cleanup
+Failed:
+    n = Err.Number: errorText = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    Set stream = Nothing
+    If accountLocked Then
+        Err.Clear: MBM_ReleaseAccountLocks
+        If Err.Number <> 0 Then cleanup = cleanup & " Account lock: " & Err.Description
+    End If
+    If rootLocked Then
+        Err.Clear: MBH_ReleaseRunLock
+        If Err.Number <> 0 Then cleanup = cleanup & " Root lock: " & Err.Description
+    End If
+    On Error GoTo 0
+    ' On any test failure retain every disposable byte for diagnosis. Cleanup
+    ' after success requires both exclusive creation and the unchanged token.
+    If passed And owned And Len(cleanup) = 0 And Not gCancel And Not gFatal Then
+        If MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then
+            On Error Resume Next
+            Err.Clear: fso.DeleteFolder testBase, True
+            If Err.Number <> 0 Then
+                cleanup = cleanup & " Disposable directory cleanup: " & Err.Description
+            Else
+                cleaned = True
+            End If
+            On Error GoTo 0
+        Else
+            cleanup = cleanup & " Disposable ownership check: " & reason
+        End If
+    End If
+    On Error Resume Next
+    Err.Clear: MBH_ReleaseCrypto
+    If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    If initialized Then
+        gStageEnabled = False: gWindowCommitted = False
+        Set gDirs = Nothing: Set gIndex = Nothing: Set gFSO = Nothing
+        gRoot = "": gBaseRoot = "": gRunDir = "": gRunId = "": gJournalPath = "": gStateRoot = ""
+    End If
+    On Error GoTo 0
+    If passed And cleaned And n = 0 And Len(cleanup) = 0 And Not gCancel And Not gFatal Then
+        detail = "PASS: disposable multi-chunk Unicode metadata snapshot, deleted-state exact-hash restore, " & _
+                 "sentinel preservation, durable reconcile token, healthy repeat, unchanged-snapshot reuse, " & _
+                 "ancillary-loss newer-proof preservation and interrupted overlay resume. " & _
+                 "Synthetic metadata only; no real mail, registry changes or actual power-loss test."
+        MBS_NativeRecoverySelfTest = True
+    Else
+        detail = "FAIL: disposable metadata recovery " & CStr(n) & " - " & errorText & cleanup
+        If owned And Not cleaned Then detail = detail & "; disposable evidence retained at " & testBase
+    End If
+End Function
+
+Private Function MBS_NativeOwnedTreeSafe(ByVal fso As Object, ByVal testBase As String, _
+                                        ByVal tempRoot As String, ByVal ownerHash As String, _
+                                        ByRef reason As String) As Boolean
+    Dim pending As New Collection, current As String, folder As Object, item As Object, ownerPath As String
+    On Error GoTo Rejected
+    reason = ""
+    If Len(testBase) = 0 Or Len(ownerHash) = 0 Then Err.Raise MB_ERR + 971, , "Missing disposable ownership proof."
+    If StrComp(CStr(fso.GetParentFolderName(testBase)), tempRoot, vbTextCompare) <> 0 Or _
+       Left$(CStr(fso.GetFileName(testBase)), 6) <> "MBREC_" Then _
+        Err.Raise MB_ERR + 971, , "Disposable directory is not a direct owned Temp child."
+    MBY_NoReparse testBase, True
+    ownerPath = MBH_JoinPath(testBase, "native-owner.txt")
+    MBY_NoReparse ownerPath, True
+    If MBH_HashFile(ownerPath) <> ownerHash Then Err.Raise MB_ERR + 971, , "Disposable ownership token changed."
+    pending.Add testBase
+    Do While pending.Count > 0
+        current = CStr(pending(pending.Count)): pending.Remove pending.Count
+        Set folder = fso.GetFolder(current)
+        If (CLng(folder.Attributes) And 1024) <> 0 Then Err.Raise MB_ERR + 971, , "Disposable tree contains a reparse folder."
+        For Each item In folder.Files
+            If (CLng(item.Attributes) And 1024) <> 0 Then Err.Raise MB_ERR + 971, , "Disposable tree contains a reparse file."
+        Next item
+        For Each item In folder.SubFolders
+            If (CLng(item.Attributes) And 1024) <> 0 Then Err.Raise MB_ERR + 971, , "Disposable tree contains a reparse folder."
+            pending.Add CStr(item.Path)
+        Next item
+    Loop
+    MBS_NativeOwnedTreeSafe = True
+    Exit Function
+Rejected:
+    reason = CStr(Err.Number) & ": " & Err.Description
+End Function

@@ -1,0 +1,573 @@
+' Queue discovery. GetTable is dynamic: this fixes a work list, not an atomic
+' mailbox snapshot. The export stage must recheck each item's current version.
+Public Function MBP_BuildQueue(ByVal roots As Collection, ByVal sinceDate As Date, _
+    ByVal untilDate As Date, ByVal includeChildren As Boolean, ByVal queuePath As String) As Long
+
+    Dim fso As Object, output As Object, seenFolders As Object, seenItems As Object
+    Dim badFolders As Object, pending As Collection, folder As Object, root As Variant
+    Dim storeId As String, entryId As String, folderPath As String, folderKey As String
+    Dim reason As String, errorNumber As Long, queued As Long, allowChildren As Boolean
+    Dim savedNumber As Long, savedDescription As String, savedSource As String
+    Dim closeNumber As Long, closeDescription As String
+
+    On Error GoTo Fatal
+    If roots Is Nothing Then Err.Raise vbObjectError + 2801, "MBP_BuildQueue", "No source roots."
+    If sinceDate <> 0 And sinceDate > untilDate Then _
+        Err.Raise vbObjectError + 2802, "MBP_BuildQueue", "The date interval is reversed."
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set output = fso.CreateTextFile(queuePath, False, True)
+    Set seenFolders = CreateObject("Scripting.Dictionary")
+    Set seenItems = CreateObject("Scripting.Dictionary")
+    Set badFolders = CreateObject("Scripting.Dictionary")
+    seenFolders.CompareMode = vbBinaryCompare
+    seenItems.CompareMode = vbBinaryCompare
+    badFolders.CompareMode = vbBinaryCompare
+    Set pending = New Collection
+    For Each root In roots
+        pending.Add root
+    Next root
+
+    Do While pending.Count > 0
+        If Not MB_ContinueWork() Then Exit Do
+        Set folder = pending(pending.Count)
+        pending.Remove pending.Count
+        allowChildren = True
+        storeId = vbNullString
+        entryId = vbNullString
+        folderPath = "<unavailable folder>"
+        folderKey = vbNullString
+
+        If MBQ_FolderInfo(folder, storeId, entryId, folderPath, errorNumber, reason) Then
+            folderKey = storeId & "|" & entryId
+            If seenFolders.Exists(folderKey) Then
+                allowChildren = False
+            Else
+                seenFolders.Add folderKey, True
+                gFoldersScanned = gFoldersScanned + 1
+                If Not MBQ_TablePass(folder, storeId, folderPath, sinceDate, untilDate, _
+                    output, seenItems, queued, errorNumber, reason) Then
+                    MB_LogEvent "WARN", "SCAN_TABLE_FALLBACK", vbNullString, folderPath, _
+                        errorNumber, reason & "; using Items enumeration with the same exact date policy."
+                    If MB_ContinueWork() Then
+                        MBQ_ItemsPass folder, storeId, folderPath, folderKey, sinceDate, untilDate, _
+                            output, seenItems, badFolders, queued
+                    End If
+                End If
+            End If
+        Else
+            gFoldersScanned = gFoldersScanned + 1
+            MBQ_FolderFailed badFolders, folderPath, folderPath, "SCAN_FOLDER_IDENTITY", errorNumber, reason
+        End If
+
+        If includeChildren And allowChildren Then
+            If MB_ContinueWork() Then MBQ_AddChildren folder, pending, badFolders, folderKey, folderPath
+        End If
+        Set folder = Nothing
+    Loop
+
+    output.Close
+    Set output = Nothing
+    MBP_BuildQueue = queued
+    Exit Function
+
+Fatal:
+    savedNumber = Err.Number
+    savedDescription = Err.Description
+    savedSource = Err.Source
+    ' Cleanup is deliberately narrow. Preserve and propagate every write/log error.
+    On Error Resume Next
+    Err.Clear
+    If Not output Is Nothing Then output.Close
+    closeNumber = Err.Number
+    closeDescription = Err.Description
+    Set output = Nothing
+    On Error GoTo 0
+    If closeNumber <> 0 Then savedDescription = savedDescription & _
+        "; queue close also failed: " & CStr(closeNumber) & " " & closeDescription
+    Err.Raise savedNumber, "MBP_BuildQueue/" & savedSource, savedDescription
+End Function
+
+Private Function MBQ_FolderInfo(ByVal folder As Object, ByRef storeId As String, _
+    ByRef entryId As String, ByRef folderPath As String, ByRef errorNumber As Long, _
+    ByRef reason As String) As Boolean
+    On Error GoTo Failed
+    If folder Is Nothing Then Err.Raise vbObjectError + 2810, , "A source folder is Nothing."
+    folderPath = CStr(folder.FolderPath)
+    storeId = CStr(folder.StoreID)
+    entryId = CStr(folder.EntryID)
+    If Len(storeId) = 0 Or Len(entryId) = 0 Then _
+        Err.Raise vbObjectError + 2811, , "A folder has no StoreID or EntryID."
+    errorNumber = 0
+    reason = vbNullString
+    MBQ_FolderInfo = True
+    Exit Function
+Failed:
+    errorNumber = Err.Number
+    reason = Err.Description
+End Function
+
+Private Sub MBQ_AddChildren(ByVal folder As Object, ByVal pending As Collection, _
+    ByVal badFolders As Object, ByVal folderKey As String, ByVal folderPath As String)
+    Dim children As Object, child As Object
+    Dim stage As String, n As Long, detail As String
+    On Error GoTo Failed
+    stage = "SOURCE"
+    Set children = folder.Folders
+    For Each child In children
+        stage = "CONTROL"
+        If Not MB_ContinueWork() Then Exit Sub
+        pending.Add child
+        stage = "SOURCE"
+    Next child
+    Exit Sub
+Failed:
+    n = Err.Number
+    detail = Err.Description
+    If stage <> "SOURCE" Then Err.Raise n, "MBQ_AddChildren", detail
+    MBQ_FolderFailed badFolders, folderKey, folderPath, "SCAN_CHILD_FOLDERS", n, detail
+End Sub
+
+Private Sub MBQ_FolderFailed(ByVal badFolders As Object, ByVal folderKey As String, _
+    ByVal folderPath As String, ByVal stage As String, ByVal errorNumber As Long, ByVal detail As String)
+    Dim key As String
+    key = folderKey
+    If Len(key) = 0 Then key = folderPath
+    If Not badFolders.Exists(key) Then
+        badFolders.Add key, True
+        gFolderFailures = gFolderFailures + 1
+    End If
+    MB_LogEvent "ERROR", stage, vbNullString, folderPath, errorNumber, detail
+End Sub
+
+Private Function MBQ_DateFilter(ByVal sinceDate As Date, ByVal untilDate As Date) As String
+    Dim fromMinute As Date, untilMinute As Date, low As String, high As String
+    If sinceDate = 0 Or gMode = "AUTO" Then Exit Function
+    fromMinute = DateSerial(Year(sinceDate), Month(sinceDate), Day(sinceDate)) _
+        + TimeSerial(Hour(sinceDate), Minute(sinceDate), 0)
+    untilMinute = DateAdd("n", 1, DateSerial(Year(untilDate), Month(untilDate), Day(untilDate)) _
+        + TimeSerial(Hour(untilDate), Minute(untilDate), 0))
+    low = Format$(fromMinute, "ddddd h:nn AMPM")
+    high = Format$(untilMinute, "ddddd h:nn AMPM")
+    If gModifiedWindow Then
+        MBQ_DateFilter = "([LastModificationTime] >= '" & low & _
+            "' AND [LastModificationTime] < '" & high & "')"
+        Exit Function
+    End If
+    ' Jet uses local time. Deliberately broaden to whole minutes, then compare
+    ' exact VBA Date values below. CreationTime is only a candidate-search aid.
+    MBQ_DateFilter = "(([ReceivedTime] >= '" & low & "' AND [ReceivedTime] < '" & high & "')" _
+        & " OR ([SentOn] >= '" & low & "' AND [SentOn] < '" & high & "')" _
+        & " OR ([CreationTime] >= '" & low & "' AND [CreationTime] < '" & high & "'))"
+End Function
+
+Private Function MBQ_TablePass(ByVal folder As Object, ByVal storeId As String, _
+    ByVal folderPath As String, ByVal sinceDate As Date, ByVal untilDate As Date, _
+    ByVal output As Object, ByVal seenItems As Object, ByRef queued As Long, _
+    ByRef errorNumber As Long, ByRef reason As String) As Boolean
+
+    Dim tbl As Object, values As Variant, rowIndex As Long, rowCount As Long
+    Dim countBefore As Long, countAfter As Long, rowsRead As Long
+    Dim stage As String, enumerating As Boolean, needsFallback As Boolean
+    Dim n As Long, detail As String, filter As String
+    On Error GoTo Failed
+    stage = "CONTROL"
+    filter = MBQ_DateFilter(sinceDate, untilDate)
+    stage = "SOURCE"
+    Set tbl = folder.GetTable(filter, 0) ' olUserItems: normal, non-hidden items.
+    tbl.Columns.RemoveAll
+    tbl.Columns.Add "EntryID"
+    tbl.Columns.Add "MessageClass"
+    tbl.Columns.Add "LastModificationTime"
+    tbl.Columns.Add "Size"
+    tbl.Columns.Add "ReceivedTime"
+    tbl.Columns.Add "SentOn"
+    tbl.Columns.Add "CreationTime"
+    countBefore = tbl.GetRowCount
+    enumerating = True
+
+    Do
+        stage = "CONTROL"
+        If Not MB_ContinueWork() Then
+            MBQ_TablePass = True
+            Exit Function
+        End If
+        stage = "SOURCE"
+        If tbl.EndOfTable Then Exit Do
+        values = tbl.GetArray(256)
+        rowCount = MBQ_ArrayRowCount(values)
+        If rowCount = 0 Then
+            If tbl.EndOfTable Then Exit Do
+            Err.Raise vbObjectError + 2820, , "GetArray returned no rows before EndOfTable."
+        End If
+        rowsRead = rowsRead + rowCount
+        For rowIndex = 0 To rowCount - 1
+            stage = "CONTROL"
+            If Not MB_ContinueWork() Then
+                MBQ_TablePass = True
+                Exit Function
+            End If
+            stage = "RECORD"
+            MBQ_TableRow values, rowIndex, storeId, folderPath, sinceDate, untilDate, _
+                output, seenItems, queued, needsFallback
+        Next rowIndex
+    Loop
+
+    stage = "SOURCE"
+    countAfter = tbl.GetRowCount
+    stage = "CONTROL"
+    If countBefore <> countAfter Or rowsRead <> countAfter Then
+        MBQ_Changed vbNullString, folderPath, "SCAN_TABLE_COUNT_CHANGED", 0, _
+            "Table counts differ: before=" & CStr(countBefore) & "; read=" & CStr(rowsRead) _
+            & "; after=" & CStr(countAfter) & ". This run is not an atomic snapshot."
+        needsFallback = True
+    End If
+
+    If needsFallback Then
+        errorNumber = 0
+        reason = "At least one table row could not be resolved; retrying the folder through Items."
+    Else
+        MBQ_TablePass = True
+    End If
+    Exit Function
+Failed:
+    n = Err.Number
+    detail = Err.Description
+    If stage <> "SOURCE" Then Err.Raise n, "MBQ_TablePass", detail
+    If enumerating Then MBQ_Changed vbNullString, folderPath, "SCAN_TABLE_UNSTABLE", n, detail
+    errorNumber = n
+    reason = detail
+End Function
+
+Private Function MBQ_ArrayRowCount(ByRef values As Variant) As Long
+    On Error GoTo EmptyArray
+    If Not IsArray(values) Then Exit Function
+    MBQ_ArrayRowCount = UBound(values, 2) - LBound(values, 2) + 1
+    Exit Function
+EmptyArray:
+    MBQ_ArrayRowCount = 0
+End Function
+
+Private Function MBQ_IsMailClass(ByVal messageClass As String) As Boolean
+    Dim value As String
+    value = LCase$(messageClass)
+    MBQ_IsMailClass = (value = "ipm.note" Or Left$(value, 9) = "ipm.note.")
+End Function
+
+Private Function MBQ_Text(ByVal value As Variant, ByRef result As String) As Boolean
+    On Error GoTo InvalidValue
+    If IsError(value) Or IsNull(value) Or IsEmpty(value) Then Exit Function
+    result = CStr(value)
+    MBQ_Text = (Len(result) > 0)
+    Exit Function
+InvalidValue:
+    MBQ_Text = False
+End Function
+
+Private Function MBQ_Date(ByVal value As Variant, ByRef result As Date) As Boolean
+    On Error GoTo InvalidValue
+    If IsError(value) Or IsNull(value) Or IsEmpty(value) Then Exit Function
+    If VarType(value) <> vbDate Then Exit Function
+    result = CDate(value)
+    ' Reject empty VBA dates and Outlook's far-future no-date sentinel.
+    MBQ_Date = MB_ValidDate(result)
+    Exit Function
+InvalidValue:
+    MBQ_Date = False
+End Function
+
+Private Function MBQ_Size(ByVal value As Variant, ByRef result As Long) As Boolean
+    Dim number As Double
+    On Error GoTo InvalidValue
+    If IsError(value) Or IsNull(value) Or IsEmpty(value) Then Exit Function
+    If Not IsNumeric(value) Then Exit Function
+    number = CDbl(value)
+    If number < 0 Or number > 2147483647# Or number <> Fix(number) Then Exit Function
+    result = CLng(number)
+    MBQ_Size = True
+    Exit Function
+InvalidValue:
+    MBQ_Size = False
+End Function
+
+Private Sub MBQ_TableRow(ByRef values As Variant, ByVal rowIndex As Long, ByVal storeId As String, _
+    ByVal folderPath As String, ByVal sinceDate As Date, ByVal untilDate As Date, _
+    ByVal output As Object, ByVal seenItems As Object, ByRef queued As Long, ByRef needsFallback As Boolean)
+
+    Dim entryId As String, messageClass As String, key As String, reason As String
+    Dim observedMod As Date, effectiveDate As Date, sourceSize As Long
+    Dim parseStatus As Long, item As Object, n As Long, detail As String
+
+    parseStatus = MBQ_ParseTableRow(values, rowIndex, entryId, messageClass, observedMod, _
+        sourceSize, effectiveDate, reason)
+    If Len(entryId) = 0 Then
+        MBQ_Changed vbNullString, folderPath, "SCAN_METADATA", 0, reason
+        needsFallback = True
+        Exit Sub
+    End If
+    key = MB_SourceKey(storeId, entryId)
+    If seenItems.Exists(key) Then
+        If CStr(seenItems(key)) <> "PENDING" Then Exit Sub
+    End If
+
+    If parseStatus = 0 Then
+        If seenItems.Exists(key) Then
+            seenItems(key) = "EXCLUDED"
+        Else
+            seenItems.Add key, "EXCLUDED"
+        End If
+        gPolicySkipped = gPolicySkipped + 1
+        Exit Sub
+    End If
+
+    If MBQ_IsMailClass(messageClass) Then
+        If Not seenItems.Exists(key) Then
+            seenItems.Add key, "PENDING"
+            gCandidates = gCandidates + 1
+        End If
+    End If
+
+    If parseStatus < 0 Then
+        MBQ_Changed key, folderPath, "SCAN_METADATA", 0, reason & "; trying the full item."
+        If MBQ_GetItem(entryId, storeId, item, n, detail) Then
+            If Not MBQ_ItemRow(item, storeId, folderPath, sinceDate, untilDate, output, seenItems, queued, key) Then _
+                needsFallback = True
+        Else
+            MBQ_Changed key, folderPath, "SCAN_ITEM_RESOLVE", n, detail
+            needsFallback = True
+        End If
+        Set item = Nothing
+        Exit Sub
+    End If
+
+    MBQ_QueueCandidate storeId, entryId, folderPath, observedMod, sourceSize, effectiveDate, _
+        key, sinceDate, untilDate, output, seenItems, queued
+End Sub
+
+Private Function MBQ_ParseTableRow(ByRef values As Variant, ByVal rowIndex As Long, _
+    ByRef entryId As String, ByRef messageClass As String, ByRef observedMod As Date, _
+    ByRef sourceSize As Long, ByRef effectiveDate As Date, ByRef reason As String) As Long
+    On Error GoTo InvalidRow
+    MBQ_ParseTableRow = -1
+    reason = "Table row has no usable EntryID."
+    If Not MBQ_Text(values(0, rowIndex), entryId) Then Exit Function
+    reason = "Table row has no usable MessageClass."
+    If Not MBQ_Text(values(1, rowIndex), messageClass) Then Exit Function
+    If Not MBQ_IsMailClass(messageClass) Then
+        MBQ_ParseTableRow = 0
+        Exit Function
+    End If
+    reason = "Table row has no usable LastModificationTime."
+    If Not MBQ_Date(values(2, rowIndex), observedMod) Then Exit Function
+    reason = "Table row has no usable Size."
+    If Not MBQ_Size(values(3, rowIndex), sourceSize) Then Exit Function
+    ' GetArray indexes are (column, row), both zero-based. Built-in date
+    ' column names return local time. ReceivedTime has priority over SentOn.
+    If Not MBQ_Date(values(4, rowIndex), effectiveDate) Then
+        If Not MBQ_Date(values(5, rowIndex), effectiveDate) Then
+            reason = "Table row has no usable ReceivedTime, SentOn, or CreationTime."
+            If Not MBQ_Date(values(6, rowIndex), effectiveDate) Then Exit Function
+        End If
+    End If
+    reason = vbNullString
+    MBQ_ParseTableRow = 1
+    Exit Function
+InvalidRow:
+    reason = "Cannot read table row: " & CStr(Err.Number) & " " & Err.Description
+    MBQ_ParseTableRow = -1
+End Function
+
+Private Function MBQ_GetItem(ByVal entryId As String, ByVal storeId As String, ByRef item As Object, _
+    ByRef errorNumber As Long, ByRef reason As String) As Boolean
+    On Error GoTo Failed
+    Set item = Nothing
+    Set item = Application.Session.GetItemFromID(entryId, storeId)
+    If item Is Nothing Then Err.Raise vbObjectError + 2830, , "GetItemFromID returned Nothing."
+    MBQ_GetItem = True
+    Exit Function
+Failed:
+    errorNumber = Err.Number
+    reason = Err.Description
+End Function
+
+Private Sub MBQ_ItemsPass(ByVal folder As Object, ByVal storeId As String, ByVal folderPath As String, _
+    ByVal folderKey As String, ByVal sinceDate As Date, ByVal untilDate As Date, _
+    ByVal output As Object, ByVal seenItems As Object, ByVal badFolders As Object, ByRef queued As Long)
+
+    Dim items As Object, item As Object, countBefore As Long, countAfter As Long
+    Dim stage As String, n As Long, detail As String
+    On Error GoTo Failed
+    stage = "SOURCE"
+    Set items = folder.Items
+    countBefore = items.Count
+    For Each item In items
+        stage = "CONTROL"
+        If Not MB_ContinueWork() Then Exit Sub
+        stage = "RECORD"
+        Call MBQ_ItemRow(item, storeId, folderPath, sinceDate, untilDate, output, seenItems, queued)
+        stage = "SOURCE"
+    Next item
+    countAfter = items.Count
+    stage = "CONTROL"
+    If countBefore <> countAfter Then MBQ_Changed vbNullString, folderPath, "SCAN_ITEMS_CHANGED", 0, _
+        "Folder item count changed during fallback scan: " & CStr(countBefore) & " -> " & CStr(countAfter)
+    Exit Sub
+Failed:
+    n = Err.Number
+    detail = Err.Description
+    If stage <> "SOURCE" Then Err.Raise n, "MBQ_ItemsPass", detail
+    MBQ_FolderFailed badFolders, folderKey, folderPath, "SCAN_ITEMS", n, detail
+End Sub
+
+Private Function MBQ_ItemRow(ByVal item As Object, ByVal storeId As String, ByVal folderPath As String, _
+    ByVal sinceDate As Date, ByVal untilDate As Date, ByVal output As Object, ByVal seenItems As Object, _
+    ByRef queued As Long, Optional ByVal expectedKey As String = "") As Boolean
+
+    Dim entryId As String, key As String, observedMod As Date, effectiveDate As Date
+    Dim sourceSize As Long, n As Long, detail As String, dateWarning As String
+    If item Is Nothing Then
+        MBQ_Changed expectedKey, folderPath, "SCAN_ITEM", 0, "An item is Nothing."
+        Exit Function
+    End If
+    If Not TypeOf item Is Outlook.MailItem Then
+        If Len(expectedKey) > 0 Then
+            key = expectedKey
+        ElseIf MBQ_ItemEntryId(item, entryId, n, detail) Then
+            key = MB_SourceKey(storeId, entryId)
+        End If
+        If Len(key) > 0 Then
+            If seenItems.Exists(key) Then
+                If CStr(seenItems(key)) <> "PENDING" Then
+                    MBQ_ItemRow = True
+                    Exit Function
+                End If
+                seenItems(key) = "EXCLUDED"
+            Else
+                seenItems.Add key, "EXCLUDED"
+            End If
+        End If
+        gPolicySkipped = gPolicySkipped + 1
+        MBQ_ItemRow = True
+        Exit Function
+    End If
+    If Not MBQ_ItemEntryId(item, entryId, n, detail) Then
+        MBQ_Changed expectedKey, folderPath, "SCAN_ITEM_IDENTITY", n, detail
+        Exit Function
+    End If
+    key = MB_SourceKey(storeId, entryId)
+    If Len(expectedKey) > 0 And expectedKey <> key Then
+        MBQ_Changed expectedKey, folderPath, "SCAN_ITEM_ID_CHANGED", 0, "Resolved item identity differs from the table row."
+        Exit Function
+    End If
+    If seenItems.Exists(key) Then
+        If CStr(seenItems(key)) <> "PENDING" Then
+            MBQ_ItemRow = True
+            Exit Function
+        End If
+    Else
+        seenItems.Add key, "PENDING"
+        gCandidates = gCandidates + 1
+    End If
+
+    If Not MBQ_ItemMetadata(item, observedMod, sourceSize, effectiveDate, dateWarning, n, detail) Then
+        MBQ_Changed key, folderPath, "SCAN_ITEM_METADATA", n, detail
+        Exit Function
+    End If
+    If Len(dateWarning) > 0 Then MBQ_Changed key, folderPath, "SCAN_DATE_FALLBACK", 0, dateWarning
+    MBQ_QueueCandidate storeId, entryId, folderPath, observedMod, sourceSize, effectiveDate, _
+        key, sinceDate, untilDate, output, seenItems, queued
+    MBQ_ItemRow = True
+End Function
+
+Private Function MBQ_ItemEntryId(ByVal item As Object, ByRef entryId As String, ByRef errorNumber As Long, _
+    ByRef reason As String) As Boolean
+    On Error GoTo Failed
+    entryId = CStr(item.EntryID)
+    If Len(entryId) = 0 Then Err.Raise vbObjectError + 2840, , "MailItem has no EntryID."
+    MBQ_ItemEntryId = True
+    Exit Function
+Failed:
+    errorNumber = Err.Number
+    reason = Err.Description
+End Function
+
+Private Function MBQ_ItemMetadata(ByVal item As Object, ByRef observedMod As Date, ByRef sourceSize As Long, _
+    ByRef effectiveDate As Date, ByRef dateWarning As String, ByRef errorNumber As Long, ByRef reason As String) As Boolean
+
+    Dim value As Variant, warning As String
+    On Error GoTo Failed
+    value = item.LastModificationTime
+    If Not MBQ_Date(value, observedMod) Then Err.Raise vbObjectError + 2841, , "MailItem LastModificationTime is missing."
+    value = item.Size
+    If Not MBQ_Size(value, sourceSize) Then Err.Raise vbObjectError + 2842, , "MailItem Size is missing or invalid."
+    If Not MBQ_ReadItemDate(item, 0, effectiveDate, warning) Then
+        dateWarning = warning
+        If Not MBQ_ReadItemDate(item, 1, effectiveDate, warning) Then
+            If Len(warning) > 0 Then dateWarning = dateWarning & " " & warning
+            If Not MBQ_ReadItemDate(item, 2, effectiveDate, warning) Then
+                Err.Raise vbObjectError + 2843, , "MailItem has no usable ReceivedTime, SentOn, or CreationTime. " & warning
+            End If
+        End If
+    End If
+    MBQ_ItemMetadata = True
+    Exit Function
+Failed:
+    errorNumber = Err.Number
+    reason = Err.Description
+End Function
+
+Private Function MBQ_ReadItemDate(ByVal item As Object, ByVal whichDate As Long, ByRef result As Date, _
+    ByRef warning As String) As Boolean
+    Dim value As Variant, propertyName As String
+    On Error GoTo Failed
+    warning = vbNullString
+    Select Case whichDate
+        Case 0
+            propertyName = "ReceivedTime"
+            value = item.ReceivedTime
+        Case 1
+            propertyName = "SentOn"
+            value = item.SentOn
+        Case Else
+            propertyName = "CreationTime"
+            value = item.CreationTime
+    End Select
+    MBQ_ReadItemDate = MBQ_Date(value, result)
+    Exit Function
+Failed:
+    warning = propertyName & " read failed: " & CStr(Err.Number) & " " & Err.Description
+End Function
+
+Private Sub MBQ_QueueCandidate(ByVal storeId As String, ByVal entryId As String, ByVal folderPath As String, _
+    ByVal observedMod As Date, ByVal sourceSize As Long, ByVal effectiveDate As Date, ByVal key As String, _
+    ByVal sinceDate As Date, ByVal untilDate As Date, ByVal output As Object, ByVal seenItems As Object, ByRef queued As Long)
+
+    Dim fields As Variant, payload As String, rangeDate As Date
+    rangeDate = effectiveDate
+    If gModifiedWindow Then rangeDate = observedMod
+    If gMode = "AUTO" Then
+        If Not MBW_ShouldQueue(key, observedMod, effectiveDate, sinceDate, untilDate) Then
+            seenItems(key) = "EXCLUDED"
+            gPolicySkipped = gPolicySkipped + 1
+            Exit Sub
+        End If
+    ElseIf sinceDate <> 0 Then
+        If rangeDate < sinceDate Or rangeDate > untilDate Then
+            seenItems(key) = "EXCLUDED"
+            gPolicySkipped = gPolicySkipped + 1
+            Exit Sub
+        End If
+    End If
+    fields = Array("MBQ2", storeId, entryId, folderPath, MB_Stamp(observedMod), _
+        CStr(sourceSize), MB_Stamp(effectiveDate), key)
+    payload = MB_EncodeFields(fields)
+    MB_WriteCheckedLine output, payload
+    seenItems(key) = "QUEUED"
+    queued = queued + 1
+End Sub
+
+Private Sub MBQ_Changed(ByVal key As String, ByVal folderPath As String, ByVal stage As String, _
+    ByVal errorNumber As Long, ByVal detail As String)
+    gScanChanged = gScanChanged + 1
+    MB_LogEvent "WARN", stage, key, folderPath, errorNumber, detail
+End Sub

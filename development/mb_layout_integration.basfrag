@@ -1,0 +1,287 @@
+' ========================= Year/month integration ==========================
+Public Sub MB_PreviewYearMonth()
+    MB_Run "PREVIEW_YEAR_MONTH", False, False, False
+End Sub
+
+Public Sub MB_OrganizeYearMonth()
+    MB_Run "ORGANIZE_YEAR_MONTH", False, False, False
+End Sub
+
+Public Sub MB_ApplyYearMonthPlan()
+    MB_Run "APPLY_YEAR_MONTH", False, False, False
+End Sub
+
+Public Sub MB_UndoYearMonth()
+    MB_Run "UNDO_YEAR_MONTH", False, False, False
+End Sub
+
+Private Function MBX_IsFileMode(ByVal mode As String) As Boolean
+    MBX_IsFileMode = (mode = "PREVIEW_YEAR_MONTH" Or mode = "ORGANIZE_YEAR_MONTH" Or _
+                     mode = "APPLY_YEAR_MONTH" Or mode = "UNDO_YEAR_MONTH" Or mode = "CHOOSE_ACCOUNT")
+End Function
+
+Private Function MBX_IndexKey(ByVal kind As String, ByVal key As String) As String
+    If kind = "N" Or kind = "R" Then kind = "M"
+    If kind = "T" Then kind = "A"
+    MBX_IndexKey = kind & "|" & key
+End Function
+
+Private Function MBX_StoreToken(ByVal storeId As String) As String
+    If Not gStoreTokens.Exists(storeId) Then gStoreTokens.Add storeId, CStr(gStoreTokens.Count + 1)
+    MBX_StoreToken = CStr(gStoreTokens(storeId))
+End Function
+
+Private Sub MBX_CacheRecord(ByVal f As Variant)
+    Dim key As String, kind As String, p As String, bytes As Double
+    Dim reference As String, referenceFields As Variant, referenceMeta As Variant
+    kind = CStr(f(1)): key = MBX_IndexKey(kind, CStr(f(2)))
+    bytes = MB_ByteCount(CStr(f(4)))
+    If (kind = "M" Or kind = "N" Or kind = "L" Or kind = "R") And bytes <= 0 Then
+        Err.Raise MB_ERR + 600, , "Empty MSG record."
+    End If
+    If MB_SourceKey(CStr(f(7)), CStr(f(8))) <> CStr(f(6)) Then
+        Err.Raise MB_ERR + 601, , "Index source identity mismatch."
+    End If
+    Select Case kind
+        Case "N", "T", "R"
+            If UBound(f) <> 16 Or CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 602, , "Missing account root binding."
+            p = MBY_CanonicalFilePath(CStr(f(3)), CStr(f(16)))
+            If (kind = "N" Or kind = "R") And LCase$(Right$(p, 4)) <> ".msg" Then Err.Raise MB_ERR + 603, , "Message path is not MSG."
+            If kind = "R" Then
+                If CStr(f(13)) <> "0" Or (CStr(f(15)) <> MB_NEW_CONTENT_VALIDATION And _
+                   CStr(f(15)) <> MB_NEW_CONTENT_VALIDATION_V2) Then _
+                    Err.Raise MB_ERR + 606, , "Invalid restored-identity validation."
+                If (Left$(CStr(f(14)), 2) <> "M|" And Left$(CStr(f(14)), 2) <> "L|") Or _
+                   Not MB_IsHexKey(Mid$(CStr(f(14)), 3)) Then _
+                    Err.Raise MB_ERR + 607, , "Invalid restored-identity source reference."
+                reference = CStr(f(14))
+                If reference = key Or Not gIndex.Exists(reference) Or Not gRecordMeta.Exists(reference) Then _
+                    Err.Raise MB_ERR + 608, , "Restored-identity reference has no prior committed proof."
+                referenceFields = MB_IndexFields(reference): referenceMeta = MBX_Meta(reference)
+                If CStr(referenceMeta(0)) <> MBX_StoreToken(CStr(f(7))) Or _
+                   CStr(referenceFields(2)) <> CStr(f(5)) Or MB_ByteCount(CStr(referenceFields(1))) <> bytes Then _
+                    Err.Raise MB_ERR + 609, , "Restored-identity reference account or bytes disagree."
+            End If
+            gExternalRoots(key) = MBH_NormalizePath(CStr(f(16)))
+            gIndex(key) = MB_EncodeFields(Array(p, f(4), f(5), f(15)))
+        Case "L"
+            MB_LoadLegacyRow f
+        Case "M", "A"
+            p = MB_RelPath(CStr(f(3)))
+            If gExternalRoots.Exists(key) Then gExternalRoots.Remove key
+            gIndex(key) = MB_EncodeFields(Array(f(3), f(4), f(5), f(15)))
+        Case Else
+            Err.Raise MB_ERR + 604, , "Unknown index file kind."
+    End Select
+    ' Store the account once, not a repeated long StoreID in every memory entry.
+    gRecordMeta(key) = MB_EncodeFields(Array(MBX_StoreToken(CStr(f(7))), CStr(f(11)), CStr(f(6))))
+    MBV_CacheRecord f
+    MBI_CacheRecord f
+    MBW_CacheRecord f
+End Sub
+
+Private Function MBX_Meta(ByVal key As String) As Variant
+    Dim f As Variant, i As Long
+    f = Split(CStr(gRecordMeta(key)), vbTab)
+    If UBound(f) <> 2 Then Err.Raise MB_ERR + 605, , "Invalid index metadata."
+    For i = 0 To 2
+        f(i) = MB_Unescape(CStr(f(i)))
+    Next i
+    MBX_Meta = f
+End Function
+
+Private Function MBX_IndexedRoot(ByVal key As String) As String
+    Dim binding As Variant
+    If Left$(key, 2) = "L|" Then
+        binding = MB_LegacyBinding(key)
+        MBX_IndexedRoot = CStr(binding(0))
+    ElseIf gExternalRoots.Exists(key) Then
+        MBX_IndexedRoot = CStr(gExternalRoots(key))
+    Else
+        MBX_IndexedRoot = gRoot
+    End If
+End Function
+
+Private Function MBX_IndexedOriginal(ByVal key As String, ByVal fields As Variant) As String
+    If Left$(key, 2) = "L|" Or gExternalRoots.Exists(key) Then
+        MBX_IndexedOriginal = MBY_CanonicalFilePath(CStr(fields(0)), MBX_IndexedRoot(key))
+    Else
+        MBX_IndexedOriginal = MB_RelPath(CStr(fields(0)))
+    End If
+End Function
+
+Private Function MBX_IndexedPath(ByVal key As String, ByVal fields As Variant, _
+                                 Optional ByVal requireExisting As Boolean = False) As String
+    Dim original As String, resolved As String, bound As String
+    original = MBX_IndexedOriginal(key, fields)
+    bound = MBM_ResolvedRoot(original, CStr(fields(2)), MBX_IndexedRoot(key))
+    resolved = MBM_ResolvePath(original, CStr(fields(2)))
+    MBX_IndexedPath = MBY_CanonicalFilePath(resolved, bound, requireExisting)
+End Function
+
+Private Sub MBX_BuildManagedPaths()
+    Dim key As Variant, f As Variant, p As String, binding As Variant, owner As String, ownerKey As String
+    gManagedFilePaths.RemoveAll
+    For Each key In gIndex.Keys
+        If Not MB_ContinueWork() Then Exit Sub
+        f = MB_IndexFields(CStr(key))
+        p = MBX_IndexedPath(CStr(key), f)
+        If Left$(CStr(key), 2) = "M|" Or Left$(CStr(key), 2) = "A|" Then
+            gManagedFilePaths(p) = True
+        ElseIf Left$(CStr(key), 2) = "L|" Then
+            binding = MB_LegacyBinding(CStr(key)): owner = CStr(binding(1))
+            ownerKey = MB_LegacyOwnerKey(p, CStr(f(2)))
+            If gLegacyOwners.Exists(ownerKey) Then
+                If CStr(gLegacyOwners(ownerKey)) <> owner Then
+                    Err.Raise MB_ERR + 610, , "Moved legacy file is assigned to conflicting source identities."
+                End If
+            End If
+            gLegacyOwners(ownerKey) = owner
+        End If
+    Next key
+End Sub
+
+Private Function MBX_IsManagedPath(ByVal path As String) As Boolean
+    MBX_IsManagedPath = gManagedFilePaths.Exists(path)
+End Function
+
+Private Sub MBX_AddAccount(ByVal storeId As String)
+    Dim root As String, value As Variant
+    root = MBY_AccountRoot(storeId)
+    If Len(root) = 0 Then gCancel = True: Exit Sub
+    For Each value In gArchiveRoots
+        If StrComp(CStr(value), root, vbTextCompare) = 0 Then Exit Sub
+    Next value
+    gArchiveRoots.Add root
+End Sub
+
+Private Sub MBX_ResolveAccounts(ByVal roots As Collection, ByVal selection As Outlook.Selection)
+    Dim folder As Outlook.Folder, obj As Object, i As Long
+    Set gArchiveRoots = New Collection
+    If gMode = "SELECTED" Then
+        For i = 1 To selection.Count
+            If Not MB_ContinueWork() Then Exit Sub
+            Set obj = selection.Item(i)
+            If TypeOf obj Is Outlook.MailItem Then
+                Set folder = obj.Parent
+                MBX_AddAccount folder.StoreID
+                If gCancel Then Exit Sub
+            End If
+        Next i
+    Else
+        For Each folder In roots
+            MBX_AddAccount folder.StoreID
+            If gCancel Then Exit Sub
+        Next folder
+    End If
+End Sub
+
+Private Function MBX_ManagedFiles(ByVal storeId As String, ByVal accountRoot As String) As Collection
+    Dim output As New Collection, dates As Object, token As String, key As Variant
+    Dim meta As Variant, fields As Variant, path As String, dt As Date, reason As String
+    Dim parentRevision As String, originalPath As String
+    Set dates = CreateObject("Scripting.Dictionary")
+    token = MBX_StoreToken(storeId)
+    For Each key In gIndex.Keys
+        If Not MB_ContinueWork() Then Exit For
+        If Left$(CStr(key), 2) = "M|" Or Left$(CStr(key), 2) = "L|" Then
+            meta = MBX_Meta(CStr(key))
+            If CStr(meta(0)) = token Then
+                fields = MB_IndexFields(CStr(key)): path = MBX_IndexedPath(CStr(key), fields)
+                If MBY_FileMonth(path, dt, reason) Then
+                    dates(Mid$(CStr(key), 3)) = dt
+                    If MB_PathWithin(path, accountRoot) Or MB_PathWithin(path, gRoot) Then
+                        output.Add Array(path, dt, CStr(fields(2)))
+                    End If
+                Else
+                    gFileExtraReview = gFileExtraReview + 1
+                    MB_LogEvent "WARNING", "MANAGED_MONTH_REVIEW", CStr(key), path, 0, reason
+                End If
+            End If
+        End If
+    Next key
+    For Each key In gIndex.Keys
+        If Not MB_ContinueWork() Then Exit For
+        If Left$(CStr(key), 2) = "A|" Then
+            meta = MBX_Meta(CStr(key))
+            If CStr(meta(0)) = token Then
+                fields = MB_IndexFields(CStr(key)): path = MBX_IndexedPath(CStr(key), fields)
+                If MB_PathWithin(path, accountRoot) Or MB_PathWithin(path, gRoot) Then
+                    originalPath = MBX_IndexedOriginal(CStr(key), fields)
+                    parentRevision = CStr(gFSO.GetFileName(gFSO.GetParentFolderName(originalPath)))
+                    If MB_IsHexKey(parentRevision) And dates.Exists(parentRevision) Then
+                        output.Add Array(path, CDate(dates(parentRevision)), CStr(fields(2)))
+                    Else
+                        gFileExtraReview = gFileExtraReview + 1
+                        MB_LogEvent "WARNING", "ATTACHMENT_MONTH_REVIEW", CStr(key), path, 0, _
+                                    "No readable parent MSG establishes this attachment's sent month."
+                    End If
+                End If
+            End If
+        End If
+    Next key
+    Set MBX_ManagedFiles = output
+End Function
+
+Private Function MBX_PlanKey(ByVal storeId As String, Optional ByVal applied As Boolean = False) As String
+    Dim prefix As String
+    prefix = "YearMonthPreview_"
+    If applied Then prefix = "YearMonthApplied_"
+    MBX_PlanKey = prefix & MBH_HashText(LCase$(gBaseRoot) & "|" & LCase$(storeId))
+End Function
+
+Private Sub MBX_RunFileMode()
+    Dim storeId As String, extra As Collection, count As Long
+    storeId = Application.Session.DefaultStore.StoreID
+    If gMode = "CHOOSE_ACCOUNT" Then
+        gFileAccount = MBY_ChooseAccountRoot(storeId)
+        gFileDetail = "Account folder remembered. Future messages use yyyy\mm below this folder."
+        Exit Sub
+    End If
+    gFileAccount = MBY_AccountRoot(storeId)
+    If Len(gFileAccount) = 0 Then gCancel = True: Exit Sub
+    If gJournalIssues > 0 Then Err.Raise MB_ERR + 606, , "Repair invalid backup index rows before organizing files."
+    gScope = gFileAccount
+    If gMode = "PREVIEW_YEAR_MONTH" Or gMode = "ORGANIZE_YEAR_MONTH" Then
+        gPhase = "Planning year/month paths; original files are unchanged"
+        Set extra = MBX_ManagedFiles(storeId, gFileAccount)
+        If gCancel Then Exit Sub
+        gFilePlan = MBH_JoinPath(gRunDir, "organize_plan.tsv")
+        count = MBM_BuildPlan(gFileAccount, gFilePlan, extra)
+        If gCancel Then Exit Sub
+        MBP_SaveSettingText MBX_PlanKey(storeId), gFilePlan
+        gFileDetail = "Completed checked plan; eligible records=" & CStr(count)
+    Else
+        gFilePlan = MBP_GetSettingText(MBX_PlanKey(storeId, gMode = "UNDO_YEAR_MONTH"), "")
+        If Len(gFilePlan) = 0 Then Err.Raise MB_ERR + 607, , "No completed year/month plan. Run MB_PreviewYearMonth first."
+    End If
+    If gMode = "ORGANIZE_YEAR_MONTH" Or gMode = "APPLY_YEAR_MONTH" Then
+        gPhase = "Moving existing files into yyyy\mm; no mail SaveAs"
+        MBM_RequirePlanAccount gFilePlan, gFileAccount
+        If gCancel Then Exit Sub
+        MBP_SaveSettingText MBX_PlanKey(storeId, True), gFilePlan
+        MBM_ApplyPlan gFilePlan
+        gFileDetail = "Year/month move plan processed. No mail was re-exported."
+    ElseIf gMode = "UNDO_YEAR_MONTH" Then
+        gPhase = "Restoring the previous file locations without overwriting"
+        MBM_RequirePlanAccount gFilePlan, gFileAccount
+        If gCancel Then Exit Sub
+        MBM_UndoPlan gFilePlan
+        gFileDetail = "Undo plan processed; files with conflicts or changed bytes require review."
+    End If
+End Sub
+
+Private Function MBX_FileSummary() As String
+    Dim status As String
+    status = "FILE OPERATION FINISHED"
+    If gMode = "PREVIEW_YEAR_MONTH" Then status = "PREVIEW FINISHED; NO ORIGINAL FILES MOVED"
+    If gMoveReview > 0 Or gMovePlanReview > 0 Or gFileExtraReview > 0 Then status = status & "; ITEMS REQUIRE REVIEW"
+    If gCancel Then status = "CANCELLED; KEEP THE PLAN TO RESUME"
+    If gFatal Then status = "FAILED: " & gFatalText
+    MBX_FileSummary = status & vbCrLf & "Version: " & MB_VERSION & "; mode: " & gMode & vbCrLf & _
+                     "Account folder: " & gFileAccount & vbCrLf & gFileDetail & vbCrLf & _
+                     "Plan: " & gFilePlan & vbCrLf & "Indexed items needing date review: " & _
+                     CStr(gFileExtraReview) & vbCrLf & "Results: " & gRunDir & vbCrLf & _
+                     MBM_Summary()
+End Function
+

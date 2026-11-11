@@ -1,0 +1,12 @@
+' Same-source revisions use a direct history head, independent of Subject/date.
+' This authorizes a new version only after an unchanged prior MSG is compared.
+Private Const MBV_NONE As Long = 0
+Private Const MBV_REUSED As Long = 1
+Private Const MBV_REVIEW As Long = 2
+Private Const MBV_CANCELLED As Long = 3
+Private Const MBV_CHANGED As Long = 4
+Private gRevisionHeads As Object
+Private gRevisionCompared As Long
+Private gRevisionReused As Long
+Private gRevisionDifferent As Long
+Private gRevisionReview As Long

@@ -1,0 +1,4 @@
+' Acceptance reports describe their tested scope; unexecuted operational gates
+' remain NOT_RUN. No global pass flag is stored here or in the Windows registry.
+Private Const MBT_REPORT_SCHEMA As String = "MBTEST1"
+

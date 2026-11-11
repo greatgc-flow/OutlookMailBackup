@@ -1,0 +1,1728 @@
+' ========================== Public entry points =============================
+Public Sub MB_BackupRecentMonth()
+    MB_Run "MONTH", False, True, False
+End Sub
+
+Public Sub MB_BackupModifiedMonth()
+    MB_Run "MODIFIED_MONTH", False, True, False
+End Sub
+
+Public Sub MB_BackupAll()
+    MB_Run "ALL", False, True, False
+End Sub
+
+Public Sub MB_BackupAllStoresMonth()
+    MB_Run "MONTH", True, True, False
+End Sub
+
+Public Sub MB_BackupPickedFolderMonth()
+    MB_Run "MONTH", False, True, True
+End Sub
+
+Public Sub MB_BackupPickedFolderOnly()
+    MB_Run "MONTH", False, False, True
+End Sub
+
+Public Sub MB_BackupSelectedMessages()
+    MB_Run "SELECTED", False, False, False
+End Sub
+
+Public Sub MB_Benchmark300()
+    MB_Run "BENCHMARK", False, True, False
+End Sub
+
+Public Sub MB_VerifyAll()
+    MB_Run "VERIFY", False, False, False
+End Sub
+
+Public Sub MB_CancelBackup()
+    If gBusy Then gCancel = True
+End Sub
+
+Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
+                   ByVal includeChildren As Boolean, ByVal pickFolder As Boolean)
+    Dim roots As Collection, folder As Outlook.Folder, st As Outlook.Store
+    Dim ex As Outlook.Explorer, selected As Outlook.Selection
+    Dim baseRoot As String, queuePath As String, summary As String
+    Dim startTick As Double, errNo As Long, errText As String, rootIndex As Long
+    Dim lockHeld As Boolean, attached As String, autoReady As Boolean
+    Dim savedCalendar As Long, calendarEntered As Boolean
+    If gBusy Then
+        MsgBox "A backup/verification is already running. Use MB_CancelBackup.", vbInformation
+        Exit Sub
+    End If
+    On Error GoTo Failed
+    gBusy = True
+    MBC_EnterGregorian savedCalendar, calendarEntered
+    MB_Reset
+    gMode = mode
+    gRunStart = Now
+    gUntil = gRunStart
+    gClockStart = MB_Clock()
+    If mode = "MONTH" Or mode = "MODIFIED_MONTH" Then gSince = MBC_ShiftMonths(gUntil, -1)
+    If mode = "AUTO" Then MBW_Start Application.Session.DefaultStore.StoreID
+    gModifiedWindow = (mode = "MODIFIED_MONTH")
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    Set gIndex = CreateObject("Scripting.Dictionary")
+    gIndex.CompareMode = vbBinaryCompare
+    Set gExternalRoots = CreateObject("Scripting.Dictionary")
+    Set gRecordMeta = CreateObject("Scripting.Dictionary")
+    Set gStoreTokens = CreateObject("Scripting.Dictionary")
+    Set gManagedFilePaths = CreateObject("Scripting.Dictionary")
+    Set gLegacyAccountStats = CreateObject("Scripting.Dictionary")
+    gStoreTokens.CompareMode = vbTextCompare
+    gManagedFilePaths.CompareMode = vbTextCompare
+    gLegacyAccountStats.CompareMode = vbTextCompare
+    Set gLegacyBindings = CreateObject("Scripting.Dictionary")
+    Set gLegacySources = CreateObject("Scripting.Dictionary")
+    Set gLegacyOwners = CreateObject("Scripting.Dictionary")
+    gLegacyBindings.CompareMode = vbBinaryCompare
+    gLegacySources.CompareMode = vbBinaryCompare
+    gLegacyOwners.CompareMode = vbTextCompare
+    Set gDirs = CreateObject("Scripting.Dictionary")
+    gDirs.CompareMode = vbTextCompare
+    Set roots = New Collection
+    If mode <> "VERIFY" And Not MBX_IsFileMode(mode) Then
+        If mode = "SELECTED" Then
+            Set ex = Application.ActiveExplorer
+            If ex Is Nothing Then Err.Raise MB_ERR + 1, "MB_Run", "No active Explorer."
+            Set selected = ex.Selection
+            If selected.Count = 0 Then Err.Raise MB_ERR + 2, "MB_Run", "No selected items."
+            gScope = "Current Explorer selection"
+        ElseIf pickFolder Then
+            Set folder = Application.Session.PickFolder
+            If folder Is Nothing Then
+                gCancel = True
+                GoTo CleanUp
+            End If
+            roots.Add folder
+            gScope = folder.FolderPath
+        ElseIf allStores Then
+            For Each st In Application.Session.Stores
+                Set folder = st.GetRootFolder
+                roots.Add folder
+            Next st
+            gScope = "All currently mounted stores (" & CStr(roots.Count) & ")"
+        Else
+            Set folder = Application.Session.DefaultStore.GetRootFolder
+            roots.Add folder
+            gScope = folder.FolderPath
+        End If
+    Else
+        gScope = "Every committed file indexed in SafeV2"
+    End If
+    baseRoot = MBP_ResolveBackupRoot(gSelectedBase)
+    If Len(baseRoot) = 0 Then
+        gCancel = True
+        GoTo CleanUp
+    End If
+    MBH_EnsureDirectory baseRoot
+    MBH_AcquireRunLock MBH_JoinPath(baseRoot, "backup.lock")
+    lockHeld = True
+    gRoot = baseRoot
+    gBaseRoot = baseRoot
+    MB_CheckOwnership gRoot
+    gLegacyRoot = MBP_ResolveLegacyRoot(gSelectedBase, gBaseRoot)
+    If gFSO.FileExists(MBH_JoinPath(baseRoot, "STOP.txt")) Then
+        Err.Raise MB_ERR + 4, "MB_Run", "STOP.txt exists. Remove it before starting a new run."
+    End If
+    gRunId = MBC_FileStamp(gRunStart) & "_" & _
+             Left$(MBH_HashText(gFSO.GetTempName & CStr(Timer)), 10)
+    If mode = "BENCHMARK" Then
+        gRoot = MBH_JoinPath(MBH_JoinPath(baseRoot, "_benchmarks"), gRunId)
+        MBH_EnsureDirectory gRoot
+        MB_CheckOwnership gRoot
+    End If
+    If mode = "AUTO" Then MBS_BindStore Application.Session.DefaultStore.StoreID
+    MBP_PersistBackupRoot gSelectedBase
+    MBS_Initialize
+    gRunDir = MBH_JoinPath(MB_StatePath("runs"), gRunId)
+    MB_EnsureDir gRunDir
+    Set gEvents = gFSO.CreateTextFile(MBH_JoinPath(gRunDir, "events.tsv"), False, True)
+    gEvents.WriteLine "time" & vbTab & "level" & vbTab & "stage" & vbTab & _
+                      "key" & vbTab & "path" & vbTab & "error" & vbTab & "detail"
+    MB_LogEvent "INFO", "START", "", gRoot, 0, _
+        "version=" & MB_VERSION & "; mode=" & mode & "; scope=" & gScope & _
+        "; since=" & MB_Stamp(gSince) & "; until=" & MB_Stamp(gUntil) & _
+        "; descendants=" & CStr(includeChildren) & _
+        "; extract=" & CStr(MB_EXTRACT_ATTACHMENTS) & _
+        "; rehash_existing=" & CStr(MB_VERIFY_EXISTING_HASH) & _
+        "; selected_base=" & gSelectedBase & "; legacy_root=" & gLegacyRoot
+    gJournalPath = MB_StatePath("journal.tsv")
+    If mode = "AUTO" Then
+        gPhase = "Recovering operating records before loading the index"
+        gEarlyAccount = MBS_EarlyAccount(Application.Session.DefaultStore.StoreID)
+        If gCancel Then GoTo Finish
+        MBR_RestoreState gEarlyAccount, Application.Session.DefaultStore.StoreID
+        MBS_CheckRestoredStore Application.Session.DefaultStore.StoreID
+        MBY_Reset
+    End If
+    gPhase = "Loading committed-file index"
+    startTick = MB_Clock()
+    MB_LoadIndex
+    If mode = "AUTO" And gJournalIssues > 0 Then
+        MB_LogEvent "WARNING", "SEMANTIC_INDEX_RECOVERY", "", gJournalPath, 0, _
+                    "Checked rows failed semantic validation; restoring/rebuilding state once."
+        MBR_RestoreState gEarlyAccount, Application.Session.DefaultStore.StoreID, True
+        MBS_CheckRestoredStore Application.Session.DefaultStore.StoreID
+        MBS_ClearLoadedIndex Application.Session.DefaultStore.StoreID
+        MB_LoadIndex
+        If gJournalIssues > 0 Then Err.Raise MB_ERR + 926, , "Recovered index still contains invalid semantic records."
+    End If
+    gIndexSeconds = MB_Clock() - startTick
+    If gCancel Then GoTo Finish
+    gPhase = "Checking recoverable file moves"
+    MBM_LoadMoves
+    If gCancel Then GoTo Finish
+    If mode = "AUTO" Then
+        gEarlyAccount = MBY_ValidateAccountRoot(gEarlyAccount, Application.Session.DefaultStore.StoreID, True)
+        If gCancel Or Len(gEarlyAccount) = 0 Then GoTo Finish
+        MBY_SaveRoot Application.Session.DefaultStore.StoreID, gEarlyAccount
+    End If
+    MBX_BuildManagedPaths
+    If gCancel Then GoTo Finish
+    If MBX_IsFileMode(mode) Then
+        MBX_RunFileMode
+        GoTo Finish
+    End If
+    If mode = "VERIFY" Then
+        gPhase = "Verifying indexed files"
+        startTick = MB_Clock()
+        MB_AuditIndex
+        gExportSeconds = MB_Clock() - startTick
+        GoTo Finish
+    End If
+    If mode <> "BENCHMARK" Then
+        gPhase = "Finding existing MSG files (no export)"
+        startTick = MB_Clock()
+        MBX_ResolveAccounts roots, selected
+        If gCancel Then GoTo Finish
+        If mode = "AUTO" Then
+            MBS_RememberAccount Application.Session.DefaultStore.StoreID, gEarlyAccount
+            MBS_EnableStages gEarlyAccount, Application.Session.DefaultStore.StoreID
+            If gCancel Then GoTo Finish
+            startTick = MB_Clock()
+            autoReady = MBU_PrepareAccount()
+            gAutoSetupSeconds = MB_Clock() - startTick
+            If Not autoReady Then GoTo Finish
+            startTick = MB_Clock()
+            MBR_BuildBaseline gAutoAccount, gAutoStoreId
+            If gCancel Then GoTo Finish
+            If MBS_RelinkMissingReferences(gAutoAccount, gAutoStoreId) > 0 Then
+                MBX_BuildManagedPaths
+                autoReady = MBU_PrepareAccount()
+                If Not autoReady Then GoTo Finish
+            End If
+            gMaintenanceReady = True
+        End If
+        MBL_BuildAccountIndexes gArchiveRoots, gBaseRoot
+        gLegacySeconds = MB_Clock() - startTick
+        If gCancel Then GoTo Finish
+        If Not gLegacyScanComplete Then
+            Err.Raise MB_ERR + 273, "MB_Run", "Old archive scan is incomplete; new exports are blocked."
+        End If
+        MBP_PersistLegacyRoot gBaseRoot, gLegacyRoot
+        MB_LogEvent "INFO", "LEGACY_SCAN", "", gLegacyRoot, 0, _
+                    "files=" & CStr(gLegacyFileCount) & "; unrecognized_names=" & _
+                    CStr(gLegacyUnrecognizedNames) & "; newest_file_write=" & MB_Stamp(gLegacyNewestFileTime)
+    End If
+    If mode = "AUTO" Then
+        MBW_Prepare
+        If gCancel Then GoTo Finish
+        If gAutoNeedsRegistration Then
+            If Not MBU_RegisterExisting(roots) Then GoTo Finish
+            MBW_Prepare
+            If gCancel Then GoTo Finish
+        End If
+    End If
+    queuePath = MBH_JoinPath(gRunDir, "queue.tsv")
+    gPhase = "Collecting fixed target list"
+    startTick = MB_Clock()
+    If mode = "SELECTED" Then
+        gPlanned = MB_QueueSelection(selected, queuePath)
+    Else
+        gPlanned = MBP_BuildQueue(roots, gSince, gUntil, includeChildren, queuePath)
+    End If
+    If mode = "AUTO" Then
+        gWindowInventoryComplete = (Not gCancel And Not gFatal And gFolderFailures = 0 And gScanChanged = 0)
+    End If
+    gScanSeconds = gScanSeconds + MB_Clock() - startTick
+    gFullPlanned = gPlanned
+    If gCancel Then GoTo Finish
+    If mode = "BENCHMARK" Then
+        queuePath = MB_MakeSample(queuePath, MB_BENCHMARK_COUNT)
+    End If
+    MB_OpenJournal
+    gPhase = "Exporting / verifying messages"
+    startTick = MB_Clock()
+    MB_ProcessQueue queuePath
+    gExportSeconds = gExportSeconds + MB_Clock() - startTick
+Finish:
+    gMailPending = gPlanned - gProcessed
+    If gMailPending < 0 Then
+        Err.Raise MB_ERR + 5, "MB_Run", "Internal count mismatch: processed exceeds plan."
+    End If
+    If mode <> "VERIFY" And Not MBX_IsFileMode(mode) Then
+        If gProcessed <> gMailNew + gMailReused + gMailFailed + gMailChanged + gMailPolicy + gMailReview + gLegacyUnmatched Then
+            Err.Raise MB_ERR + 6, "MB_Run", "Internal message outcome reconciliation failed."
+        End If
+        If gAttFound <> gAttNew + gAttReused + gAttExcluded + gAttFailed + gAttPending Then
+            Err.Raise MB_ERR + 7, "MB_Run", "Internal attachment outcome reconciliation failed."
+        End If
+    End If
+    If mode = "AUTO" And gMaintenanceReady Then
+        MBW_FinishAudit
+        If Not gCancel And Not gFatal Then MBA_Run
+        ' Current unresolved mail is itemized in the source-audit ledger.
+        ' Do not perpetuate an old aggregate registration-review counter.
+        If gWindowInventoryComplete Then
+            gAutoLegacyReview = 0
+            gAutoReviewCount = gAutoFileReview
+            If gAutoSetupPhase = "READY" Then MBU_SaveSetup "READY", gFilePlan, gAutoSetupNote
+        End If
+    End If
+    MB_FlushJournal
+    If mode = "AUTO" Then MBW_PrepareCommit
+    summary = MB_Summary()
+    MB_LogEvent "INFO", "END", "", gRunDir, 0, Replace(summary, vbCrLf, " | ")
+    GoTo CleanUp
+Failed:
+    errNo = Err.Number
+    errText = Err.Description
+    gFatal = True
+    gFatalText = "Error " & CStr(errNo) & ": " & errText
+    On Error Resume Next
+    If Not gEvents Is Nothing Then MB_LogEvent "ERROR", "FATAL", "", gRunDir, errNo, errText
+    gMailPending = gPlanned - gProcessed
+    If gMailPending < 0 Then gMailPending = 0
+    summary = MB_Summary()
+    On Error GoTo 0
+CleanUp:
+    On Error Resume Next
+    MBC_LeaveGregorian savedCalendar, calendarEntered
+    If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Calendar restore: " & Err.Description
+    On Error GoTo 0
+    MB_CloseResources
+    ' Coverage advances under the same locks, only after the durable message
+    ' journal and both streams closed successfully. Interrupted work replays.
+    On Error Resume Next
+    Err.Clear
+    If mode = "AUTO" Then MBW_CommitAfterClose
+    If mode = "AUTO" And gWindowCommitted Then MBR_CompleteReconcile gAutoAccount, gAutoStoreId
+    If Err.Number <> 0 Then
+        gFatal = True
+        gFatalText = gFatalText & " UTC checkpoint: " & Err.Description
+    End If
+    On Error GoTo 0
+    If mode = "AUTO" And Len(gRunDir) > 0 Then summary = MB_Summary()
+    If mode = "AUTO" And gMaintenanceReady And gJournalIssues = 0 Then
+        On Error Resume Next
+        Err.Clear
+        MBR_SaveSnapshot gAutoAccount, gAutoStoreId
+        If Err.Number <> 0 Then
+            gFatal = True
+            gFatalText = gFatalText & " Recovery snapshot: " & Err.Description
+        End If
+        On Error GoTo 0
+        summary = MB_Summary()
+    End If
+    gStageEnabled = False
+    On Error Resume Next
+    Err.Clear
+    MBM_ReleaseAccountLocks
+    If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Account lock release: " & Err.Description
+    On Error GoTo 0
+    If lockHeld Then
+        On Error Resume Next
+        Err.Clear
+        MBH_ReleaseRunLock
+        If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Lock release: " & Err.Description
+        Err.Clear
+        MBH_ReleaseCrypto
+        If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Crypto release: " & Err.Description
+        On Error GoTo 0
+    End If
+    If Len(gCleanupIssue) > 0 Then
+        gFatal = True
+        gFatalText = gFatalText & " CLEANUP ERROR: " & gCleanupIssue
+        summary = MB_Summary()
+    End If
+    If Len(summary) = 0 Then
+        If gCancel Then
+            summary = "Cancelled before export."
+        Else
+            summary = gFatalText
+        End If
+    End If
+    ' The durable summary is written only after journal/event streams have closed.
+    If Len(gRunDir) > 0 Then
+        On Error Resume Next
+        Err.Clear
+        MB_WriteSummary summary
+        If Err.Number <> 0 Then
+            gFatal = True
+            summary = "FAILED TO WRITE FINAL SUMMARY: " & Err.Description & vbCrLf & summary
+        End If
+        On Error GoTo 0
+    End If
+    MBL_Reset
+    MBY_Reset
+    MBM_Reset
+    MBI_Reset
+    MBW_Reset
+    MBA_Reset
+    MBR_Reset
+    Set gExternalRoots = Nothing: Set gRecordMeta = Nothing: Set gStoreTokens = Nothing
+    Set gManagedFilePaths = Nothing: Set gLegacyAccountStats = Nothing: Set gArchiveRoots = Nothing
+    Set gLegacyBindings = Nothing: Set gLegacySources = Nothing: Set gLegacyOwners = Nothing
+    Set gIndex = Nothing: Set gDirs = Nothing: Set gFSO = Nothing
+    On Error Resume Next
+    MBC_LeaveGregorian savedCalendar, calendarEntered
+    On Error GoTo 0
+    gBusy = False
+    Debug.Print summary
+    If Len(summary) > 900 Then
+        summary = Left$(summary, 350) & vbCrLf & "Phase: " & Left$(gPhase, 100)
+        If gFatal Then summary = summary & vbCrLf & "Cause: " & Left$(gFatalText, 250)
+        summary = summary & vbCrLf & "Full results: " & gRunDir & "\summary.txt"
+    End If
+    MsgBox summary, IIf(gFatal Or Len(gCleanupIssue) > 0, vbExclamation, vbInformation), _
+           "Outlook Mail Backup " & MB_VERSION
+End Sub
+
+Private Sub MB_Reset()
+    gCancel = False: gFatal = False: gFatalText = "": gCleanupIssue = ""
+    gBaseRoot = "": gSelectedBase = "": gLegacyRoot = ""
+    gMailLegacy = 0: gMailReview = 0: gLegacyUnmatched = 0: gLegacySeconds = 0
+    gFilePlan = "": gFileAccount = "": gFileDetail = "": gFileExtraReview = 0
+    gReuseBlocked = False: gReuseReason = ""
+    MBP_Reset
+    MBF_Reset
+    MBU_Reset
+    MBS_Reset
+    MBR_Reset
+    MBA_Reset
+    MBI_Reset
+    MBW_Reset
+    MBL_Reset
+    MBY_Reset
+    MBM_Reset
+    gRoot = "": gRunId = "": gRunDir = "": gSince = 0: gUntil = 0
+    gPhase = "Starting": gMode = "": gScope = "": gModifiedWindow = False
+    gLastPulse = 0: gLastProgress = 0
+    MBH_PathCacheHits = 0: MBH_PathCacheMisses = 0
+    gJournalWrites = 0: gJournalIssues = 0
+    gFoldersScanned = 0: gFolderFailures = 0: gPolicySkipped = 0
+    gCandidates = 0: gScanChanged = 0
+    gPlanned = 0: gFullPlanned = 0: gProcessed = 0
+    gMailNew = 0: gMailReused = 0: gMailFailed = 0
+    gMailChanged = 0: gMailPolicy = 0: gMailPending = 0: gContentReview = 0
+    gAttFound = 0: gAttNew = 0: gAttReused = 0
+    gAttExcluded = 0: gAttFailed = 0: gAttPending = 0
+    gBytesNew = 0: gScanSeconds = 0: gIndexSeconds = 0: gExportSeconds = 0
+    gSampleCount = 0
+    ReDim gSampleSeconds(1 To MB_BENCHMARK_COUNT)
+    Set gEvents = Nothing: Set gJournal = Nothing
+End Sub
+
+Private Sub MB_CheckOwnership(ByVal rootPath As String)
+    Dim p As String, ts As Object, value As String, f As Object, subFolder As Object
+    p = MBH_JoinPath(rootPath, "owner.txt")
+    If Not gFSO.FileExists(p) Then
+        If MBS_CanRecoverOwner(rootPath, gFSO) Then
+            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            Exit Sub
+        End If
+    End If
+    If gFSO.FileExists(p) Then
+        Set ts = gFSO.OpenTextFile(p, 1, False, -1)
+        value = ts.ReadAll
+        ts.Close
+        If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
+           value <> MB_OWNER_PREVIOUS & vbCrLf Then
+            Err.Raise MB_ERR + 10, "MB_CheckOwnership", "Output owner marker is invalid: " & p
+        End If
+        If value = MB_OWNER_LEGACY & vbCrLf Or value = MB_OWNER_PREVIOUS & vbCrLf Then
+            ' Preserve the old marker, then reject unsupported downgrade writers.
+            If Not gFSO.FileExists(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt")) Then
+                Set ts = gFSO.CreateTextFile(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt"), False, True)
+                ts.Write value: ts.Close
+            End If
+            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+        End If
+        Exit Sub
+    End If
+    For Each f In gFSO.GetFolder(rootPath).Files
+        If LCase$(f.Name) <> "backup.lock" Then
+            Err.Raise MB_ERR + 11, "MB_CheckOwnership", _
+                      "Unowned output folder contains files. Choose a new empty SafeV2 folder."
+        End If
+    Next f
+    For Each subFolder In gFSO.GetFolder(rootPath).SubFolders
+        Err.Raise MB_ERR + 12, "MB_CheckOwnership", _
+                  "Unowned output folder contains directories. Choose a new empty SafeV2 folder."
+    Next subFolder
+    Set ts = gFSO.CreateTextFile(p, False, True)
+    ts.WriteLine MB_OWNER
+    ts.Close
+End Sub
+
+' ======================= Journal / metadata utilities =======================
+Public Function MB_Stamp(ByVal value As Date) As String
+    MB_Stamp = MBC_Stamp(value)
+End Function
+
+Private Function MB_ParseStamp(ByVal value As String) As Date
+    MB_ParseStamp = MBC_ParseLegacyStamp(value)
+End Function
+
+Private Function MB_Escape(ByVal value As String) As String
+    value = Replace(value, "%", "%25")
+    value = Replace(value, vbTab, "%09")
+    value = Replace(value, vbCr, "%0D")
+    value = Replace(value, vbLf, "%0A")
+    ' Avoid formula interpretation when human-readable TSV is opened in Excel.
+    If Len(value) > 0 Then
+        Select Case Left$(value, 1)
+            Case "=": value = "%3D" & Mid$(value, 2)
+            Case "+": value = "%2B" & Mid$(value, 2)
+            Case "-": value = "%2D" & Mid$(value, 2)
+            Case "@": value = "%40" & Mid$(value, 2)
+        End Select
+    End If
+    MB_Escape = value
+End Function
+
+Private Function MB_Unescape(ByVal value As String) As String
+    value = Replace(value, "%09", vbTab)
+    value = Replace(value, "%0D", vbCr)
+    value = Replace(value, "%0A", vbLf)
+    value = Replace(value, "%3D", "=")
+    value = Replace(value, "%2B", "+")
+    value = Replace(value, "%2D", "-")
+    value = Replace(value, "%40", "@")
+    MB_Unescape = Replace(value, "%25", "%")
+End Function
+
+Public Function MB_EncodeFields(ByVal values As Variant) As String
+    Dim i As Long, fields() As String
+    ReDim fields(LBound(values) To UBound(values))
+    For i = LBound(values) To UBound(values)
+        fields(i) = MB_Escape(CStr(values(i)))
+    Next i
+    MB_EncodeFields = Join(fields, vbTab)
+End Function
+
+Public Sub MB_WriteCheckedLine(ByVal stream As Object, ByVal payload As String)
+    stream.WriteLine payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+End Sub
+
+Private Function MB_ReadCheckedLine(ByVal line As String, ByVal fieldCount As Long) As Variant
+    Dim raw As Variant, fields() As String, payload As String, i As Long
+    raw = Split(line, vbTab)
+    If UBound(raw) <> fieldCount + 1 Then
+        Err.Raise MB_ERR + 15, "MB_ReadCheckedLine", "Wrong journal/queue field count."
+    End If
+    If raw(fieldCount + 1) <> "END" Then
+        Err.Raise MB_ERR + 16, "MB_ReadCheckedLine", "Incomplete journal/queue record."
+    End If
+    For i = 0 To fieldCount - 1
+        If i > 0 Then payload = payload & vbTab
+        payload = payload & CStr(raw(i))
+    Next i
+    If MBH_HashText(payload) <> CStr(raw(fieldCount)) Then
+        Err.Raise MB_ERR + 17, "MB_ReadCheckedLine", "Journal/queue checksum mismatch."
+    End If
+    ReDim fields(0 To fieldCount - 1)
+    For i = 0 To fieldCount - 1
+        fields(i) = MB_Unescape(CStr(raw(i)))
+    Next i
+    MB_ReadCheckedLine = fields
+End Function
+
+Public Function MB_SourceKey(ByVal storeId As String, ByVal entryId As String) As String
+    If Len(storeId) = 0 Or Len(entryId) = 0 Then
+        Err.Raise MB_ERR + 18, "MB_SourceKey", "Missing source identity."
+    End If
+    storeId = LCase$(storeId): entryId = LCase$(entryId)
+    MB_SourceKey = MBH_HashText("MBSOURCE2|" & CStr(Len(storeId)) & ":" & storeId & _
+                              "|" & CStr(Len(entryId)) & ":" & entryId)
+End Function
+
+Private Function MB_IsHexKey(ByVal value As String) As Boolean
+    Dim i As Long, ch As String
+    If Len(value) <> 64 Then Exit Function
+    For i = 1 To Len(value)
+        ch = Mid$(value, i, 1)
+        If InStr(1, "0123456789abcdef", ch, vbBinaryCompare) = 0 Then Exit Function
+    Next i
+    MB_IsHexKey = True
+End Function
+
+Private Function MB_ByteCount(ByVal value As String) As Double
+    Dim i As Long, ch As String
+    If Len(value) = 0 Or Len(value) > 16 Then
+        Err.Raise MB_ERR + 19, "MB_ByteCount", "Invalid byte count."
+    End If
+    For i = 1 To Len(value)
+        ch = Mid$(value, i, 1)
+        If ch < "0" Or ch > "9" Then Err.Raise MB_ERR + 19, "MB_ByteCount", "Invalid byte count."
+    Next i
+    MB_ByteCount = CDbl(value)
+End Function
+
+Private Function MB_RelPath(ByVal relativePath As String) As String
+    Dim parts As Variant, part As Variant, p As String
+    parts = Split(relativePath, "\")
+    If UBound(parts) < 1 Then Err.Raise MB_ERR + 20, "MB_RelPath", "Invalid relative output path."
+    If parts(0) <> "messages" And parts(0) <> "attachments" Then
+        Err.Raise MB_ERR + 21, "MB_RelPath", "Unexpected output namespace."
+    End If
+    p = gRoot
+    For Each part In parts
+        p = MBH_JoinPath(p, CStr(part))
+    Next part
+    MB_RelPath = p
+End Function
+
+Private Sub MB_EnsureDir(ByVal directoryPath As String)
+    If gDirs.Exists(directoryPath) Then Exit Sub
+    MBH_EnsureDirectory directoryPath
+    gDirs.Add directoryPath, True
+End Sub
+
+Private Sub MB_LoadIndex()
+    Dim stream As Object, line As String, rowNumber As Long, errNo As Long, errText As String
+    On Error GoTo Failed
+    If Not gFSO.FileExists(gJournalPath) Then Exit Sub
+    If CDbl(gFSO.GetFile(gJournalPath).Size) Mod 2 <> 0 Then
+        Err.Raise MB_ERR + 22, "MB_LoadIndex", "Journal has an odd UTF-16 byte count; preserve and inspect it."
+    End If
+    Set stream = gFSO.OpenTextFile(gJournalPath, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        If Not MB_ContinueWork() Then Exit Do
+        line = stream.ReadLine
+        rowNumber = rowNumber + 1
+        If Len(line) > 0 Then MB_LoadIndexRow line, rowNumber
+    Loop
+    stream.Close
+    Exit Sub
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise errNo, "MB_LoadIndex", errText
+End Sub
+
+Private Sub MB_LoadIndexRow(ByVal line As String, ByVal rowNumber As Long)
+    Dim f As Variant, errNo As Long, errText As String
+    On Error GoTo Invalid
+    If Left$(line, 6) = "MBS3" & vbTab & "N" Or Left$(line, 6) = "MBS3" & vbTab & "T" Or _
+       Left$(line, 6) = "MBS3" & vbTab & "R" Then
+        f = MB_ReadCheckedLine(line, 17)
+        If CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
+    Else
+        f = MB_ReadCheckedLine(line, 16)
+        If CStr(f(0)) <> "MBS2" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
+    End If
+    If Not MB_IsHexKey(f(2)) Or Not MB_IsHexKey(f(5)) Or Not MB_IsHexKey(f(6)) Then
+        Err.Raise MB_ERR + 25, , "Invalid index key/hash."
+    End If
+    MBX_CacheRecord f
+    Exit Sub
+Invalid:
+    errNo = Err.Number: errText = Err.Description
+    gJournalIssues = gJournalIssues + 1
+    MB_LogEvent "ERROR", "INVALID_INDEX_ROW", CStr(rowNumber), gJournalPath, errNo, errText
+End Sub
+
+Private Sub MB_OpenJournal()
+    If gJournal Is Nothing Then
+        Set gJournal = gFSO.OpenTextFile(gJournalPath, 8, True, -1)
+        ' Leading newline separates a possibly truncated previous final line.
+        gJournal.WriteLine ""
+        gJournalWrites = 0
+    End If
+End Sub
+
+Private Sub MB_FlushJournal()
+    If Not gJournal Is Nothing Then
+        gJournal.Close
+        Set gJournal = Nothing
+    End If
+    gJournalWrites = 0
+End Sub
+
+Private Sub MB_RecordCommit(ByVal kind As String, ByVal key As String, ByVal relativePath As String, _
+                            ByVal bytes As Double, ByVal digest As String, ByVal q As Variant, _
+                            ByVal subject As String, ByVal attNo As Long, _
+                            ByVal originalName As String, ByVal validation As String, _
+                            Optional ByVal accountRoot As String = "")
+    Dim payload As String, fields As Variant, indexKey As String
+    On Error GoTo Failed
+    If kind = "N" Or kind = "T" Or kind = "R" Then
+        fields = Array("MBS3", kind, key, relativePath, Format$(bytes, "0"), digest, _
+                       q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation, accountRoot)
+    Else
+        fields = Array("MBS2", kind, key, relativePath, Format$(bytes, "0"), digest, _
+                       q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation)
+    End If
+    payload = MB_EncodeFields(fields)
+    MB_OpenJournal
+    MB_WriteCheckedLine gJournal, payload
+    gJournalWrites = gJournalWrites + 1
+    If gJournalWrites >= MB_JOURNAL_FLUSH_EVERY Then MB_FlushJournal
+    MBX_CacheRecord fields
+    indexKey = MBX_IndexKey(kind, key)
+    If kind <> "L" Then gManagedFilePaths(MBX_IndexedPath(indexKey, MB_IndexFields(indexKey))) = True
+    Exit Sub
+Failed:
+    gFatal = True
+    gFatalText = "Cannot record committed file: " & Err.Description
+    Err.Raise MB_ERR + 27, "MB_RecordCommit", gFatalText
+End Sub
+
+Private Function MB_IndexFields(ByVal key As String) As Variant
+    Dim parts As Variant, i As Long
+    parts = Split(CStr(gIndex(key)), vbTab)
+    If UBound(parts) <> 3 Then Err.Raise MB_ERR + 28, , "Invalid compact index state."
+    For i = 0 To 3
+        parts(i) = MB_Unescape(CStr(parts(i)))
+    Next i
+    MB_IndexFields = parts
+End Function
+
+Private Function MB_ExistingValid(ByVal key As String, ByRef relativePath As String) As Boolean
+    Dim fields As Variant, p As String, reason As String, errNo As Long
+    On Error GoTo Invalid
+    gReuseBlocked = False: gReuseReason = ""
+    If Not gIndex.Exists(key) Then Exit Function
+    fields = MB_IndexFields(key)
+    relativePath = CStr(fields(0))
+    p = MBX_IndexedPath(key, fields, True)
+    If Not gFSO.FileExists(p) Then
+        reason = "Indexed file is missing.": GoTo InvalidResult
+    End If
+    If CDbl(gFSO.GetFile(p).Size) <> MB_ByteCount(CStr(fields(1))) Then
+        reason = "Indexed file size mismatch.": GoTo InvalidResult
+    End If
+    If Left$(key, 2) = "M|" And MB_REOPEN_NEW_MSG Then
+        If fields(3) <> "REOPENED_SHA256" And fields(3) <> MB_NEW_CONTENT_VALIDATION And _
+           fields(3) <> MB_NEW_BASIC_VALIDATION And fields(3) <> MB_NEW_CONTENT_VALIDATION_V2 And _
+           fields(3) <> MB_NEW_BASIC_VALIDATION_V2 Then
+            reason = "Existing MSG does not have required reopen validation.": GoTo InvalidResult
+        End If
+    End If
+    If MB_VERIFY_EXISTING_HASH Then
+        If MBH_HashFile(p) <> CStr(fields(2)) Then
+            reason = "Indexed SHA-256 mismatch.": GoTo InvalidResult
+        End If
+    End If
+    MB_ExistingValid = True
+    Exit Function
+Invalid:
+    errNo = Err.Number: reason = Err.Description
+InvalidResult:
+    MB_LogEvent "WARNING", "INDEXED_FILE_REVIEW_NO_REEXPORT", key, p, errNo, reason
+    ' Keep the recorded identity, including moved/missing files. No automatic SaveAs.
+    gReuseBlocked = True: gReuseReason = reason
+    relativePath = ""
+End Function
+
+' =========================== Exporting messages =============================
+Private Sub MB_ProcessQueue(ByVal queuePath As String)
+    Dim stream As Object, line As String, q As Variant, result As Long
+    Dim tick As Double, elapsed As Double, errNo As Long, errText As String
+    Dim priorContentReview As Long, metricInFlight As Boolean
+    On Error GoTo Failed
+    Set stream = gFSO.OpenTextFile(queuePath, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        If Not MB_ContinueWork() Then Exit Do
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            q = MB_ReadCheckedLine(line, 8)
+            If q(0) <> "MBQ2" Then Err.Raise MB_ERR + 30, , "Wrong queue schema."
+            If MB_SourceKey(q(1), q(2)) <> q(7) Then Err.Raise MB_ERR + 31, , "Queue identity mismatch."
+            tick = MB_Clock()
+            priorContentReview = gContentReview
+            result = 0: metricInFlight = True
+            result = MB_ProcessOne(q)
+            elapsed = MB_Clock() - tick
+            metricInFlight = False
+            MBF_Record gMode, result, elapsed, (gContentReview > priorContentReview)
+            If result = 5 Then Exit Do
+            MBW_RecordAuditResult CStr(q(7)), result, (gContentReview > priorContentReview)
+            gProcessed = gProcessed + 1
+            Select Case result
+                Case 1: gMailNew = gMailNew + 1
+                Case 2: gMailReused = gMailReused + 1
+                Case 3: gMailFailed = gMailFailed + 1
+                Case 4: gMailChanged = gMailChanged + 1
+                Case 6: gMailPolicy = gMailPolicy + 1
+                Case 7: gMailReview = gMailReview + 1
+                Case 8: gLegacyUnmatched = gLegacyUnmatched + 1
+                Case Else: Err.Raise MB_ERR + 32, , "Unknown message result."
+            End Select
+            If gMode = "BENCHMARK" And result = 1 Then
+                gSampleCount = gSampleCount + 1
+                If gSampleCount <= MB_BENCHMARK_COUNT Then gSampleSeconds(gSampleCount) = elapsed
+            End If
+        End If
+    Loop
+    stream.Close
+    Exit Sub
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If metricInFlight Then
+        elapsed = -1#
+        elapsed = MB_Clock() - tick
+        MBF_Record gMode, result, elapsed, (gContentReview > priorContentReview)
+    End If
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise errNo, "MB_ProcessQueue", errText
+End Sub
+
+Private Function MB_Revision(ByVal mail As Outlook.MailItem, ByVal sourceKey As String) As String
+    Dim changeKey As String, modified As Date, itemSize As Long, precise As String
+    modified = mail.LastModificationTime
+    itemSize = mail.Size
+    precise = Replace(Format$(CDbl(modified), "0.0000000000"), ",", ".")
+    changeKey = MB_GetChangeKey(mail)
+    MB_Revision = MBH_HashText("MBREV2|" & sourceKey & "|" & precise & "|" & _
+                             CStr(itemSize) & "|" & changeKey)
+End Function
+
+Private Function MB_GetChangeKey(ByVal mail As Outlook.MailItem) As String
+    Dim value As Variant, i As Long, result As String
+    ' Optional provider property. Absence is not a missing email.
+    On Error GoTo NotProvided
+    value = mail.PropertyAccessor.GetProperty(MB_CHANGE_KEY)
+    If Not IsArray(value) Then GoTo NotProvided
+    For i = LBound(value) To UBound(value)
+        result = result & Right$("0" & Hex$(CByte(value(i))), 2)
+    Next i
+    MB_GetChangeKey = LCase$(result)
+    Exit Function
+NotProvided:
+    MB_GetChangeKey = "NO_PROVIDER_CHANGEKEY"
+End Function
+
+Private Function MB_SourceStable(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                                  ByVal revision As String) As Boolean
+    Dim parent As Outlook.Folder
+    Set parent = mail.Parent
+    If MB_SourceKey(parent.StoreID, mail.EntryID) <> CStr(q(7)) Then Exit Function
+    If StrComp(parent.FolderPath, CStr(q(3)), vbBinaryCompare) <> 0 Then Exit Function
+    If MB_Stamp(mail.LastModificationTime) <> CStr(q(4)) Then Exit Function
+    If CDbl(mail.Size) <> MB_ByteCount(CStr(q(5))) Then Exit Function
+    If Len(revision) > 0 Then
+        If MB_Revision(mail, CStr(q(7))) <> revision Then Exit Function
+    End If
+    MB_SourceStable = True
+End Function
+
+Private Function MB_MessageLeaf(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                                ByVal revision As String, ByVal parent As String) As String
+    MB_MessageLeaf = MBN_MessageLeaf(MBC_FileStamp(MBY_MessageDate(mail)), _
+                                     MB_SenderLabel(mail), mail.Subject, parent)
+End Function
+
+Private Function MB_SenderLabel(ByVal mail As Outlook.MailItem) As String
+    On Error GoTo Missing
+    MB_SenderLabel = mail.SenderName
+    If Len(MB_SenderLabel) = 0 Then MB_SenderLabel = "unknown_sender"
+    Exit Function
+Missing:
+    MB_SenderLabel = "unknown_sender"
+End Function
+
+Private Function MB_ProcessOne(ByVal q As Variant) As Long
+    Dim obj As Object, mail As Outlook.MailItem, originalFolder As Outlook.Folder
+    Dim revision As String, relativePath As String, finalPath As String, stagePath As String
+    Dim digest As String, bytes As Double, subject As String, stage As String
+    Dim wasNew As Boolean, attCount As Long, attHandled As Long, i As Long, r As Long
+    Dim attAccounted As Boolean, messageDir As String, wasLegacy As Boolean
+    Dim legacyResult As Long, legacyReason As String, accountRoot As String, recordKind As String
+    Dim errNo As Long, errText As String, sourceRevisionAfter As String, validation As String
+    Dim contentComplete As Boolean, verifiedKnownChange As Boolean
+#If VBA7 Then
+    Dim publishedGuard As LongPtr
+#Else
+    Dim publishedGuard As Long
+#End If
+    On Error GoTo Failed
+    stage = "GET_ITEM"
+    Set obj = Application.Session.GetItemFromID(CStr(q(2)), CStr(q(1)))
+    If Not TypeOf obj Is Outlook.MailItem Then
+        MB_LogEvent "WARNING", "TYPE_CHANGED", q(7), q(3), 0, "Queued item is no longer MailItem."
+        MB_ProcessOne = 4
+        Exit Function
+    End If
+    Set mail = obj
+    Set originalFolder = mail.Parent
+    If MB_SourceKey(originalFolder.StoreID, mail.EntryID) <> CStr(q(7)) Then GoTo Changed
+    If StrComp(originalFolder.FolderPath, CStr(q(3)), vbBinaryCompare) <> 0 Then
+        ' Search folders are virtual views; an item belongs to its real parent.
+        ' Same-store moves that preserve the source revision are also recorded.
+        MB_LogEvent "INFO", "SOURCE_LOCATION_RESOLVED", q(7), originalFolder.FolderPath, 0, _
+                    "Queued view/location: " & CStr(q(3)) & "; recording actual parent at export."
+        q(3) = originalFolder.FolderPath
+    End If
+    If Not MB_SourceStable(mail, q, "") Then GoTo Changed
+    stage = "DOWNLOAD_STATE"
+    If mail.DownloadState = olHeaderOnly Then
+        Err.Raise MB_ERR + 33, , "Header-only message. Download it fully, then rerun."
+    End If
+    revision = MB_Revision(mail, CStr(q(7)))
+    subject = mail.Subject
+    stage = "VERIFY_EXISTING_MSG"
+    If MB_ExistingValid("M|" & revision, relativePath) Then
+        stage = "UPGRADE_EXISTING_VALIDATION_NO_SAVEAS"
+        validation = MB_UpgradeMsgValidation(mail, q, revision)
+        If validation = MB_NEW_BASIC_VALIDATION Then gContentReview = gContentReview + 1
+        wasNew = False
+    Else
+        If gReuseBlocked Then
+            legacyReason = "Recorded backup needs review: " & gReuseReason
+            GoTo LegacyReview
+        End If
+        If gMode <> "BENCHMARK" Then
+            stage = "VERIFY_KNOWN_SOURCE_REVISION_NO_SAVEAS"
+            legacyResult = MBV_TryKnownRevision(mail, q, revision, legacyReason)
+            Select Case legacyResult
+                Case MBV_REUSED
+                    wasNew = False
+                    GoTo MessageReady
+                Case MBV_REVIEW
+                    GoTo LegacyReview
+                Case MBV_CANCELLED
+                    MB_ProcessOne = 5
+                    Exit Function
+                Case MBV_CHANGED
+                    verifiedKnownChange = True
+                Case MBV_NONE
+                    verifiedKnownChange = False
+                Case Else
+                    legacyReason = "Unknown known-revision decision; prior files retained."
+                    GoTo LegacyReview
+            End Select
+            stage = "VERIFY_RESTORED_IDENTITY_NO_SAVEAS"
+            legacyResult = MBI_TryAlias(mail, q, revision, legacyReason)
+            If legacyResult = 1 Then
+                wasNew = False
+                GoTo MessageReady
+            ElseIf legacyResult = 3 Then
+                MB_ProcessOne = 5
+                Exit Function
+            ElseIf legacyResult = 2 Then
+                GoTo LegacyReview
+            End If
+            If Not verifiedKnownChange Then
+                stage = "VERIFY_LEGACY_MSG"
+                legacyResult = MB_ReuseLegacy(mail, q, revision, legacyReason)
+                If legacyResult = 1 Then
+                    wasNew = False: wasLegacy = True
+                    GoTo MessageReady
+                ElseIf legacyResult = 3 Then
+                    MB_ProcessOne = 5
+                    Exit Function
+                ElseIf legacyResult = 2 Then
+                    GoTo LegacyReview
+                End If
+            End If
+        End If
+        If gMode = "REGISTER_LEGACY" Then
+            MB_LogEvent "INFO", "LEGACY_UNMATCHED_NO_EXPORT", q(7), q(3), 0, _
+                        "No verified existing MSG match; registration mode never saves new messages."
+            MB_ProcessOne = 8
+            Exit Function
+        End If
+        If Not MB_NewExportAllowed(mail, legacyReason, verifiedKnownChange) Then GoTo LegacyReview
+        stage = "SAVE_MSG"
+        If gMode = "BENCHMARK" Then
+            messageDir = MBH_JoinPath(MBH_JoinPath(gRoot, "messages"), Left$(revision, 2))
+            recordKind = "M"
+        Else
+            accountRoot = MBY_AccountRoot(CStr(q(1)))
+            If Len(accountRoot) = 0 Then MB_ProcessOne = 5: Exit Function
+            messageDir = MBY_MonthDirectory(accountRoot, MBY_MessageDate(mail))
+            recordKind = "N"
+        End If
+        finalPath = MBH_JoinPath(messageDir, MB_MessageLeaf(mail, q, revision, messageDir))
+        MB_EnsureDir messageDir
+        MBY_NoReparse messageDir, True
+        finalPath = MB_UnusedFinal(finalPath)
+        If recordKind = "N" Then
+            relativePath = finalPath
+        Else
+            relativePath = Mid$(finalPath, Len(gRoot) + 2)
+        End If
+        stagePath = MBH_NewStagePath(finalPath)
+        mail.SaveAs stagePath, olMSGUnicode
+        If CDbl(gFSO.GetFile(stagePath).Size) = 0 Then Err.Raise MB_ERR + 34, , "Empty exported MSG."
+        stage = "REOPEN_MSG"
+        validation = "SHA256"
+        If MB_REOPEN_NEW_MSG Then
+            MB_CompareMsg mail, stagePath, contentComplete
+            If contentComplete Then
+                validation = MB_NEW_CONTENT_VALIDATION
+            Else
+                validation = MB_NEW_BASIC_VALIDATION
+            End If
+        End If
+        stage = "HASH_MSG"
+        digest = MBH_HashFile(stagePath)
+        bytes = CDbl(gFSO.GetFile(stagePath).Size)
+        If Not MB_SourceStable(mail, q, revision) Then GoTo Changed
+        stage = "COMMIT_MSG"
+        MBH_CommitStage stagePath, finalPath, digest, bytes
+        stagePath = ""
+        publishedGuard = MBH_GuardFile(finalPath)
+        If MBH_HashFile(finalPath) <> digest Or CDbl(gFSO.GetFile(finalPath).Size) <> bytes Then _
+            Err.Raise MB_ERR + 923, , "Published MSG changed before index commit."
+        ' The stage was content-checked against this captured revision before
+        ' publication. Record those verified historical bytes even if the live
+        ' item changed immediately afterward. MessageReady still refuses to
+        ' count the CURRENT revision as complete in that case.
+        MB_RecordCommit recordKind, revision, relativePath, bytes, digest, q, subject, 0, "", validation, accountRoot
+        MBH_CloseGuard publishedGuard
+        gBytesNew = gBytesNew + bytes
+        If validation = MB_NEW_BASIC_VALIDATION Then
+            gContentReview = gContentReview + 1
+            MB_LogEvent "WARNING", "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
+                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven."
+        End If
+        wasNew = True
+    End If
+MessageReady:
+    If Not MB_SourceStable(mail, q, revision) Then GoTo Changed
+    If gMode = "REGISTER_LEGACY" Then
+        If wasLegacy Then gMailLegacy = gMailLegacy + 1
+        MB_ProcessOne = 2
+        Exit Function
+    End If
+    If MB_EXTRACT_ATTACHMENTS Then
+        attCount = mail.Attachments.Count
+        gAttFound = gAttFound + attCount
+        For i = 1 To attCount
+            If Not MB_ContinueWork() Then
+                Exit For
+            End If
+            stage = "ATTACHMENT_" & CStr(i)
+            r = MB_ProcessAttachment(mail, i, revision, q, subject)
+            Select Case r
+                Case 1: gAttNew = gAttNew + 1
+                Case 2: gAttReused = gAttReused + 1
+                Case 3: gAttFailed = gAttFailed + 1
+                Case 4: gAttExcluded = gAttExcluded + 1
+                Case Else: Err.Raise MB_ERR + 35, , "Unknown attachment result."
+            End Select
+            attHandled = attHandled + 1
+        Next i
+        gAttPending = gAttPending + (attCount - attHandled)
+        attAccounted = True
+    End If
+    If Not MB_SourceStable(mail, q, revision) Then GoTo Changed
+    If wasLegacy Then gMailLegacy = gMailLegacy + 1
+    If wasNew Then
+        MB_ProcessOne = 1
+    Else
+        MB_ProcessOne = 2
+    End If
+    Exit Function
+LegacyReview:
+    MB_LogEvent "WARNING", "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason
+    MB_ProcessOne = 7
+    Exit Function
+Changed:
+    MBH_CloseGuard publishedGuard
+    If Not attAccounted Then gAttPending = gAttPending + (attCount - attHandled)
+    If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
+    MB_LogEvent "WARNING", "SOURCE_CHANGED_RETRY", q(7), q(3), 0, _
+                "Source changed/moved after queue capture or during export; rerun to capture its current revision."
+    MB_ProcessOne = 4
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    If Not attAccounted Then gAttPending = gAttPending + (attCount - attHandled)
+    On Error Resume Next
+    MBH_CloseGuard publishedGuard
+    If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
+    On Error GoTo 0
+    MB_LogEvent "ERROR", stage, q(7), q(3), errNo, errText
+    If gFatal Then Err.Raise errNo, "MB_ProcessOne", errText
+    MB_ProcessOne = 3
+End Function
+
+Private Function MB_UnusedFinal(ByVal requested As String) As String
+    Dim candidate As String, parent As String, stem As String, ext As String, n As Long
+    If Not gFSO.FileExists(requested) And Not gFSO.FolderExists(requested) Then
+        MB_UnusedFinal = requested
+        Exit Function
+    End If
+    parent = gFSO.GetParentFolderName(requested)
+    stem = gFSO.GetBaseName(requested)
+    ext = gFSO.GetExtensionName(requested)
+    If Len(ext) > 0 Then ext = "." & ext
+    For n = 1 To 99999
+        candidate = MBH_JoinPath(parent, stem & "_r" & Format$(n, "00000") & ext)
+        If Not gFSO.FileExists(candidate) And Not gFSO.FolderExists(candidate) Then
+            MB_UnusedFinal = candidate
+            Exit Function
+        End If
+    Next n
+    Err.Raise MB_ERR + 36, "MB_UnusedFinal", "Too many preserved path conflicts."
+End Function
+
+Private Function MB_UpgradeMsgValidation(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                                         ByVal revision As String) As String
+    Dim key As String, fields As Variant, path As String, bound As String
+    Dim validation As String, complete As Boolean, relative As String, kind As String
+    Dim n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    key = "M|" & revision
+    fields = MB_IndexFields(key)
+    validation = CStr(fields(3))
+    If MB_REOPEN_NEW_MSG And (validation <> MB_NEW_CONTENT_VALIDATION Or MBW_RequireContentCheck(CStr(q(7)))) Then
+        path = MBX_IndexedPath(key, fields, True)
+        guard = MBH_GuardFile(path)
+        MB_CompareMsg mail, path, complete
+        If MBH_HashFile(path) <> CStr(fields(2)) Then Err.Raise MB_ERR + 80, , "Existing MSG changed during validation upgrade."
+        If Not MB_SourceStable(mail, q, revision) Then Err.Raise MB_ERR + 81, , "Source changed during validation upgrade."
+        If complete Then validation = MB_NEW_CONTENT_VALIDATION Else validation = MB_NEW_BASIC_VALIDATION
+        bound = MBM_ResolvedRoot(MBX_IndexedOriginal(key, fields), CStr(fields(2)), MBX_IndexedRoot(key))
+        If StrComp(bound, gRoot, vbTextCompare) = 0 Then
+            kind = "M": relative = Mid$(path, Len(gRoot) + 2)
+        Else
+            kind = "N": relative = path
+        End If
+        MB_RecordCommit kind, revision, relative, MB_ByteCount(CStr(fields(1))), CStr(fields(2)), _
+                        q, mail.Subject, 0, "", validation, bound
+        MBH_CloseGuard guard
+        MB_LogEvent "INFO", "VALIDATION_UPGRADED_NO_SAVEAS", q(7), path, 0, validation
+    End If
+    MB_UpgradeMsgValidation = validation
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise n, "MB_UpgradeMsgValidation", detail
+End Function
+
+Private Sub MB_CompareMsg(ByVal source As Outlook.MailItem, ByVal path As String, _
+                          Optional ByRef contentComplete As Boolean = False)
+    Dim obj As Object, copy As Outlook.MailItem, a As Outlook.Attachment, b As Outlook.Attachment
+    Dim ra As Outlook.Recipient, rb As Outlook.Recipient
+    Dim i As Long, errNo As Long, errText As String, digest As String
+    Dim sourceId As String, copyId As String, hasSourceId As Boolean, hasCopyId As Boolean
+    On Error GoTo Failed
+    contentComplete = True
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 37, , "Export is not MailItem."
+    Set copy = obj
+    If Not MBE_MetadataComplete(source, copy) Then contentComplete = False
+    If StrComp(source.MessageClass, copy.MessageClass, vbBinaryCompare) <> 0 Or _
+       source.Sent <> copy.Sent Or source.BodyFormat <> copy.BodyFormat Then
+        Err.Raise MB_ERR + 74, , "Message class/sent state/body format mismatch."
+    End If
+    If source.Sent Then
+        If MB_Stamp(source.SentOn) <> MB_Stamp(copy.SentOn) Or _
+           MB_Stamp(source.ReceivedTime) <> MB_Stamp(copy.ReceivedTime) Then
+            Err.Raise MB_ERR + 75, , "Sent/received timestamp mismatch."
+        End If
+        If StrComp(source.SenderEmailType, copy.SenderEmailType, vbTextCompare) <> 0 Or _
+           StrComp(source.SenderEmailAddress, copy.SenderEmailAddress, vbTextCompare) <> 0 Or _
+           StrComp(source.SenderName, copy.SenderName, vbBinaryCompare) <> 0 Then
+            Err.Raise MB_ERR + 76, , "Sender mismatch."
+        End If
+    End If
+    sourceId = MBL_InternetId(source, hasSourceId): copyId = MBL_InternetId(copy, hasCopyId)
+    If hasSourceId <> hasCopyId Or StrComp(sourceId, copyId, vbBinaryCompare) <> 0 Then
+        Err.Raise MB_ERR + 77, , "Internet Message-ID mismatch."
+    End If
+    If StrComp(source.Subject, copy.Subject, vbBinaryCompare) <> 0 Then Err.Raise MB_ERR + 38, , "Subject mismatch."
+    If StrComp(source.Body, copy.Body, vbBinaryCompare) <> 0 Then Err.Raise MB_ERR + 39, , "Body mismatch."
+    If source.BodyFormat = olFormatHTML Then
+        If StrComp(source.HTMLBody, copy.HTMLBody, vbBinaryCompare) <> 0 Then
+            Err.Raise MB_ERR + 40, , "HTML body mismatch."
+        End If
+    ElseIf source.BodyFormat = olFormatRichText Then
+        If Not MBL_ByteArraysEqual(source.RTFBody, copy.RTFBody) Then
+            Err.Raise MB_ERR + 78, , "RTF body bytes mismatch."
+        End If
+    End If
+    If source.Recipients.Count <> copy.Recipients.Count Then Err.Raise MB_ERR + 41, , "Recipient count mismatch."
+    For i = 1 To source.Recipients.Count
+        Set ra = source.Recipients.Item(i): Set rb = copy.Recipients.Item(i)
+        If ra.Type <> rb.Type Or StrComp(ra.Address, rb.Address, vbBinaryCompare) <> 0 Then
+            Err.Raise MB_ERR + 70, , "Recipient type/address mismatch at index " & CStr(i)
+        End If
+    Next i
+    Set ra = Nothing: Set rb = Nothing
+    If source.Attachments.Count <> copy.Attachments.Count Then Err.Raise MB_ERR + 42, , "Attachment count mismatch."
+    For i = 1 To source.Attachments.Count
+        Set a = source.Attachments.Item(i)
+        Set b = copy.Attachments.Item(i)
+        If a.FileName <> b.FileName Or a.Type <> b.Type Or a.Size <> b.Size Then
+            Err.Raise MB_ERR + 43, , "Attachment metadata mismatch at index " & CStr(i)
+        End If
+        MBL_CompareAttachmentProperties a, b
+        If a.Type = olByValue Then
+            digest = MBL_AttachmentHash(a)
+            If digest <> MBL_AttachmentHash(b) Then Err.Raise MB_ERR + 79, , "Attachment bytes mismatch at index " & CStr(i)
+        Else
+            contentComplete = False
+        End If
+    Next i
+    Set a = Nothing: Set b = Nothing
+    copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    Exit Sub
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    Set a = Nothing: Set b = Nothing
+    Set ra = Nothing: Set rb = Nothing
+    If Not copy Is Nothing Then copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    Err.Raise errNo, "MB_CompareMsg", errText
+End Sub
+
+Private Function MB_AttachmentAllowed(ByVal name As String) As Boolean
+    Dim ext As String, dot As Long, allowed As String
+    allowed = LCase$(Replace(MB_ATTACHMENT_EXTENSIONS, " ", ""))
+    If allowed = "*" Then
+        MB_AttachmentAllowed = True
+        Exit Function
+    End If
+    dot = InStrRev(name, ".")
+    If dot = 0 Then Exit Function
+    ext = LCase$(Mid$(name, dot + 1))
+    If Len(ext) = 0 Then Exit Function
+    MB_AttachmentAllowed = (InStr(1, ";" & allowed & ";", ";" & ext & ";", vbBinaryCompare) > 0)
+End Function
+
+Private Function MB_AttachmentLeaf(ByVal original As String, ByVal ordinal As Long, _
+                                   ByVal parent As String) As String
+    Dim safe As String, dot As Long, stem As String, ext As String
+    Dim prefix As String, budget As Long
+    ' Split the original extension BEFORE shortening the basename.
+    dot = InStrRev(original, ".")
+    If dot > 1 And Len(original) - dot <= 16 Then
+        stem = Left$(original, dot - 1)
+        ext = MBH_SafeComponent(Mid$(original, dot + 1), 16, "bin")
+        ext = "." & ext
+    Else
+        stem = original: ext = ""
+    End If
+    prefix = Format$(ordinal, "00000") & "_"
+    ' Leave space for _r00001 and for staged names at the same directory depth.
+    budget = MBH_MAX_PATH_UNITS - Len(parent) - 1 - Len(prefix) - Len(ext) - 8
+    If budget < 8 Then Err.Raise MB_ERR + 44, , "Attachment parent path too long."
+    MB_AttachmentLeaf = prefix & MBH_SafeComponent(stem, budget, "attachment") & ext
+End Function
+
+Private Function MB_ProcessAttachment(ByVal mail As Outlook.MailItem, ByVal ordinal As Long, _
+                                      ByVal revision As String, ByVal q As Variant, _
+                                      ByVal subject As String) As Long
+    Dim attachment As Outlook.Attachment, key As String, original As String
+    Dim parent As String, finalPath As String, relativePath As String, stagePath As String
+    Dim digest As String, bytes As Double, errNo As Long, errText As String, stage As String
+    Dim accountRoot As String, recordKind As String
+#If VBA7 Then
+    Dim publishedGuard As LongPtr
+#Else
+    Dim publishedGuard As Long
+#End If
+    On Error GoTo Failed
+    stage = "READ_ATTACHMENT"
+    Set attachment = mail.Attachments.Item(ordinal)
+    original = attachment.FileName
+    If Not MB_AttachmentAllowed(original) Then
+        MB_LogEvent "INFO", "ATTACHMENT_POLICY_SKIP", q(7), q(3), 0, _
+                    CStr(ordinal) & ": " & original
+        MB_ProcessAttachment = 4
+        Exit Function
+    End If
+    key = MBH_HashText("MBATT2|" & revision & "|" & CStr(ordinal))
+    stage = "VERIFY_EXISTING_ATTACHMENT"
+    If MB_ExistingValid("A|" & key, relativePath) Then
+        MB_ProcessAttachment = 2
+        Exit Function
+    End If
+    If gReuseBlocked Then Err.Raise MB_ERR + 608, , "Recorded attachment needs review: " & gReuseReason
+    If gMode = "BENCHMARK" Then
+        parent = MBH_JoinPath(MBH_JoinPath(MBH_JoinPath(gRoot, "attachments"), Left$(revision, 2)), revision)
+        recordKind = "A"
+    Else
+        accountRoot = MBY_AccountRoot(CStr(q(1)))
+        If Len(accountRoot) = 0 Then Err.Raise MB_ERR + 609, , "Attachment export cancelled."
+        parent = MBH_JoinPath(MBH_JoinPath(MBY_MonthDirectory(accountRoot, MBY_MessageDate(mail)), "_attachments"), revision)
+        recordKind = "T"
+    End If
+    MB_EnsureDir parent
+    MBY_NoReparse parent, True
+    finalPath = MBH_JoinPath(parent, MB_AttachmentLeaf(original, ordinal, parent))
+    finalPath = MB_UnusedFinal(finalPath)
+    If recordKind = "T" Then
+        relativePath = finalPath
+    Else
+        relativePath = Mid$(finalPath, Len(gRoot) + 2)
+    End If
+    stagePath = MBH_NewStagePath(finalPath)
+    stage = "SAVE_ATTACHMENT"
+    attachment.SaveAsFile stagePath
+    bytes = CDbl(gFSO.GetFile(stagePath).Size)
+    ' Zero-byte attachments can be valid. Do not equate MAPI.Size with exported size.
+    digest = MBH_HashFile(stagePath)
+    If Not MB_SourceStable(mail, q, revision) Then
+        Err.Raise MB_ERR + 45, , "Source changed during attachment extraction."
+    End If
+    stage = "COMMIT_ATTACHMENT"
+    MBH_CommitStage stagePath, finalPath, digest, bytes
+    stagePath = ""
+    publishedGuard = MBH_GuardFile(finalPath)
+    If MBH_HashFile(finalPath) <> digest Or CDbl(gFSO.GetFile(finalPath).Size) <> bytes Then _
+        Err.Raise MB_ERR + 924, , "Published attachment changed before index commit."
+    MB_RecordCommit recordKind, key, relativePath, bytes, digest, q, subject, ordinal, original, "SHA256", accountRoot
+    MBH_CloseGuard publishedGuard
+    gBytesNew = gBytesNew + bytes
+    MB_ProcessAttachment = 1
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard publishedGuard
+    If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
+    On Error GoTo 0
+    MB_LogEvent "ERROR", stage, q(7), q(3), errNo, _
+                "attachment=" & CStr(ordinal) & "; name=" & original & "; " & errText
+    If gFatal Then Err.Raise errNo, "MB_ProcessAttachment", errText
+    MB_ProcessAttachment = 3
+End Function
+
+' ===================== Selected mail / benchmark sample =====================
+Private Function MB_QueueSelection(ByVal selection As Outlook.Selection, ByVal path As String) As Long
+    Dim stream As Object, obj As Object, mail As Outlook.MailItem, folder As Outlook.Folder
+    Dim seen As Object, key As String, i As Long, payload As String, dt As Date
+    Dim errNo As Long, errText As String
+    On Error GoTo Failed
+    Set seen = CreateObject("Scripting.Dictionary")
+    Set stream = gFSO.CreateTextFile(path, False, True)
+    For i = 1 To selection.Count
+        If Not MB_ContinueWork() Then Exit For
+        Set obj = selection.Item(i)
+        If TypeOf obj Is Outlook.MailItem Then
+            Set mail = obj: Set folder = mail.Parent
+            key = MB_SourceKey(folder.StoreID, mail.EntryID)
+            If Not seen.Exists(key) Then
+                seen.Add key, True
+                dt = MB_EffectiveDate(mail)
+                payload = MB_EncodeFields(Array("MBQ2", folder.StoreID, mail.EntryID, _
+                          folder.FolderPath, MB_Stamp(mail.LastModificationTime), _
+                          CStr(mail.Size), MB_Stamp(dt), key))
+                MB_WriteCheckedLine stream, payload
+                MB_QueueSelection = MB_QueueSelection + 1
+            End If
+        Else
+            gPolicySkipped = gPolicySkipped + 1
+        End If
+    Next i
+    stream.Close
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise errNo, "MB_QueueSelection", errText
+End Function
+
+Private Function MB_ValidDate(ByVal value As Date) As Boolean
+    MB_ValidDate = MBC_ValidDate(value)
+End Function
+
+Private Function MB_EffectiveDate(ByVal mail As Outlook.MailItem) As Date
+    Dim value As Date
+    value = mail.ReceivedTime
+    If MB_ValidDate(value) Then MB_EffectiveDate = value: Exit Function
+    value = mail.SentOn
+    If MB_ValidDate(value) Then MB_EffectiveDate = value: Exit Function
+    value = mail.CreationTime
+    If MB_ValidDate(value) Then MB_EffectiveDate = value: Exit Function
+    Err.Raise MB_ERR + 46, , "No usable received/sent/creation timestamp."
+End Function
+
+Private Function MB_MakeSample(ByVal queuePath As String, ByVal limit As Long) As String
+    Dim reservoir() As String, stream As Object, output As Object, line As String
+    Dim n As Long, j As Long, count As Long, samplePath As String
+    Dim errNo As Long, errText As String
+    On Error GoTo Failed
+    ReDim reservoir(1 To limit)
+    Randomize
+    Set stream = gFSO.OpenTextFile(queuePath, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        If Not MB_ContinueWork() Then Exit Do
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            n = n + 1
+            If n <= limit Then
+                reservoir(n) = line
+            Else
+                j = CLng(Int(Rnd * CDbl(n))) + 1
+                If j <= limit Then reservoir(j) = line
+            End If
+        End If
+    Loop
+    stream.Close
+    samplePath = MBH_JoinPath(gRunDir, "sample_queue.tsv")
+    Set output = gFSO.CreateTextFile(samplePath, False, True)
+    count = limit
+    If n < count Then count = n
+    For j = 1 To count
+        output.WriteLine reservoir(j)
+    Next j
+    output.Close
+    gPlanned = count
+    MB_MakeSample = samplePath
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If Not output Is Nothing Then output.Close
+    On Error GoTo 0
+    Err.Raise errNo, "MB_MakeSample", errText
+End Function
+
+' ============================= Integrity audit =============================
+Private Sub MB_AuditIndex()
+    Dim key As Variant, fields As Variant, p As String, ok As Boolean, binding As Variant
+    gPlanned = gIndex.Count
+    gFullPlanned = gPlanned
+    For Each key In gIndex.Keys
+        If Not MB_ContinueWork() Then Exit For
+        fields = MB_IndexFields(CStr(key))
+        p = MBX_IndexedPath(CStr(key), fields)
+        ok = MB_AuditFile(CStr(key), p, MB_ByteCount(CStr(fields(1))), CStr(fields(2)))
+        gProcessed = gProcessed + 1
+        If ok Then
+            gMailReused = gMailReused + 1
+        Else
+            gMailFailed = gMailFailed + 1
+        End If
+    Next key
+End Sub
+
+Private Function MB_AuditFile(ByVal key As String, ByVal path As String, _
+                              ByVal bytes As Double, ByVal digest As String) As Boolean
+    Dim obj As Object, errNo As Long, errText As String, binding As Variant
+    On Error GoTo Failed
+    path = MBX_IndexedPath(key, MB_IndexFields(key), True)
+    If Not gFSO.FileExists(path) Then Err.Raise MB_ERR + 47, , "Indexed file is missing."
+    If CDbl(gFSO.GetFile(path).Size) <> bytes Then Err.Raise MB_ERR + 48, , "File size mismatch."
+    If MBH_HashFile(path) <> digest Then Err.Raise MB_ERR + 49, , "SHA-256 mismatch."
+    If Left$(key, 2) = "M|" Or Left$(key, 2) = "L|" Then
+        Set obj = Application.Session.OpenSharedItem(path)
+        If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 50, , "MSG cannot reopen as MailItem."
+        obj.Close olDiscard
+        Set obj = Nothing
+    End If
+    MB_AuditFile = True
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If Not obj Is Nothing Then obj.Close olDiscard
+    Set obj = Nothing
+    On Error GoTo 0
+    MB_LogEvent "ERROR", "AUDIT_FAILED", key, path, errNo, errText
+End Function
+
+' ============================= Logs and UI =================================
+Public Sub MB_LogEvent(ByVal level As String, ByVal stage As String, ByVal key As String, _
+                       ByVal path As String, ByVal errorNumber As Long, ByVal detail As String)
+    On Error GoTo Failed
+    If gEvents Is Nothing Then Err.Raise MB_ERR + 51, , "Event log is not open."
+    gEvents.WriteLine MB_EncodeFields(Array(MB_Stamp(Now), level, stage, key, path, CStr(errorNumber), detail))
+    Exit Sub
+Failed:
+    gFatal = True
+    gFatalText = "Logging failed: " & Err.Description
+    Err.Raise MB_ERR + 52, "MB_LogEvent", gFatalText
+End Sub
+
+Private Function MB_Clock() As Double
+    Static frequency As Currency
+    Dim counter As Currency
+    If frequency = 0 Then
+        If MB_QueryPerformanceFrequency(frequency) = 0 Then
+            Err.Raise MB_ERR + 71, "MB_Clock", "Performance-counter frequency unavailable."
+        End If
+    End If
+    If MB_QueryPerformanceCounter(counter) = 0 Then
+        Err.Raise MB_ERR + 72, "MB_Clock", "Performance counter unavailable."
+    End If
+    MB_Clock = CDbl(counter) / CDbl(frequency)
+End Function
+
+Public Function MB_ContinueWork() As Boolean
+    Dim tick As Double, ts As Object, progress As String
+    If gFatal Or gCancel Then Exit Function
+    tick = MB_Clock()
+    If tick - gLastPulse >= 0.25 Then
+        gLastPulse = tick
+        DoEvents
+        If gFatal Or gCancel Then Exit Function
+        If Len(gRoot) > 0 Then
+            If gFSO.FileExists(MBH_JoinPath(gRoot, "STOP.txt")) Then gCancel = True
+            If gMode = "BENCHMARK" Then
+                If gFSO.FileExists(MBH_JoinPath(gBaseRoot, "STOP.txt")) Then gCancel = True
+            End If
+        End If
+    End If
+    If tick - gLastProgress >= 2# And Len(gRunDir) > 0 Then
+        gLastProgress = tick
+        progress = gPhase & vbCrLf & "Processed: " & CStr(gProcessed) & "/" & CStr(gPlanned) & _
+                   vbCrLf & "Folders: " & CStr(gFoldersScanned) & _
+                   vbCrLf & "Elapsed seconds: " & Format$(tick - gClockStart, "0.0") & _
+                   vbCrLf & "Run: " & gRunDir & vbCrLf & _
+                   "Cancel: run MB_01_RunBackup again or create STOP.txt in the output root."
+        Debug.Print Replace(progress, vbCrLf, " | ")
+        ' Progress is optional; an unavailable progress file must not hide backup errors.
+        On Error Resume Next
+        Set ts = gFSO.CreateTextFile(MB_StatePath("progress.txt"), True, True)
+        If Not ts Is Nothing Then ts.Write progress: ts.Close
+        Set ts = Nothing
+        Err.Clear
+        On Error GoTo 0
+    End If
+    MB_ContinueWork = Not (gCancel Or gFatal)
+End Function
+
+Private Function MB_Status() As String
+    If gFatal Then
+        MB_Status = "FAILED"
+    ElseIf gCancel Then
+        MB_Status = "CANCELLED"
+    ElseIf gMailFailed > 0 Or gMailChanged > 0 Or gMailPending > 0 Or gMailReview > 0 Or gContentReview > 0 Or _
+           gAttFailed > 0 Or gAttPending > 0 Or gFolderFailures > 0 Or _
+           gScanChanged > 0 Or gJournalIssues > 0 Or gAutoReviewCount > 0 Or gAutoFailureCount > 0 Or _
+           MBA_HasReview() Or MBW_HasAuditReview() Or gStageReview > 0 Or gStageHeld > 0 Or MBR_HasReview() Then
+        MB_Status = "PARTIAL"
+    ElseIf gMode = "REGISTER_LEGACY" Then
+        MB_Status = "LEGACY REGISTRATION FINISHED (NOT A FULL BACKUP)"
+    ElseIf gMode = "BENCHMARK" Then
+        MB_Status = "BENCHMARK SAMPLE COMPLETE"
+    Else
+        MB_Status = "COMPLETE FOR DECLARED SCOPE"
+    End If
+End Function
+
+Private Function MB_Summary() As String
+    Dim s As String, label As String, total As Double, mean As Double, rangeText As String
+    Dim a() As Double, i As Long, j As Long, x As Double, idx95 As Long
+    If MBX_IsFileMode(gMode) Then MB_Summary = MBX_FileSummary(): Exit Function
+    label = "Messages"
+    If gMode = "VERIFY" Then label = "Indexed files"
+    If gSince = 0 Then
+        rangeText = "ALL gathered items (collection starts " & MB_Stamp(gUntil) & ")"
+    Else
+        rangeText = MB_Stamp(gSince) & " through " & MB_Stamp(gUntil)
+        If gModifiedWindow Then rangeText = "LastModificationTime: " & rangeText
+    End If
+    s = MB_Status() & vbCrLf & "Version: " & MB_VERSION & "; mode: " & gMode & vbCrLf & _
+        "Current organization review records: " & CStr(gAutoReviewCount) & " (re-evaluated this run)" & vbCrLf & _
+        "Scope: " & gScope & vbCrLf & _
+        "Selected folder: " & gSelectedBase & vbCrLf & _
+        "State/log root: " & gStateRoot & vbCrLf & _
+        "Output layout: remembered account folder\yyyy\mm (SentOn-first)" & vbCrLf & _
+        "Old archive: " & gLegacyRoot & vbCrLf & _
+        "Range: " & rangeText & vbCrLf & _
+        label & " planned: " & CStr(gPlanned) & "; processed: " & CStr(gProcessed) & vbCrLf & _
+        "New: " & CStr(gMailNew) & "; verified existing: " & CStr(gMailReused) & _
+        "; failed: " & CStr(gMailFailed) & vbCrLf & _
+        "Old MSG reused in place (subset of existing): " & CStr(gMailLegacy) & vbCrLf & _
+        "Review required (no SaveAs): " & CStr(gMailReview) & _
+        "; registration unmatched (no SaveAs): " & CStr(gLegacyUnmatched) & vbCrLf & _
+        "Source changed: " & CStr(gMailChanged) & "; policy skip: " & CStr(gMailPolicy) & _
+        "; pending: " & CStr(gMailPending) & vbCrLf & _
+        "Attachments: new " & CStr(gAttNew) & "; existing " & CStr(gAttReused) & _
+        "; excluded " & CStr(gAttExcluded) & "; failed " & CStr(gAttFailed) & _
+        "; pending " & CStr(gAttPending) & vbCrLf
+    s = s & "MSGs with limited attachment/custom-metadata validation: " & CStr(gContentReview) & vbCrLf
+    s = s & "Separate extraction: " & CStr(MB_EXTRACT_ATTACHMENTS) & vbCrLf & _
+        "Existing SHA-256 recheck: " & CStr(MB_VERIFY_EXISTING_HASH) & _
+        "; reopen new MSG: " & CStr(MB_REOPEN_NEW_MSG) & vbCrLf & _
+        "Scanned folders: " & CStr(gFoldersScanned) & "; candidate mail: " & CStr(gCandidates) & _
+        "; scan policy exclusions: " & CStr(gPolicySkipped) & vbCrLf & _
+        "Folders failed: " & CStr(gFolderFailures) & "; scan issues: " & CStr(gScanChanged) & _
+        "; invalid index rows: " & CStr(gJournalIssues) & vbCrLf & _
+        "Index / scan / export seconds: " & Format$(gIndexSeconds, "0.0") & " / " & _
+        Format$(gScanSeconds, "0.0") & " / " & Format$(gExportSeconds, "0.0") & vbCrLf & _
+        "New output MiB: " & Format$(gBytesNew / 1048576#, "0.0") & vbCrLf & _
+        "Old MSG files found: " & CStr(gLegacyFileCount) & "; unresolved filename/SentOn lookup: " & _
+        CStr(gLegacyUnrecognizedNames) & "; scan seconds: " & Format$(gLegacySeconds, "0.0") & vbCrLf & _
+        "Old archive newest file write (conservative guard, not coverage proof): " & _
+        MB_Stamp(gLegacyNewestFileTime)
+    If gMode = "BENCHMARK" And gSampleCount > 0 Then
+        ReDim a(1 To gSampleCount)
+        For i = 1 To gSampleCount
+            a(i) = gSampleSeconds(i): total = total + a(i)
+        Next i
+        For i = 2 To gSampleCount
+            x = a(i): j = i - 1
+            Do While j >= 1
+                If a(j) <= x Then Exit Do
+                a(j + 1) = a(j): j = j - 1
+            Loop
+            a(j + 1) = x
+        Next i
+        mean = total / CDbl(gSampleCount)
+        idx95 = CLng(Int(CDbl(gSampleCount) * 0.95))
+        If idx95 < 1 Then idx95 = 1
+        s = s & vbCrLf & "Sample NEW successes: " & CStr(gSampleCount) & _
+            " from " & CStr(gFullPlanned) & " eligible messages." & vbCrLf & _
+            "Seconds/new: mean=" & Format$(mean, "0.000") & _
+            "; p50=" & Format$(a((gSampleCount + 1) \ 2), "0.000") & _
+            "; p95~=" & Format$(a(idx95), "0.000") & vbCrLf & _
+            "100,000 NEW estimate, hours: " & _
+            Format$((gIndexSeconds + gScanSeconds + mean * 100000#) / 3600#, "0.00") & vbCrLf & _
+            "Planning band (0.5x-2x variable cost), hours: " & _
+            Format$((gIndexSeconds + gScanSeconds + mean * 50000#) / 3600#, "0.00") & " - " & _
+            Format$((gIndexSeconds + gScanSeconds + mean * 200000#) / 3600#, "0.00") & vbCrLf & _
+            "Planning band is not a statistical confidence interval. Check sample failures."
+    End If
+    s = s & vbCrLf & "Lexical path cache hits/misses (max 512 entries): " & _
+        Format$(MBH_PathCacheHits, "0") & "/" & Format$(MBH_PathCacheMisses, "0")
+    s = s & vbCrLf & "Content-verified restored/moved identity aliases (no SaveAs): " & CStr(gIdentityAliases)
+    s = s & vbCrLf & "Verified identity-header reads/cache hits: " & CStr(gIdentityHeaderReads) & "/" & CStr(gIdentityHeaderHits)
+    s = s & MBV_Summary() & MBF_Summary(gMode)
+    s = s & MBW_Summary()
+    s = s & MBA_Summary() & MBR_Summary() & MBS_Summary()
+    If Len(gAutoSetupPhase) > 0 Then
+        s = s & vbCrLf & "Automatic setup phase: " & gAutoSetupPhase & vbCrLf & _
+            "Initial setup note: " & gAutoSetupNote & vbCrLf & _
+            "Initial organization/resume seconds: " & Format$(gAutoSetupSeconds, "0.0")
+        If Len(gAutoRegistrationSummary) > 0 Then s = s & vbCrLf & gAutoRegistrationSummary
+    End If
+    If Len(gAutoTestReport) > 0 Then s = s & vbCrLf & "Native environment test report: " & gAutoTestReport
+    If gFatal Then s = s & vbCrLf & "FATAL: " & gFatalText
+    If Len(gRunDir) > 0 Then s = s & vbCrLf & "Logs: " & gRunDir
+    MB_Summary = s
+End Function
+
+Private Sub MB_WriteSummary(ByVal summary As String)
+    Dim ts As Object
+    Set ts = gFSO.CreateTextFile(MBH_JoinPath(gRunDir, "summary.txt"), True, True)
+    ts.Write summary & vbCrLf
+    ts.Close
+End Sub
+
+Private Sub MB_CloseResources()
+    On Error Resume Next
+    Err.Clear
+    If Not gJournal Is Nothing Then gJournal.Close
+    If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Journal close: " & Err.Description
+    Set gJournal = Nothing
+    Err.Clear
+    If Not gEvents Is Nothing Then gEvents.Close
+    If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Event log close: " & Err.Description
+    Set gEvents = Nothing
+    On Error GoTo 0
+End Sub
+
+' =========================== On-PC self tests ================================
+Public Sub MB_SelfTest()
+    Dim detail As String, ok As Boolean
+    If gBusy Then Exit Sub
+    gBusy = True
+    ok = MBT_HelperSelfTest(detail)
+    gBusy = False
+    MsgBox detail, IIf(ok, vbInformation, vbExclamation), "Mail Backup helper test"
+End Sub
+
+Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
+    Dim s As String, fields As Variant, payload As String, line As String
+    Dim a As String, b As String, message As String, fso As Object, testDir As String
+    Dim finalPath As String, stagePath As String, ts As Object, rejected As Boolean
+    Dim errNo As Long, errText As String, ownsTestDir As Boolean, clockStart As Double
+    On Error GoTo Failed
+    clockStart = MB_Clock()
+    If Not MBH_HashSelfTest() Then Err.Raise MB_ERR + 60, , "SHA-256 known-answer test failed."
+    If Not MBN_SelfTest() Then Err.Raise MB_ERR + 71, , "Searchable filename contract test failed."
+    If MBH_SafeComponent("CON.txt") = "CON.txt" Then Err.Raise MB_ERR + 61, , "Reserved-name test failed."
+    If MBH_SafeComponent("A:B") <> MBH_SafeComponent("A?B") Then Err.Raise MB_ERR + 62, , "Sanitizer test failed."
+    a = MB_SourceKey("store", "mailA")
+    b = MB_SourceKey("store", "mailB")
+    If a = b Then Err.Raise MB_ERR + 63, , "Source-key separation failed."
+    s = "=x" & vbTab & "%09" & vbCrLf & ChrW(&HD55C) & ChrW(&HD83D) & ChrW(&HDE00)
+    payload = MB_EncodeFields(Array("TEST", s))
+    line = payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+    fields = MB_ReadCheckedLine(line, 2)
+    If fields(1) <> s Then Err.Raise MB_ERR + 64, , "Unicode TSV round-trip failed."
+    rejected = MB_TestRejectRecord(Left$(line, Len(line) - 1))
+    If Not rejected Then Err.Raise MB_ERR + 65, , "Truncated record was accepted."
+    If DateAdd("m", -1, DateSerial(2024, 3, 31)) <> DateSerial(2024, 2, 29) Then
+        Err.Raise MB_ERR + 66, , "Calendar-month boundary test failed."
+    End If
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    testDir = MBH_JoinPath(fso.GetSpecialFolder(2).Path, "MBTest_" & fso.GetTempName)
+    ' Claim a NEW directory; never clean up an existing directory on collision.
+    fso.CreateFolder testDir
+    ownsTestDir = True
+    finalPath = MBH_JoinPath(testDir, "test.txt")
+    stagePath = MBH_NewStagePath(finalPath)
+    Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
+    ts.Write "first": ts.Close
+    MBH_CommitStage stagePath, finalPath
+    stagePath = MBH_NewStagePath(finalPath)
+    Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
+    ts.Write "second": ts.Close
+    On Error Resume Next
+    Err.Clear
+    MBH_CommitStage stagePath, finalPath
+    rejected = (Err.Number <> 0)
+    Err.Clear
+    On Error GoTo Failed
+    If Not rejected Then Err.Raise MB_ERR + 67, , "Existing final file was overwritten."
+    Set ts = fso.OpenTextFile(finalPath, 1, False, 0)
+    s = ts.ReadAll: ts.Close
+    If s <> "first" Then Err.Raise MB_ERR + 68, , "Existing bytes were changed."
+    MBH_DeleteStage stagePath: stagePath = ""
+    fso.DeleteFolder testDir, True: testDir = "": ownsTestDir = False
+    If MB_Clock() < clockStart Then Err.Raise MB_ERR + 73, , "Performance counter moved backwards."
+    MBH_ReleaseCrypto
+    detail = "PASS: hashes, Unicode, names, keys, journal, calendar month, no-overwrite."
+    MBT_HelperSelfTest = True
+    Exit Function
+Failed:
+    errNo = Err.Number: errText = Err.Description
+    On Error Resume Next
+    If Not ts Is Nothing Then ts.Close
+    If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
+    If ownsTestDir Then fso.DeleteFolder testDir, True
+    MBH_ReleaseCrypto
+    On Error GoTo 0
+    detail = "FAIL: " & CStr(errNo) & " - " & errText
+End Function
+
+Private Function MB_TestRejectRecord(ByVal line As String) As Boolean
+    Dim value As Variant
+    On Error GoTo Expected
+    value = MB_ReadCheckedLine(line, 2)
+    Exit Function
+Expected:
+    MB_TestRejectRecord = True
+End Function

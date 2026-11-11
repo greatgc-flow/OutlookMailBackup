@@ -1,0 +1,328 @@
+' ===================== Restored / moved message identity ====================
+Private Sub MBI_Reset()
+    MBV_Reset
+    Set gIdentityBuckets = Nothing: Set gIdentitySeen = Nothing: Set gIdentityHeaders = Nothing
+    gIdentityAliases = 0: gIdentityHeaderReads = 0: gIdentityHeaderHits = 0
+End Sub
+
+Private Function MBI_SubjectKey(ByVal storeId As String, ByVal subject As String) As String
+    MBI_SubjectKey = MBX_StoreToken(storeId) & "|" & MBH_HashText("MBI1|" & subject)
+End Function
+
+Private Sub MBI_CacheRecord(ByVal f As Variant)
+    Dim kind As String, bucket As String, unique As String, key As String, candidates As Collection
+    kind = CStr(f(1))
+    If kind <> "M" And kind <> "N" And kind <> "L" And kind <> "R" Then Exit Sub
+    If gIdentityBuckets Is Nothing Then
+        Set gIdentityBuckets = CreateObject("Scripting.Dictionary")
+        Set gIdentitySeen = CreateObject("Scripting.Dictionary")
+    End If
+    bucket = MBI_SubjectKey(CStr(f(7)), CStr(f(12)))
+    key = MBX_IndexKey(kind, CStr(f(2)))
+    ' Keep distinct reference keys even when they share a file: a later journal
+    ' row may replace one key. Runtime path+hash dedup avoids comparing shared
+    ' bytes repeatedly and also covers verified move redirects.
+    unique = bucket & "|" & key
+    If gIdentitySeen.Exists(unique) Then Exit Sub
+    If Not gIdentityBuckets.Exists(bucket) Then
+        Set candidates = New Collection
+        gIdentityBuckets.Add bucket, candidates
+    Else
+        Set candidates = gIdentityBuckets(bucket)
+    End If
+    candidates.Add key
+    gIdentitySeen.Add unique, True
+End Sub
+
+Private Function MBI_ReadHeader(ByVal key As String, ByRef hint As Variant, ByRef reason As String) As Long
+    Dim f As Variant, path As String, root As String, unique As String, disk As Object
+    Dim obj As Object, copy As Outlook.MailItem, beforeDate As Date, bytes As Double
+    Dim messageId As String, present As Boolean, sentStamp As String, n As Long, detail As String
+    On Error GoTo Failed
+    f = MB_IndexFields(key): path = MBX_IndexedPath(key, f)
+    unique = MB_LegacyOwnerKey(path, CStr(f(2)))
+    If gIdentityHeaders Is Nothing Then Set gIdentityHeaders = CreateObject("Scripting.Dictionary")
+    If gIdentityHeaders.Exists(unique) Then
+        gIdentityHeaderHits = gIdentityHeaderHits + 1
+        hint = gIdentityHeaders(unique): MBI_ReadHeader = 1: Exit Function
+    End If
+    If Not MB_ContinueWork() Then MBI_ReadHeader = 3: Exit Function
+    gIdentityHeaderReads = gIdentityHeaderReads + 1
+    root = MBM_ResolvedRoot(MBX_IndexedOriginal(key, f), CStr(f(2)), MBX_IndexedRoot(key))
+    path = MBL_CanonicalLegacyPath(path, root, True)
+    Set disk = gFSO.GetFile(path)
+    bytes = CDbl(disk.Size): beforeDate = disk.DateLastModified
+    If bytes <= 0 Or bytes <> MB_ByteCount(CStr(f(1))) Then _
+        Err.Raise MB_ERR + 738, , "Identity header candidate size changed."
+    If MBH_HashFile(path) <> CStr(f(2)) Then _
+        Err.Raise MB_ERR + 739, , "Identity header candidate SHA-256 changed."
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 730, , "Identity candidate is not MailItem."
+    Set copy = obj
+    messageId = MBL_InternetId(copy, present): sentStamp = MB_Stamp(copy.SentOn)
+    copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    If MBH_HashFile(path) <> CStr(f(2)) Then Err.Raise MB_ERR + 740, , "Identity header candidate changed while read."
+    Set disk = gFSO.GetFile(path)
+    If CDbl(disk.Size) <> bytes Or disk.DateLastModified <> beforeDate Then _
+        Err.Raise MB_ERR + 741, , "Identity header candidate size/time changed while read."
+    hint = Array(messageId, sentStamp, present)
+    gIdentityHeaders.Add unique, hint
+    MBI_ReadHeader = 1
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not copy Is Nothing Then copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    If gFatal Then Err.Raise n, "MBI_ReadHeader", detail
+    reason = "Cannot verify identity candidate headers: " & detail
+    If gCancel Then MBI_ReadHeader = 3 Else MBI_ReadHeader = 2
+End Function
+
+Private Function MBI_TimestampDifference(ByVal mail As Outlook.MailItem, ByVal path As String, _
+                                        ByRef reason As String) As Long
+    Dim obj As Object, copy As Outlook.MailItem, sourceId As String, copyId As String
+    Dim sourceHas As Boolean, copyHas As Boolean, result As Long, n As Long, detail As String
+    On Error GoTo Failed
+    result = 2
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 730, , "Identity candidate is not MailItem."
+    Set copy = obj
+    sourceId = MBL_InternetId(mail, sourceHas): copyId = MBL_InternetId(copy, copyHas)
+    If sourceHas And copyHas And Len(sourceId) > 0 And Len(copyId) > 0 Then
+        If StrComp(sourceId, copyId, vbBinaryCompare) <> 0 Then
+            result = 0
+        Else
+            reason = "Same Message-ID but different message times; provider/import rewriting requires review."
+        End If
+    ElseIf Not sourceHas And Not copyHas Then
+        If MB_Stamp(mail.SentOn) <> MB_Stamp(copy.SentOn) Then
+            result = 0
+        Else
+            reason = "No Message-ID and the same sent time but different received time; restored identity is uncertain."
+        End If
+    Else
+        reason = "Message-ID presence changed with message times; restored identity is uncertain."
+    End If
+    copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    MBI_TimestampDifference = result
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not copy Is Nothing Then copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    If gFatal Then Err.Raise n, "MBI_TimestampDifference", detail
+    reason = "Cannot establish candidate time/ID relationship: " & detail
+    MBI_TimestampDifference = 2
+End Function
+
+Private Function MBI_CompareContents(ByVal mail As Outlook.MailItem, ByVal path As String, _
+                                     ByRef reason As String) As Long
+    ' 0=explicitly different; 1=equal under the declared comparator;
+    ' 2=unknown/unsupported; 3=cancel. Message-ID alone never produces 1.
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    MBL_CompareExisting mail, path
+    MBI_CompareContents = 1
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    If gFatal Then Err.Raise n, "MBI_CompareContents", detail
+    reason = detail
+    If gCancel Then MBI_CompareContents = 3: Exit Function
+    If n = MB_ERR + 161 Then
+        MBI_CompareContents = MBI_TimestampDifference(mail, path, reason)
+    Else
+        Select Case n - MB_ERR
+            Case 158 To 160, 162 To 172, 176, 181, 182, 1120 To 1122
+                MBI_CompareContents = 0
+            Case Else
+                MBI_CompareContents = 2
+        End Select
+    End If
+End Function
+
+Private Function MBI_CheckCandidate(ByVal mail As Outlook.MailItem, ByVal key As String, _
+                                    ByRef path As String, ByRef root As String, _
+                                    ByRef digest As String, ByRef bytes As Double, _
+                                    ByRef reason As String) As Long
+    Dim f As Variant, disk As Object, beforeDate As Date, result As Long, n As Long, detail As String
+    On Error GoTo Failed
+    f = MB_IndexFields(key)
+    root = MBM_ResolvedRoot(MBX_IndexedOriginal(key, f), CStr(f(2)), MBX_IndexedRoot(key))
+    path = MBX_IndexedPath(key, f, True)
+    path = MBL_CanonicalLegacyPath(path, root, True)
+    Set disk = gFSO.GetFile(path)
+    bytes = CDbl(disk.Size): beforeDate = disk.DateLastModified
+    If bytes <= 0 Or bytes <> MB_ByteCount(CStr(f(1))) Then _
+        Err.Raise MB_ERR + 731, , "Indexed identity candidate size changed."
+    digest = MBH_HashFile(path)
+    If digest <> CStr(f(2)) Then Err.Raise MB_ERR + 732, , "Indexed identity candidate SHA-256 changed."
+    result = MBI_CompareContents(mail, path, reason)
+    If result = 3 Then MBI_CheckCandidate = 3: Exit Function
+    ' Even an explicit content mismatch is trusted only while the indexed file
+    ' still has its original bytes. This prevents a race from authorizing SaveAs.
+    If MBH_HashFile(path) <> digest Then Err.Raise MB_ERR + 733, , "Identity candidate changed while compared."
+    Set disk = gFSO.GetFile(path)
+    If CDbl(disk.Size) <> bytes Or disk.DateLastModified <> beforeDate Then _
+        Err.Raise MB_ERR + 734, , "Identity candidate size/time changed while compared."
+    MBI_CheckCandidate = result
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    If gFatal Then Err.Raise n, "MBI_CheckCandidate", detail
+    reason = "Indexed identity candidate needs review: " & detail
+    If gCancel Then MBI_CheckCandidate = 3 Else MBI_CheckCandidate = 2
+End Function
+
+Private Function MBI_TryAlias(ByVal mail As Outlook.MailItem, ByVal q As Variant, _
+                              ByVal revision As String, ByRef reason As String) As Long
+    ' 0=no equal candidate (ordinary legacy/new-export policy still applies);
+    ' 1=verified R alias, no mail SaveAs; 2=review, no SaveAs; 3=cancel.
+    Dim bucket As String, candidates As Collection, key As Variant, meta As Variant, fields As Variant
+    Dim seen As Object, unique As String, pass As Long, checked As Long, result As Long
+    Dim path As String, root As String, digest As String, bytes As Double, candidateReason As String
+    Dim matchedPath As String, matchedRoot As String, matchedHash As String, matchedKey As String
+    Dim matchedBytes As Double, uncertain As String, conflict As Boolean, n As Long, detail As String
+    Dim hint As Variant, sourceId As String, sourceHas As Boolean, sourceSent As String, plausible As Boolean
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    reason = ""
+    If gIdentityBuckets Is Nothing Then Exit Function
+    bucket = MBI_SubjectKey(CStr(q(1)), mail.Subject)
+    If Not gIdentityBuckets.Exists(bucket) Then Exit Function
+    sourceId = MBL_InternetId(mail, sourceHas): sourceSent = MB_Stamp(mail.SentOn)
+    Set candidates = gIdentityBuckets(bucket)
+    Set seen = CreateObject("Scripting.Dictionary"): seen.CompareMode = vbTextCompare
+    For pass = 1 To 2
+        ' Timestamp is a cheap ordering hint only. The fallback also handles
+        ' timezone changes and old journals whose displayed local stamp differs.
+        For Each key In candidates
+            If Not MB_ContinueWork() Then MBI_TryAlias = 3: Exit Function
+            If gIndex.Exists(CStr(key)) Then
+                meta = MBX_Meta(CStr(key))
+                If CStr(meta(0)) <> MBX_StoreToken(CStr(q(1))) Then _
+                    Err.Raise MB_ERR + 735, , "Identity candidate belongs to another store."
+                If (CStr(meta(1)) = CStr(q(6))) = (pass = 1) Then
+                    fields = MB_IndexFields(CStr(key))
+                    path = MBX_IndexedPath(CStr(key), fields)
+                    unique = MB_LegacyOwnerKey(path, CStr(fields(2)))
+                    If Not seen.Exists(unique) Then
+                        seen.Add unique, True
+                        ' Header inventory has no silent cap. Each indexed path
+                        ' + hash is read once per run; repeated daily subjects
+                        ' with different IDs do not consume the deep-check cap.
+                        result = MBI_ReadHeader(CStr(key), hint, candidateReason)
+                        If result = 3 Then MBI_TryAlias = 3: Exit Function
+                        If result = 2 Then
+                            If Len(uncertain) = 0 Then uncertain = candidateReason
+                        Else
+                            plausible = True
+                            If sourceHas And CBool(hint(2)) And Len(sourceId) > 0 And Len(CStr(hint(0))) > 0 Then
+                                plausible = (StrComp(sourceId, CStr(hint(0)), vbBinaryCompare) = 0)
+                            ElseIf Not sourceHas And Not CBool(hint(2)) Then
+                                plausible = (sourceSent = CStr(hint(1)))
+                            End If
+                            If plausible Then
+                                If checked >= MBI_MAX_CANDIDATES Then
+                                    reason = "Plausible identity candidate limit reached; unvisited candidates remain, so automatic export is blocked."
+                                    MBI_TryAlias = 2: Exit Function
+                                End If
+                                checked = checked + 1
+                                result = MBI_CheckCandidate(mail, CStr(key), path, root, digest, bytes, candidateReason)
+                                If result = 3 Then MBI_TryAlias = 3: Exit Function
+                                If result = 2 Then
+                                    If Len(uncertain) = 0 Then uncertain = candidateReason
+                                ElseIf result = 1 Then
+                                    If Len(matchedPath) = 0 Then
+                                        matchedPath = path: matchedRoot = root: matchedHash = digest
+                                        matchedBytes = bytes: matchedKey = CStr(key)
+                                    ElseIf matchedHash <> digest Or matchedBytes <> bytes Then
+                                        conflict = True
+                                    ElseIf StrComp(path, matchedPath, vbTextCompare) < 0 Then
+                                        matchedPath = path: matchedRoot = root: matchedKey = CStr(key)
+                                    End If
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        Next key
+        If conflict Then
+            reason = "Multiple content-equal MSG candidates have different file bytes; preserve all and review."
+            MBI_TryAlias = 2: Exit Function
+        End If
+        If Len(matchedPath) > 0 Then
+            ' A full exact-date match proves this alias; other-date candidates
+            ' need not be searched. Unknown candidates never become aliases.
+            ' Other candidates may have taken a long time or yielded to Outlook.
+            ' Recheck the selected reference, bytes AND content before commit.
+            ' Deny write/delete on that selected file throughout the final
+            ' comparator, source check and index writer invocation.
+            guard = MBH_GuardFile(matchedPath)
+            result = MBI_CheckCandidate(mail, matchedKey, path, root, digest, bytes, candidateReason)
+            If result = 3 Then MBI_TryAlias = 3: GoTo AliasReturn
+            If result <> 1 Then
+                reason = "Chosen identity candidate no longer verifies: " & candidateReason
+                MBI_TryAlias = 2: GoTo AliasReturn
+            End If
+            If StrComp(path, matchedPath, vbTextCompare) <> 0 Or _
+               StrComp(root, matchedRoot, vbTextCompare) <> 0 Or _
+               digest <> matchedHash Or bytes <> matchedBytes Then
+                reason = "Chosen identity reference changed before its alias could be committed."
+                MBI_TryAlias = 2: GoTo AliasReturn
+            End If
+            If Not MB_SourceStable(mail, q, revision) Then
+                reason = "The source changed during restored-identity verification."
+                MBI_TryAlias = 2: GoTo AliasReturn
+            End If
+            MB_RecordCommit "R", revision, matchedPath, matchedBytes, matchedHash, q, mail.Subject, _
+                            0, matchedKey, MB_NEW_CONTENT_VALIDATION, matchedRoot
+            MBH_CloseGuard guard
+            gIdentityAliases = gIdentityAliases + 1
+            MB_LogEvent "INFO", "IDENTITY_ALIAS_NO_SAVEAS", q(7), matchedPath, 0, _
+                        "Current source content matched existing indexed bytes; reference=" & matchedKey
+            MBI_TryAlias = 1: Exit Function
+        End If
+    Next pass
+    If Len(uncertain) > 0 Then reason = uncertain: MBI_TryAlias = 2
+AliasReturn:
+    MBH_CloseGuard guard
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    If gFatal Then Err.Raise n, "MBI_TryAlias", detail
+    reason = "Restored-identity lookup failed: " & detail
+    If gCancel Then MBI_TryAlias = 3 Else MBI_TryAlias = 2
+End Function
+
+Private Function MBI_SyntheticComparatorTest(ByVal mail As Outlook.MailItem, ByVal path As String, _
+                                            ByRef detail As String) As Boolean
+    ' The caller owns this unsent test item and closes it with olDiscard.
+    ' This checks the production comparator, not actual mailbox restore behavior.
+    Dim reason As String, result As Long
+    On Error GoTo Failed
+    result = MBI_CompareContents(mail, path, reason)
+    If result <> 1 Then Err.Raise MB_ERR + 736, , "Equal synthetic MSG was not accepted: " & reason
+    mail.Body = mail.Body & vbCrLf & "Owned synthetic identity difference."
+    result = MBI_CompareContents(mail, path, reason)
+    If result <> 0 Then Err.Raise MB_ERR + 737, , "Different synthetic body was not rejected: " & reason
+    detail = "PASS: same bounded content accepted; changed synthetic body rejected without alias."
+    MBI_SyntheticComparatorTest = True
+    Exit Function
+Failed:
+    detail = "FAIL: " & CStr(Err.Number) & " - " & Err.Description
+End Function

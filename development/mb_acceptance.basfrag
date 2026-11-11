@@ -1,0 +1,306 @@
+' ======================= Native acceptance report ===========================
+' Called by the single public command, once per VBA session after a successful
+' result. Uses only newly owned local test files and unsent, undisplayed messages.
+' No MailItem.Save, Send, real archive migration or original-mail reads occur.
+Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detail As String) As Boolean
+    Dim fso As Object, stream As Object, base As String, runFolder As String
+    Dim testDetail As String, envOK As Boolean, helperOK As Boolean, moveOK As Boolean
+    Dim plainOK As Boolean, htmlOK As Boolean, propertyOK As Boolean, localeOK As Boolean
+    Dim recoveryOK As Boolean
+    Dim started As Double, failures As Long, savedCalendar As Long, calendarEntered As Boolean
+    Dim n As Long, errorText As String, ownsBusy As Boolean
+    reportPath = "": detail = ""
+    If gBusy Then
+        detail = "A backup or native test is already running."
+        Exit Function
+    End If
+    On Error GoTo Failed
+    gBusy = True: ownsBusy = True
+    MBC_EnterGregorian savedCalendar, calendarEntered
+    MB_Reset
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    base = Environ$("LOCALAPPDATA")
+    If Len(base) = 0 Then Err.Raise MB_ERR + 700, , "LOCALAPPDATA is unavailable for the native test report."
+    base = MBH_JoinPath(MBH_NormalizePath(base), "OutlookMailBackupValidation")
+    MBH_EnsureDirectory base
+    runFolder = MBH_JoinPath(base, MBC_FileStamp(Now) & "_" & fso.GetTempName)
+    ' CreateFolder must claim a new directory. Never reuse/delete a prior report.
+    fso.CreateFolder runFolder
+    reportPath = MBH_JoinPath(runFolder, "acceptance.tsv")
+    Set stream = fso.CreateTextFile(reportPath, False, True)
+    stream.WriteLine "schema" & vbTab & "module_version" & vbTab & "local_time" & vbTab & _
+                     "check" & vbTab & "status" & vbTab & "seconds" & vbTab & "detail"
+    stream.Close: Set stream = Nothing
+
+    started = Timer
+    envOK = MBT_Environment(testDetail)
+    MBT_ReportRow reportPath, "OUTLOOK_ENVIRONMENT", MBT_PassFail(envOK), MBT_Elapsed(started), testDetail
+    If Not envOK Then failures = failures + 1
+
+    started = Timer
+    helperOK = MBT_HelperSelfTest(testDetail)
+    If gCancel Then helperOK = False: testDetail = testDetail & " Cancellation requested."
+    MBT_ReportRow reportPath, "NATIVE_HELPERS", MBT_PassFail(helperOK), MBT_Elapsed(started), testDetail
+    If Not helperOK Then failures = failures + 1
+
+    If helperOK And Not gCancel Then
+        started = Timer
+        localeOK = MBC_LocaleSelfTest(testDetail)
+        MBT_ReportRow reportPath, "LOCALE_GREGORIAN_UTC", MBT_PassFail(localeOK), MBT_Elapsed(started), testDetail
+        If Not localeOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "LOCALE_GREGORIAN_UTC", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    If helperOK And Not gCancel Then
+        started = Timer
+        propertyOK = MBT_PropertySelfTest(testDetail)
+        MBT_ReportRow reportPath, "MAPI_PROPERTY_CONTRACT", MBT_PassFail(propertyOK), MBT_Elapsed(started), testDetail
+        If Not propertyOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "MAPI_PROPERTY_CONTRACT", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    If helperOK And propertyOK And Not gCancel Then
+        started = Timer
+        moveOK = MBT_YearMonthSelfTest(testDetail)
+        If gCancel Then moveOK = False: testDetail = testDetail & " Cancellation requested."
+        MBT_ReportRow reportPath, "NATIVE_YEAR_MONTH", MBT_PassFail(moveOK), MBT_Elapsed(started), testDetail
+        If Not moveOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "NATIVE_YEAR_MONTH", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    If helperOK And moveOK And Not gCancel Then
+        started = Timer
+        recoveryOK = MBS_NativeRecoverySelfTest(testDetail)
+        If gCancel Then recoveryOK = False: testDetail = testDetail & " Cancellation requested."
+        MBT_ReportRow reportPath, "NATIVE_METADATA_RECOVERY", MBT_PassFail(recoveryOK), MBT_Elapsed(started), testDetail
+        If Not recoveryOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "NATIVE_METADATA_RECOVERY", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    If envOK And helperOK And propertyOK And moveOK And recoveryOK And Not gCancel Then
+        started = Timer
+        plainOK = MBT_SyntheticMsgSelfTest(olFormatPlain, testDetail)
+        If gCancel Then plainOK = False: testDetail = testDetail & " Cancellation requested."
+        MBT_ReportRow reportPath, "SYNTHETIC_MSG_PLAIN", MBT_PassFail(plainOK), MBT_Elapsed(started), testDetail
+        If Not plainOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "SYNTHETIC_MSG_PLAIN", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+    If envOK And helperOK And propertyOK And moveOK And recoveryOK And plainOK And Not gCancel Then
+        started = Timer
+        htmlOK = MBT_SyntheticMsgSelfTest(olFormatHTML, testDetail)
+        If gCancel Then htmlOK = False: testDetail = testDetail & " Cancellation requested."
+        MBT_ReportRow reportPath, "SYNTHETIC_MSG_HTML", MBT_PassFail(htmlOK), MBT_Elapsed(started), testDetail
+        If Not htmlOK Then failures = failures + 1
+    Else
+        MBT_ReportRow reportPath, "SYNTHETIC_MSG_HTML", "NOT_RUN", 0, "Prerequisite failed or cancellation requested."
+    End If
+
+    ' These gates require the actual account/archive and must not be reported PASS
+    ' from a small synthetic test. Running a macro is not a full VBA project compile.
+    MBT_ReportRow reportPath, "FULL_VBA_PROJECT_COMPILE", "NOT_RUN", 0, "Debug > Compile is a separate manual gate."
+    MBT_ReportRow reportPath, "REAL_ARCHIVE_COMPATIBILITY", "NOT_RUN", 0, "No original mail or archive files were used by these tests."
+    MBT_ReportRow reportPath, "SPECIAL_ATTACHMENTS_AND_ALL_MAPI", "NOT_RUN", 0, "Synthetic tests cover ordinary by-value attachments only."
+    MBT_ReportRow reportPath, "100000_ITEM_PERFORMANCE", "NOT_RUN", 0, "No large real-account workload was executed."
+    MBT_RunAcceptanceReport = envOK And helperOK And localeOK And propertyOK And moveOK And recoveryOK And plainOK And htmlOK And Not gCancel
+    detail = "Built-in native checks: " & MBT_PassFail(MBT_RunAcceptanceReport) & _
+             "; failed checks=" & CStr(failures) & ". Four operational gates remain NOT_RUN."
+    MBT_ReportRow reportPath, "RUN_RESULT", MBT_PassFail(MBT_RunAcceptanceReport), 0, detail
+    MBC_LeaveGregorian savedCalendar, calendarEntered
+    gBusy = False
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If Len(reportPath) > 0 Then
+        MBT_ReportRow reportPath, "RUN_RESULT", "FAIL", 0, "Test runner error " & CStr(n) & ": " & errorText
+    End If
+    MBH_ReleaseCrypto
+    MBC_LeaveGregorian savedCalendar, calendarEntered
+    On Error GoTo 0
+    If ownsBusy Then gBusy = False
+    detail = "Native acceptance could not complete: " & CStr(n) & " - " & errorText
+    MBT_RunAcceptanceReport = False
+End Function
+
+Private Function MBT_PropertySelfTest(ByRef detail As String) As Boolean
+    On Error GoTo Failed
+    If Not MBL_PropertySelfTest() Then Err.Raise MB_ERR + 712, , "Optional MAPI property contract test failed."
+    If Not MBE_CategorySelfTest() Then Err.Raise MB_ERR + 1125, , "Category metadata contract test failed."
+    detail = "PASS: exact category sets, MAPI Error variants, Unicode/ANSI fallback, missing/access failure and Null/Empty/type handling."
+    MBT_PropertySelfTest = True
+    Exit Function
+Failed:
+    detail = "FAIL: " & CStr(Err.Number) & " - " & Err.Description
+End Function
+
+Private Function MBT_PassFail(ByVal passed As Boolean) As String
+    If passed Then MBT_PassFail = "PASS" Else MBT_PassFail = "FAIL"
+End Function
+
+Private Function MBT_Elapsed(ByVal started As Double) As Double
+    MBT_Elapsed = CDbl(Timer) - started
+    If MBT_Elapsed < 0 Then MBT_Elapsed = MBT_Elapsed + 86400#
+End Function
+
+Private Sub MBT_ReportRow(ByVal path As String, ByVal check As String, ByVal status As String, _
+                          ByVal seconds As Double, ByVal detail As String)
+    Dim fso As Object, stream As Object, n As Long, errorText As String
+    On Error GoTo Failed
+    If status <> "PASS" And status <> "FAIL" And status <> "NOT_RUN" Then
+        Err.Raise MB_ERR + 701, , "Unknown acceptance status."
+    End If
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    Set stream = fso.OpenTextFile(path, 8, False, -1)
+    stream.WriteLine MB_EncodeFields(Array(MBT_REPORT_SCHEMA, MB_VERSION, MB_Stamp(Now), check, status, _
+                      Trim$(Str$(seconds)), detail))
+    stream.Close
+    Exit Sub
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBT_ReportRow", errorText
+End Sub
+
+Private Function MBT_Environment(ByRef detail As String) As Boolean
+    Dim stores As Long, bitness As String
+    On Error GoTo Failed
+#If Win64 Then
+    bitness = "64"
+#Else
+    bitness = "32"
+#End If
+    stores = Application.Session.Stores.Count
+    If stores < 1 Then Err.Raise MB_ERR + 702, , "No Outlook store is mounted."
+    detail = "Outlook=" & Application.Version & "; VBA bits=" & bitness & _
+             "; mounted stores=" & CStr(stores) & "; local time=" & MB_Stamp(Now)
+    MBT_Environment = True
+    Exit Function
+Failed:
+    detail = "Environment error " & CStr(Err.Number) & ": " & Err.Description
+End Function
+
+Private Function MBT_SyntheticMsgSelfTest(ByVal bodyFormat As Long, ByRef detail As String) As Boolean
+    Dim testBase As String, payload As String, msgPath As String, copyPath As String
+    Dim stagePath As String, expectedSubject As String, unicodeText As String, expectedHash As String
+    Dim source As Outlook.MailItem, reopened As Outlook.MailItem, obj As Object, attachment As Outlook.Attachment
+    Dim stream As Object, owned As Boolean, complete As Boolean, n As Long, errorText As String, cleanup As String
+#If VBA7 Then
+    Dim readGuard As LongPtr
+#Else
+    Dim readGuard As Long
+#End If
+    On Error GoTo Failed
+    MB_Reset
+    gMode = "SELFTEST_MSG": gPhase = "Testing disposable Outlook MSG files"
+    gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
+    testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBMSG_" & gFSO.GetTempName)
+    gFSO.CreateFolder testBase: owned = True
+    gRoot = testBase: gBaseRoot = testBase: gRunDir = testBase
+    gRunId = "synthetic_msg"
+    payload = MBH_JoinPath(testBase, "payload.txt")
+    unicodeText = ChrW(&HD55C) & ChrW(&HAE00) & ChrW(&HD83D) & ChrW(&HDE00)
+    expectedSubject = "Mail Backup synthetic test " & unicodeText
+    Set stream = gFSO.CreateTextFile(payload, False, True)
+    stream.Write "Owned synthetic attachment" & vbCrLf & unicodeText & vbTab & "1234567890"
+    stream.Close: Set stream = Nothing
+    expectedHash = MBH_HashFile(payload)
+    Set source = Application.CreateItem(olMailItem)
+    source.Subject = expectedSubject
+    source.BodyFormat = bodyFormat
+    If bodyFormat = olFormatHTML Then
+        source.HTMLBody = "<html><body><p>Synthetic HTML " & unicodeText & "</p></body></html>"
+    Else
+        source.Body = "Synthetic plain text " & unicodeText & vbCrLf & "Second line."
+    End If
+    Set attachment = source.Attachments.Add(payload, olByValue)
+    Set attachment = Nothing
+    msgPath = MBH_JoinPath(testBase, "original.msg")
+    stagePath = MBH_NewStagePath(msgPath)
+    source.SaveAs stagePath, olMSGUnicode
+    MBH_CommitStage stagePath, msgPath: stagePath = ""
+    source.Close olDiscard: Set source = Nothing
+    If gCancel Then Err.Raise MB_ERR + 703, , "Synthetic test cancelled."
+
+    ' Attachment.Type on an unsaved item can report olOLE. Reopen the owned MSG
+    ' before validating types or invoking the production content comparator.
+    Set obj = Application.Session.OpenSharedItem(msgPath)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 704, , "Synthetic MSG did not reopen as MailItem."
+    Set reopened = obj: Set obj = Nothing
+    If reopened.Sent Or reopened.Subject <> expectedSubject Or reopened.BodyFormat <> bodyFormat Then
+        Err.Raise MB_ERR + 705, , "Synthetic subject/sent-state/body-format did not survive SaveAs."
+    End If
+    If InStr(1, reopened.Body, unicodeText, vbBinaryCompare) = 0 Then
+        Err.Raise MB_ERR + 706, , "Synthetic Unicode body did not survive SaveAs."
+    End If
+    If reopened.Attachments.Count <> 1 Then Err.Raise MB_ERR + 707, , "Synthetic attachment count changed."
+    Set attachment = reopened.Attachments.Item(1)
+    If attachment.Type <> olByValue Or attachment.FileName <> "payload.txt" Then
+        Err.Raise MB_ERR + 708, , "Synthetic ordinary attachment metadata changed."
+    End If
+    If MBL_AttachmentHash(attachment) <> expectedHash Then
+        Err.Raise MB_ERR + 709, , "Synthetic attachment bytes changed."
+    End If
+    Set attachment = Nothing
+    copyPath = MBH_JoinPath(testBase, "roundtrip.msg")
+    stagePath = MBH_NewStagePath(copyPath)
+    reopened.SaveAs stagePath, olMSGUnicode
+    MBH_CommitStage stagePath, copyPath: stagePath = ""
+    readGuard = MBH_GuardFile(copyPath)
+    MB_CompareMsg reopened, copyPath, complete
+    MBH_CloseGuard readGuard
+    If Not complete Then Err.Raise MB_ERR + 710, , "Ordinary synthetic message did not receive full bounded content validation."
+    If Not MBI_SyntheticComparatorTest(reopened, copyPath, detail) Then _
+        Err.Raise MB_ERR + 713, , "Synthetic restored-identity comparison failed: " & detail
+    If Not MBE_SyntheticMetadataTest(reopened, copyPath, detail) Then _
+        Err.Raise MB_ERR + 1125, , "Synthetic metadata comparison failed: " & detail
+    If gCancel Or gFatal Then Err.Raise MB_ERR + 711, , "Synthetic verification was cancelled or stopped."
+    GoTo CleanUp
+Failed:
+    n = Err.Number: errorText = Err.Description
+CleanUp:
+    On Error Resume Next
+    MBH_CloseGuard readGuard
+    If Not stream Is Nothing Then stream.Close
+    Set attachment = Nothing
+    Err.Clear
+    If Not reopened Is Nothing Then reopened.Close olDiscard
+    If Err.Number <> 0 Then cleanup = " Reopened MSG close: " & Err.Description
+    Set reopened = Nothing: Set obj = Nothing
+    Err.Clear
+    If Not source Is Nothing Then source.Close olDiscard
+    If Err.Number <> 0 Then cleanup = cleanup & " Synthetic source close: " & Err.Description
+    Set source = Nothing
+    If Len(stagePath) > 0 Then
+        Err.Clear
+        MBH_DeleteStage stagePath
+        If Err.Number <> 0 Then cleanup = cleanup & " Stage cleanup: " & Err.Description
+    End If
+    Err.Clear
+    MBH_ReleaseCrypto
+    If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    If owned Then
+        Err.Clear
+        gFSO.DeleteFolder testBase, True
+        If Err.Number <> 0 Then cleanup = cleanup & " Owned test directory preserved: " & testBase & ": " & Err.Description
+    End If
+    Set gDirs = Nothing: Set gFSO = Nothing
+    gRoot = "": gBaseRoot = "": gRunDir = "": gRunId = ""
+    On Error GoTo 0
+    If n = 0 And Len(cleanup) = 0 And Not gCancel Then
+        detail = "PASS: unsent Unicode MSG roundtrip, ordinary attachment bytes, equal-content reuse and changed-body rejection."
+        MBT_SyntheticMsgSelfTest = True
+    Else
+        detail = "FAIL: " & CStr(n) & " - " & errorText & cleanup
+    End If
+End Function
+

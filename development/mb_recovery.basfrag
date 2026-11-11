@@ -1,0 +1,1247 @@
+' ================== Independent metadata recovery / MSG baseline =============
+' The independent recovery directory holds metadata only, never extra MSG copies.
+' Snapshots are immutable manifests over content-addressed 1 MiB chunks, so an
+' append to a large journal does not duplicate every unchanged prefix block.
+' A reconstructed MSG-only baseline proves readable bytes NOW. It cannot prove
+' equality to a lost historical hash, recover deleted mail, or restore lost IDs.
+
+Private Sub MBR_Reset()
+    gRecoveryForceFull = False: gRecoveryRebased = False
+    gRecoveryReviewCount = 0: gRecoveryRestoredCount = 0: gRecoveryNewBaselines = 0
+    mbrBaselineWrites = 0: gRecoverySnapshotsSaved = 0: mbrActiveRecoveryRoot = ""
+    gRecoverySalvagedRows = 0
+    gRecoveryMergedRows = 0: gRecoveryOverlayRejected = 0: gRecoveryOverlayFiles = 0
+    gRecoveryNote = ""
+    Set gRecoveryFiles = CreateObject("Scripting.Dictionary")
+    gRecoveryFiles.CompareMode = vbTextCompare
+    Set gRecoverySentHints = CreateObject("Scripting.Dictionary")
+    gRecoverySentHints.CompareMode = vbTextCompare
+    Set mbrDigestFiles = CreateObject("Scripting.Dictionary")
+    mbrDigestFiles.CompareMode = vbBinaryCompare
+End Sub
+
+Private Sub MBR_Log(ByVal level As String, ByVal stage As String, ByVal key As String, _
+                     ByVal path As String, ByVal errorNumber As Long, ByVal detail As String)
+    Dim stream As Object, logPath As String, n As Long, description As String
+    If Not gEvents Is Nothing Then
+        MB_LogEvent level, stage, key, path, errorNumber, detail
+        Exit Sub
+    End If
+    On Error GoTo Failed
+    If Len(mbrActiveRecoveryRoot) = 0 Then Err.Raise MB_ERR + 863, , "Recovery event has no bound destination."
+    logPath = MBH_JoinPath(mbrActiveRecoveryRoot, "recovery-events.tsv")
+    MBY_NoReparse logPath, False
+    Set stream = gFSO.OpenTextFile(logPath, 8, True, -1)
+    stream.WriteLine ""
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBREVENT1", MBC_UtcStamp(MBC_UtcNow()), _
+        level, stage, key, path, CStr(errorNumber), detail))
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath logPath
+    Exit Sub
+Failed:
+    n = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_Log", description
+End Sub
+
+Private Function MBR_HasReview() As Boolean
+    MBR_HasReview = (gRecoveryReviewCount > 0)
+End Function
+
+Private Function MBR_Summary() As String
+    Dim count As Long
+    If Not gRecoveryFiles Is Nothing Then count = gRecoveryFiles.Count
+    MBR_Summary = vbCrLf & "Recovery folder: " & mbrActiveRecoveryRoot & vbCrLf & _
+        "Recovered state files: " & CStr(gRecoveryRestoredCount) & _
+        "; new metadata snapshots: " & CStr(gRecoverySnapshotsSaved) & vbCrLf & _
+        "Salvaged valid prior index rows: " & CStr(gRecoverySalvagedRows) & vbCrLf & _
+        "Preserved pre-restore state files: " & CStr(gRecoveryOverlayFiles) & _
+        "; later journal rows retained: " & CStr(gRecoveryMergedRows) & _
+        "; unproven raw rows preserved: " & CStr(gRecoveryOverlayRejected) & vbCrLf & _
+        "MSG-only baseline records: " & CStr(count) & "; new this run: " & CStr(gRecoveryNewBaselines) & _
+        "; baseline review: " & CStr(gRecoveryReviewCount) & vbCrLf & _
+        "Full reconciliation required: " & CStr(gRecoveryForceFull) & _
+        "; rebuilt without prior hashes this run: " & CStr(gRecoveryRebased) & vbCrLf & gRecoveryNote
+    If count > 0 Then MBR_Summary = MBR_Summary & vbCrLf & _
+        "MSG_ONLY_REBASELINED proves present readable bytes; lost historical equality remains unproven."
+End Function
+
+Private Function MBR_ReadOwner(ByVal folderPath As String) As Variant
+    Dim path As String, stream As Object, fields As Variant, n As Long, detail As String
+    On Error GoTo Failed
+    folderPath = MBH_NormalizePath(folderPath)
+    path = MBH_JoinPath(folderPath, MBR_OWNER_FILE)
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 800, , "Recovery owner is truncated."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 801, , "Recovery owner is empty."
+    fields = MB_ReadCheckedLine(stream.ReadLine, 5)
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 802, , "Recovery owner has extra data."
+    stream.Close: Set stream = Nothing
+    If CStr(fields(0)) <> "MBRECOVERY1" Or CStr(fields(4)) <> "1" Then _
+        Err.Raise MB_ERR + 803, , "Unknown recovery owner schema."
+    If Len(CStr(fields(3))) = 0 Then Err.Raise MB_ERR + 804, , "Recovery owner has no StoreID."
+    If StrComp(MBH_JoinPath(CStr(fields(2)), MBR_FOLDER), folderPath, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 805, , "Recovery directory moved outside its bound account."
+    If Len(gRoot) > 0 Then
+        If StrComp(MBH_NormalizePath(CStr(fields(1))), MBH_NormalizePath(gRoot), vbTextCompare) <> 0 Then _
+            Err.Raise MB_ERR + 806, , "Recovery directory belongs to a different managed root."
+    End If
+    MBR_ReadOwner = fields
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_ReadOwner", detail
+End Function
+
+Private Function MBR_IsRecoveryDirectory(ByVal folderPath As String) As Boolean
+    Dim fields As Variant
+    If Not gFSO.FileExists(MBH_JoinPath(folderPath, MBR_OWNER_FILE)) Then Exit Function
+    fields = MBR_ReadOwner(folderPath)
+    MBR_IsRecoveryDirectory = True
+End Function
+
+Private Function MBR_RecoveryRoot(ByVal accountRoot As String, ByVal storeId As String) As String
+    Dim root As String, marker As String, fields As Variant, stream As Object, folder As Object
+    Dim n As Long, detail As String, manifest As String, files As Object, chunks As Object
+    On Error GoTo Failed
+    accountRoot = MBH_NormalizePath(accountRoot)
+    If Len(storeId) = 0 Or Len(gRoot) = 0 Then Err.Raise MB_ERR + 807, , "Recovery needs root and StoreID bindings."
+    MBY_NoReparse accountRoot, True
+    root = MBH_JoinPath(accountRoot, MBR_FOLDER)
+    marker = MBH_JoinPath(root, MBR_OWNER_FILE)
+    If gFSO.FolderExists(root) Then
+        MBY_NoReparse root, True
+        If Not gFSO.FileExists(marker) Then
+            Set folder = gFSO.GetFolder(root)
+            If folder.Files.Count <> 0 Or folder.SubFolders.Count <> 0 Then
+                ' A deleted marker can be reconstructed from an independently
+                ' checked complete generation with the exact same three bindings.
+                manifest = MBR_FindSnapshot(root, accountRoot, storeId, files, chunks, True, True)
+                If Len(manifest) = 0 Then Err.Raise MB_ERR + 808, , _
+                    "Recovery owner is missing and no complete exactly bound snapshot proves ownership: " & root
+            End If
+        End If
+    Else
+        MBH_EnsureDirectory root
+    End If
+    If Not gFSO.FileExists(marker) Then
+        Set stream = gFSO.CreateTextFile(marker, False, True)
+        MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRECOVERY1", gRoot, accountRoot, storeId, "1"))
+        stream.Close: Set stream = Nothing
+        MBM_FlushPath marker
+    End If
+    fields = MBR_ReadOwner(root)
+    If StrComp(CStr(fields(2)), accountRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(fields(3)), storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 809, , "Recovery owner does not match the selected account."
+    mbrActiveRecoveryRoot = root
+    MBR_RecoveryRoot = root
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_RecoveryRoot", detail
+End Function
+
+Private Function MBR_IsStateLeaf(ByVal leaf As String) As Boolean
+    If Len(leaf) = 0 Or InStr(leaf, "\") > 0 Or InStr(leaf, "/") > 0 Or InStr(leaf, ":") > 0 Then Exit Function
+    If Left$(leaf, 1) = "." Or Left$(leaf, 4) = "~mb_" Then Exit Function
+    MBR_IsStateLeaf = (LCase$(Right$(leaf, 4)) = ".tsv")
+End Function
+
+Private Function MBR_CheckedStateValid(ByVal path As String, ByRef reason As String) As Boolean
+    Dim stream As Object, line As String, raw As Variant, fields As Variant, n As Long
+    Dim auditKind As String, sawCursor As Boolean, leaf As String
+    On Error GoTo Invalid
+    reason = ""
+    leaf = LCase$(CStr(gFSO.GetFileName(path)))
+    If Left$(leaf, 13) = "source_audit_" Then auditKind = "SOURCE"
+    If Left$(leaf, 14) = "archive_audit_" Then auditKind = "ARCHIVE"
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 810, , "Odd UTF-16 byte count."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            If sawCursor Then Err.Raise MB_ERR + 865, , "Data follows an audit snapshot terminator."
+            raw = Split(line, vbTab)
+            n = UBound(raw) - 1
+            If n < 1 Then Err.Raise MB_ERR + 811, , "State record has no checked framing."
+            fields = MB_ReadCheckedLine(line, n)
+            If auditKind = "SOURCE" Then
+                If n <> 9 Then Err.Raise MB_ERR + 866, , "Source-audit state has the wrong field count."
+                If CStr(fields(0)) <> "MBSOURCEAUDIT1" Then Err.Raise MB_ERR + 867, , "Wrong source-audit schema."
+                sawCursor = (CStr(fields(5)) = "CURSOR")
+            ElseIf auditKind = "ARCHIVE" Then
+                If n <> 17 Then Err.Raise MB_ERR + 868, , "Archive-audit state has the wrong field count."
+                If CStr(fields(0)) <> "MBARCHIVEAUDIT1" Then Err.Raise MB_ERR + 869, , "Wrong archive-audit schema."
+                sawCursor = (CStr(fields(4)) = "CURSOR" And CStr(fields(13)) = "CURSOR")
+            End If
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    If Len(auditKind) > 0 And Not sawCursor Then Err.Raise MB_ERR + 870, , "Audit snapshot terminator is missing."
+    MBR_CheckedStateValid = True
+    Exit Function
+Invalid:
+    reason = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+End Function
+
+Private Function MBR_BlockPath(ByVal recoveryRoot As String, ByVal digest As String) As String
+    If Not MB_IsHexKey(digest) Then Err.Raise MB_ERR + 812, , "Invalid recovery chunk digest."
+    MBR_BlockPath = MBH_JoinPath(MBH_JoinPath(recoveryRoot, "chunks"), LCase$(digest) & ".bin")
+End Function
+
+Private Function MBR_HashBuffer(ByRef buffer() As Byte, ByVal count As Long) As String
+    Dim context As MBH_HashContext, n As Long, detail As String
+    On Error GoTo Failed
+    MBH_HashOpen context
+    If count > 0 Then MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), count, 0), "RecoveryChunkHash"
+    MBR_HashBuffer = MBH_HashFinish(context)
+    MBH_HashClose context
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise n, "MBR_HashBuffer", detail
+End Function
+
+Private Sub MBR_StoreBlock(ByVal recoveryRoot As String, ByRef buffer() As Byte, _
+                           ByVal count As Long, ByVal digest As String)
+    Dim path As String, stage As String, written As Long, n As Long, detail As String, rc As Long
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = -1
+    On Error GoTo Failed
+    path = MBR_BlockPath(recoveryRoot, digest)
+    MBY_NoReparse path, False
+    MBH_EnsureDirectory gFSO.GetParentFolderName(path)
+    If gFSO.FileExists(path) Then
+        MBY_NoReparse path, True
+        If CDbl(gFSO.GetFile(path).Size) = count Then
+            If MBH_HashFile(path) = digest Then Exit Sub
+        End If
+        ' Keep corrupted owned metadata as evidence; create a fresh verified copy.
+        MBR_PreserveFile path, MBH_JoinPath(recoveryRoot, "preserved")
+    End If
+    stage = MBH_NewStagePath(path)
+    handle = MBH_CreateFileW(StrPtr(stage), MBH_GENERIC_WRITE, 0, 0, MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If handle = -1 Then Err.Raise MB_ERR + 813, , "Cannot open recovery chunk stage."
+    If MBR_WriteFile(handle, buffer(0), count, written, 0) = 0 Or written <> count Then _
+        Err.Raise MB_ERR + 814, , "Incomplete recovery chunk write."
+    If MBM_FlushFileBuffers(handle) = 0 Then Err.Raise MB_ERR + 815, , "Cannot flush recovery chunk."
+    rc = MBH_CloseHandle(handle): handle = -1
+    If rc = 0 Then Err.Raise MB_ERR + 816, , "Cannot close recovery chunk."
+    If MBH_HashFile(stage) <> digest Then Err.Raise MB_ERR + 817, , "Recovery chunk stage digest mismatch."
+    MBH_CommitStage stage, path
+    stage = ""
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If handle <> -1 Then rc = MBH_CloseHandle(handle)
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBR_StoreBlock", detail
+End Sub
+
+Private Function MBR_CaptureState(ByVal path As String, ByVal recoveryRoot As String, _
+                                   ByRef bytes As Double, ByRef digest As String) As Collection
+    Dim blocks As New Collection, buffer() As Byte, context As MBH_HashContext
+    Dim count As Long, blockHash As String, rc As Long, n As Long, detail As String
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = -1
+    On Error GoTo Failed
+    bytes = 0: digest = ""
+    ReDim buffer(0 To MBR_CHUNK_BYTES - 1)
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL Or MBH_FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    If handle = -1 Then Err.Raise MB_ERR + 818, , "Cannot lock primary state for a snapshot: " & path
+    MBH_HashOpen context
+    Do
+        If MBH_ReadFile(handle, buffer(0), MBR_CHUNK_BYTES, count, 0) = 0 Then _
+            Err.Raise MB_ERR + 819, , "Cannot read primary state."
+        If count = 0 Then Exit Do
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), count, 0), "RecoveryStateHash"
+        blockHash = MBR_HashBuffer(buffer, count)
+        MBR_StoreBlock recoveryRoot, buffer, count, blockHash
+        blocks.Add Array(CStr(blocks.Count + 1), CStr(count), blockHash)
+        bytes = bytes + count
+    Loop
+    digest = MBH_HashFinish(context)
+    MBH_HashClose context
+    rc = MBH_CloseHandle(handle): handle = -1
+    If rc = 0 Then Err.Raise MB_ERR + 820, , "Cannot close primary snapshot reader."
+    Set MBR_CaptureState = blocks
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If handle <> -1 Then rc = MBH_CloseHandle(handle)
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise n, "MBR_CaptureState", detail
+End Function
+
+Private Function MBR_ReadSnapshot(ByVal path As String, ByVal accountRoot As String, ByVal storeId As String, _
+                                   ByRef files As Object, ByRef chunks As Object, ByRef reason As String) As Boolean
+    Dim stream As Object, line As String, raw As Variant, f As Variant, meta As Variant
+    Dim header As Boolean, footer As Boolean, leaf As String, blocks As Collection
+    Dim totalChunks As Long, key As Variant, n As Long
+    On Error GoTo Invalid
+    Set files = CreateObject("Scripting.Dictionary"): files.CompareMode = vbTextCompare
+    Set chunks = CreateObject("Scripting.Dictionary"): chunks.CompareMode = vbTextCompare
+    reason = ""
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 821, , "Snapshot has a truncated UTF-16 byte."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            If footer Then Err.Raise MB_ERR + 822, , "Snapshot has records after its completion footer."
+            raw = Split(line, vbTab)
+            If UBound(raw) < 3 Then Err.Raise MB_ERR + 823, , "Snapshot record is incomplete."
+            Select Case CStr(raw(1))
+                Case "HEADER"
+                    If header Then Err.Raise MB_ERR + 824, , "Duplicate snapshot header."
+                    f = MB_ReadCheckedLine(line, 7)
+                    If CStr(f(0)) <> "MBRSNAP1" Or StrComp(CStr(f(2)), gRoot, vbTextCompare) <> 0 Or _
+                       StrComp(CStr(f(3)), accountRoot, vbTextCompare) <> 0 Or _
+                       StrComp(CStr(f(4)), storeId, vbTextCompare) <> 0 Then _
+                        Err.Raise MB_ERR + 825, , "Snapshot belongs to another root/account/store."
+                    If Not MBC_ValidDate(MBC_ParseUtcStamp(CStr(f(5)))) Then _
+                        Err.Raise MB_ERR + 826, , "Snapshot UTC timestamp is invalid."
+                    header = True
+                Case "FILE"
+                    If Not header Then Err.Raise MB_ERR + 827, , "Snapshot has no header."
+                    f = MB_ReadCheckedLine(line, 6): leaf = CStr(f(2))
+                    If CStr(f(0)) <> "MBRSNAP1" Or Not MBR_IsStateLeaf(leaf) Then _
+                        Err.Raise MB_ERR + 828, , "Unsafe snapshot state filename."
+                    If files.Exists(leaf) Or Not MB_IsHexKey(CStr(f(4))) Then _
+                        Err.Raise MB_ERR + 829, , "Duplicate snapshot file or invalid digest."
+                    If MB_ByteCount(CStr(f(3))) < 0 Or MB_ByteCount(CStr(f(5))) < 0 Then _
+                        Err.Raise MB_ERR + 830, , "Invalid snapshot size/count."
+                    files.Add leaf, MB_EncodeFields(Array(f(3), f(4), f(5)))
+                    Set blocks = New Collection: chunks.Add leaf, blocks
+                Case "CHUNK"
+                    f = MB_ReadCheckedLine(line, 6): leaf = CStr(f(2))
+                    If CStr(f(0)) <> "MBRSNAP1" Or Not files.Exists(leaf) Then _
+                        Err.Raise MB_ERR + 831, , "Snapshot chunk has no preceding file."
+                    Set blocks = chunks(leaf)
+                    If MB_ByteCount(CStr(f(3))) <> blocks.Count + 1 Then _
+                        Err.Raise MB_ERR + 832, , "Snapshot chunk order is invalid."
+                    If MB_ByteCount(CStr(f(4))) <= 0 Or MB_ByteCount(CStr(f(4))) > MBR_CHUNK_BYTES Or _
+                       Not MB_IsHexKey(CStr(f(5))) Then Err.Raise MB_ERR + 833, , "Invalid recovery chunk."
+                    blocks.Add Array(f(3), f(4), f(5))
+                    totalChunks = totalChunks + 1
+                Case "END"
+                    f = MB_ReadCheckedLine(line, 4)
+                    If Not header Or CStr(f(0)) <> "MBRSNAP1" Or MB_ByteCount(CStr(f(2))) <> files.Count Or _
+                       MB_ByteCount(CStr(f(3))) <> totalChunks Then Err.Raise MB_ERR + 834, , "Incomplete snapshot footer."
+                    footer = True
+                Case Else
+                    Err.Raise MB_ERR + 835, , "Unknown snapshot record."
+            End Select
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    If Not header Or Not footer Or Not files.Exists("journal.tsv") Then _
+        Err.Raise MB_ERR + 836, , "Snapshot has no complete journal generation."
+    For Each key In files.Keys
+        meta = MBM_Unpack(CStr(files(key)), 3): Set blocks = chunks(key)
+        If blocks.Count <> MB_ByteCount(CStr(meta(2))) Then _
+            Err.Raise MB_ERR + 837, , "Snapshot file chunk count mismatch."
+    Next key
+    MBR_ReadSnapshot = True
+    Exit Function
+Invalid:
+    reason = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Set files = Nothing: Set chunks = Nothing
+End Function
+
+Private Function MBR_BlocksValid(ByVal recoveryRoot As String, ByVal files As Object, _
+                                 ByVal chunks As Object, ByRef reason As String) As Boolean
+    Dim key As Variant, meta As Variant, blocks As Collection, block As Variant
+    Dim path As String, total As Double
+    On Error GoTo Invalid
+    For Each key In files.Keys
+        meta = MBM_Unpack(CStr(files(key)), 3): Set blocks = chunks(key): total = 0
+        For Each block In blocks
+            path = MBR_BlockPath(recoveryRoot, CStr(block(2)))
+            MBY_NoReparse path, True
+            If CDbl(gFSO.GetFile(path).Size) <> MB_ByteCount(CStr(block(1))) Then _
+                Err.Raise MB_ERR + 838, , "Snapshot chunk size mismatch."
+            If MBH_HashFile(path) <> CStr(block(2)) Then Err.Raise MB_ERR + 839, , "Snapshot chunk SHA-256 mismatch."
+            total = total + MB_ByteCount(CStr(block(1)))
+        Next block
+        If total <> MB_ByteCount(CStr(meta(0))) Then Err.Raise MB_ERR + 840, , "Snapshot total bytes mismatch."
+    Next key
+    MBR_BlocksValid = True
+    Exit Function
+Invalid:
+    reason = Err.Description
+End Function
+
+Private Function MBR_FindSnapshot(ByVal recoveryRoot As String, ByVal accountRoot As String, _
+                                  ByVal storeId As String, ByRef files As Object, ByRef chunks As Object, _
+                                  Optional ByVal verifyBlocks As Boolean = False, _
+                                  Optional ByVal quiet As Boolean = False) As String
+    Dim dir As String, item As Object, candidates As Object, keys As Variant, i As Long, reason As String
+    Set candidates = CreateObject("Scripting.Dictionary")
+    dir = MBH_JoinPath(recoveryRoot, "snapshots")
+    If Not gFSO.FolderExists(dir) Then Exit Function
+    MBY_NoReparse dir, True
+    For Each item In gFSO.GetFolder(dir).Files
+        If LCase$(Left$(CStr(item.Name), 9)) = "snapshot_" And LCase$(Right$(CStr(item.Name), 4)) = ".tsv" Then
+            candidates(CStr(item.Path)) = True
+        End If
+    Next item
+    If candidates.Count = 0 Then Exit Function
+    keys = candidates.Keys: MBW_SortKeys keys, LBound(keys), UBound(keys)
+    For i = UBound(keys) To LBound(keys) Step -1
+        If MBR_ReadSnapshot(CStr(keys(i)), accountRoot, storeId, files, chunks, reason) Then
+            If Not verifyBlocks Then
+                MBR_FindSnapshot = CStr(keys(i)): Exit Function
+            ElseIf MBR_BlocksValid(recoveryRoot, files, chunks, reason) Then
+                MBR_FindSnapshot = CStr(keys(i)): Exit Function
+            End If
+        End If
+        If Not quiet Then MBR_Log "WARNING", "RECOVERY_SNAPSHOT_REJECTED", "", CStr(keys(i)), 0, reason
+    Next i
+    Set files = Nothing: Set chunks = Nothing
+End Function
+
+Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As String) As Boolean
+    Dim dir As String, item As Object, key As Variant, meta As Variant, path As String
+    reason = ""
+    dir = gFSO.GetParentFolderName(MB_StatePath("journal.tsv"))
+    If Not gFSO.FileExists(MB_StatePath("journal.tsv")) Then reason = "Primary journal is missing.": Exit Function
+    If Not gFSO.FolderExists(dir) Then reason = "Primary state directory is missing.": Exit Function
+    For Each item In gFSO.GetFolder(dir).Files
+        If MBR_IsStateLeaf(CStr(item.Name)) Then
+            If Not MBR_CheckedStateValid(CStr(item.Path), reason) Then
+                reason = CStr(item.Name) & ": " & reason: Exit Function
+            End If
+        End If
+    Next item
+    If Not snapshotFiles Is Nothing Then
+        For Each key In snapshotFiles.Keys
+            path = MB_StatePath(CStr(key))
+            If Not gFSO.FileExists(path) Then reason = "State component is missing: " & CStr(key): Exit Function
+            ' Journal/moves/baseline are append-only. Compact audits may shrink.
+            If LCase$(CStr(key)) = "journal.tsv" Or LCase$(CStr(key)) = "moves.tsv" Or _
+               LCase$(Left$(CStr(key), 9)) = "baseline_" Then
+                meta = MBM_Unpack(CStr(snapshotFiles(key)), 3)
+                If CDbl(gFSO.GetFile(path).Size) < MB_ByteCount(CStr(meta(0))) Then
+                    reason = "Append-only state is shorter than its recovery snapshot: " & CStr(key): Exit Function
+                End If
+            End If
+        Next key
+    End If
+    MBR_StateHealthy = True
+End Function
+
+Private Sub MBR_PreserveFile(ByVal path As String, ByVal preservedRoot As String)
+    Dim target As String, nonce As String
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True
+    MBY_NoReparse preservedRoot, False
+    MBH_EnsureDirectory preservedRoot
+    nonce = Left$(MBH_HashText(gFSO.GetTempName & CStr(Timer)), 12)
+    target = MBH_JoinPath(preservedRoot, nonce & "_" & CStr(gFSO.GetFileName(path)))
+    If MBH_MoveFileW(StrPtr(path), StrPtr(target)) = 0 Then _
+        Err.Raise MB_ERR + 841, , "Cannot preserve previous state without overwrite: " & path
+    MBM_FlushPath target
+    MBR_Log "WARNING", "RECOVERY_PREVIOUS_STATE_PRESERVED", "", target, 0, "Previous bytes retained before recovery."
+End Sub
+
+Private Sub MBR_WriteIntent(ByVal recoveryRoot As String, ByVal accountRoot As String, ByVal storeId As String, _
+                            ByVal manifest As String, ByVal phase As String)
+    Dim path As String, stream As Object, n As Long, detail As String
+    On Error GoTo Failed
+    path = MBH_JoinPath(recoveryRoot, "restore-intents.tsv")
+    MBY_NoReparse path, False
+    Set stream = gFSO.OpenTextFile(path, 8, True, -1)
+    stream.WriteLine ""
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRRESTORE1", gRoot, accountRoot, storeId, manifest, phase, MBC_UtcStamp(MBC_UtcNow())))
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath path
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_WriteIntent", detail
+End Sub
+
+Private Function MBR_PendingIntent(ByVal recoveryRoot As String, ByVal accountRoot As String, ByVal storeId As String) As String
+    Dim path As String, stream As Object, line As String, f As Variant, latest As Variant
+    Dim n As Long, detail As String, saved As Boolean
+    On Error GoTo Failed
+    path = MBH_JoinPath(recoveryRoot, "restore-intents.tsv")
+    If Not gFSO.FileExists(path) Then Exit Function
+    MBY_NoReparse path, True
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            On Error Resume Next
+            Err.Clear: f = MB_ReadCheckedLine(line, 7): n = Err.Number
+            On Error GoTo Failed
+            If n = 0 Then
+                If CStr(f(0)) <> "MBRRESTORE1" Or StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+                   StrComp(CStr(f(2)), accountRoot, vbTextCompare) <> 0 Or _
+                   StrComp(CStr(f(3)), storeId, vbTextCompare) <> 0 Then _
+                    Err.Raise MB_ERR + 842, , "Restore intent belongs to another binding."
+                If CStr(f(5)) <> "START" And CStr(f(5)) <> "DONE" Then _
+                    Err.Raise MB_ERR + 843, , "Unknown restore intent phase."
+                latest = f: saved = True
+            Else
+                MBR_Log "WARNING", "RECOVERY_TORN_INTENT", "", path, n, "A complete prior intent remains authoritative."
+            End If
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    If saved Then
+        If CStr(latest(5)) = "START" Then MBR_PendingIntent = CStr(latest(4))
+    End If
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_PendingIntent", detail
+End Function
+
+Private Sub MBR_ReconstructFile(ByVal recoveryRoot As String, ByVal leaf As String, _
+                                ByVal meta As Variant, ByVal blocks As Collection)
+    Dim finalPath As String, stage As String, block As Variant, path As String, buffer() As Byte
+    Dim count As Long, written As Long, rc As Long, total As Double, n As Long, detail As String
+#If VBA7 Then
+    Dim outputHandle As LongPtr, inputHandle As LongPtr
+#Else
+    Dim outputHandle As Long, inputHandle As Long
+#End If
+    outputHandle = -1: inputHandle = -1
+    On Error GoTo Failed
+    finalPath = MB_StatePath(leaf)
+    If gFSO.FileExists(finalPath) Then
+        If CDbl(gFSO.GetFile(finalPath).Size) = MB_ByteCount(CStr(meta(0))) Then
+            If MBH_HashFile(finalPath) = CStr(meta(1)) Then Exit Sub
+        End If
+        MBR_PreserveFile finalPath, MB_StatePath("preserved")
+    End If
+    MBH_EnsureDirectory gFSO.GetParentFolderName(finalPath)
+    stage = MBH_NewStagePath(finalPath)
+    outputHandle = MBH_CreateFileW(StrPtr(stage), MBH_GENERIC_WRITE, 0, 0, MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If outputHandle = -1 Then Err.Raise MB_ERR + 844, , "Cannot create restored state stage."
+    ReDim buffer(0 To MBR_CHUNK_BYTES - 1)
+    For Each block In blocks
+        path = MBR_BlockPath(recoveryRoot, CStr(block(2)))
+        inputHandle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+        If inputHandle = -1 Then Err.Raise MB_ERR + 845, , "Cannot open snapshot chunk."
+        If MBH_ReadFile(inputHandle, buffer(0), MBR_CHUNK_BYTES, count, 0) = 0 Then _
+            Err.Raise MB_ERR + 846, , "Cannot read snapshot chunk."
+        If count <> MB_ByteCount(CStr(block(1))) Or MBR_HashBuffer(buffer, count) <> CStr(block(2)) Then _
+            Err.Raise MB_ERR + 847, , "Snapshot chunk changed while restoring."
+        If MBR_WriteFile(outputHandle, buffer(0), count, written, 0) = 0 Or written <> count Then _
+            Err.Raise MB_ERR + 848, , "Incomplete restored state write."
+        rc = MBH_CloseHandle(inputHandle): inputHandle = -1
+        If rc = 0 Then Err.Raise MB_ERR + 849, , "Cannot close snapshot chunk."
+        total = total + count
+    Next block
+    If MBM_FlushFileBuffers(outputHandle) = 0 Then Err.Raise MB_ERR + 850, , "Cannot flush restored state."
+    rc = MBH_CloseHandle(outputHandle): outputHandle = -1
+    If rc = 0 Then Err.Raise MB_ERR + 851, , "Cannot close restored state."
+    If total <> MB_ByteCount(CStr(meta(0))) Or MBH_HashFile(stage) <> CStr(meta(1)) Then _
+        Err.Raise MB_ERR + 852, , "Restored state failed final size/digest verification."
+    MBH_CommitStage stage, finalPath: stage = ""
+    gRecoveryRestoredCount = gRecoveryRestoredCount + 1
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If inputHandle <> -1 Then rc = MBH_CloseHandle(inputHandle)
+    If outputHandle <> -1 Then rc = MBH_CloseHandle(outputHandle)
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBR_ReconstructFile", detail
+End Sub
+
+Private Sub MBR_PreserveExtraState(ByVal snapshotFiles As Object)
+    Dim dir As String, item As Object, paths As New Collection, path As Variant
+    dir = gFSO.GetParentFolderName(MB_StatePath("journal.tsv"))
+    If Not gFSO.FolderExists(dir) Then Exit Sub
+    For Each item In gFSO.GetFolder(dir).Files
+        If MBR_IsStateLeaf(CStr(item.Name)) Then
+            If snapshotFiles Is Nothing Then
+                paths.Add CStr(item.Path)
+            ElseIf Not snapshotFiles.Exists(CStr(item.Name)) Then
+                paths.Add CStr(item.Path)
+            End If
+        End If
+    Next item
+    For Each path In paths
+        MBR_PreserveFile CStr(path), MB_StatePath("preserved")
+    Next path
+End Sub
+
+Private Function MBR_ReconcileLeaf(ByVal accountRoot As String, ByVal storeId As String) As String
+    MBR_ReconcileLeaf = "reconcile_" & Left$(MBH_HashText(MB_EncodeFields(Array(gRoot, accountRoot, storeId))), 32) & ".tsv"
+End Function
+
+Private Function MBR_TokenNeeds(ByVal path As String, ByVal accountRoot As String, ByVal storeId As String) As Boolean
+    Dim stream As Object, f As Variant, n As Long, detail As String
+    If Not gFSO.FileExists(path) Then Exit Function
+    On Error GoTo Damaged
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 875, , "Reconciliation token is truncated."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 875, , "Reconciliation token is empty."
+    f = MB_ReadCheckedLine(stream.ReadLine, 7)
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 875, , "Reconciliation token has extra rows."
+    stream.Close: Set stream = Nothing
+    If CStr(f(0)) <> "MBRECONCILE1" Or StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), accountRoot, vbTextCompare) <> 0 Or StrComp(CStr(f(3)), storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 876, , "Reconciliation token belongs to another archive/account/store."
+    If CStr(f(4)) <> "NEEDS" And CStr(f(4)) <> "DONE" Then Err.Raise MB_ERR + 875, , "Unknown reconciliation token state."
+    MBR_TokenNeeds = (CStr(f(4)) = "NEEDS")
+    Exit Function
+Damaged:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    If n = MB_ERR + 876 Then Err.Raise n, "MBR_TokenNeeds", detail
+    ' An unreadable token never means completed reconciliation.
+    MBR_TokenNeeds = True
+    MBR_Log "WARNING", "RECOVERY_RECONCILE_TOKEN_REVIEW", "", path, n, detail
+End Function
+
+Private Sub MBR_WriteToken(ByVal path As String, ByVal recoveryRoot As String, _
+                           ByVal accountRoot As String, ByVal storeId As String, ByVal phase As String)
+    Dim leaf As String, stage As String, stream As Object, digest As String, n As Long, detail As String
+    Dim expectedPrimary As String, expectedMirror As String, created As Boolean
+    On Error GoTo Failed
+    leaf = MBR_ReconcileLeaf(accountRoot, storeId)
+    expectedPrimary = MB_StatePath(leaf): expectedMirror = MBH_JoinPath(recoveryRoot, leaf)
+    If StrComp(path, expectedPrimary, vbTextCompare) <> 0 And StrComp(path, expectedMirror, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 877, , "Reconciliation token destination is outside its exact owned binding."
+    If phase <> "NEEDS" And phase <> "DONE" Then Err.Raise MB_ERR + 878, , "Unknown reconciliation phase."
+    MBY_NoReparse path, False
+    MBH_EnsureDirectory gFSO.GetParentFolderName(path)
+    stage = MBH_JoinPath(CStr(gFSO.GetParentFolderName(path)), "_mb_reconcile_" & gFSO.GetTempName)
+    Set stream = gFSO.CreateTextFile(stage, False, True): created = True
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRECONCILE1", gRoot, accountRoot, storeId, _
+        phase, MBC_UtcStamp(MBC_UtcNow()), gRunId))
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath stage: digest = MBH_HashFile(stage)
+    ' Only these two exact metadata tokens may be replaced, never a MSG.
+    If MBM_MoveFileExW(StrPtr(stage), StrPtr(path), 9) = 0 Then _
+        Err.Raise MB_ERR + 879, , "Cannot atomically publish reconciliation requirement."
+    created = False
+    MBM_FlushPath path
+    If MBH_HashFile(path) <> digest Then Err.Raise MB_ERR + 880, , "Published reconciliation token changed."
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_WriteToken", detail
+End Sub
+
+Private Sub MBR_RequireReconcile(ByVal recoveryRoot As String, ByVal accountRoot As String, ByVal storeId As String)
+    Dim leaf As String
+    leaf = MBR_ReconcileLeaf(accountRoot, storeId)
+    ' The independent NEEDS is durable before destructive metadata replacement.
+    MBR_WriteToken MBH_JoinPath(recoveryRoot, leaf), recoveryRoot, accountRoot, storeId, "NEEDS"
+    MBR_WriteToken MB_StatePath(leaf), recoveryRoot, accountRoot, storeId, "NEEDS"
+    gRecoveryForceFull = True
+End Sub
+
+Private Sub MBR_CompleteReconcile(ByVal accountRoot As String, ByVal storeId As String)
+    Dim recoveryRoot As String, leaf As String
+    If Not gWindowCommitted Then Err.Raise MB_ERR + 881, , "Reconciliation can close only after durable mail coverage."
+    If Not gRecoveryForceFull Then Exit Sub
+    recoveryRoot = MBR_RecoveryRoot(accountRoot, storeId)
+    leaf = MBR_ReconcileLeaf(accountRoot, storeId)
+    MBR_WriteToken MB_StatePath(leaf), recoveryRoot, accountRoot, storeId, "DONE"
+    MBR_WriteToken MBH_JoinPath(recoveryRoot, leaf), recoveryRoot, accountRoot, storeId, "DONE"
+    ' If either write fails, the other NEEDS copy forces a safe repeat.
+    gRecoveryForceFull = False
+    gRecoveryNote = gRecoveryNote & " Full current-mail reconciliation completed."
+End Sub
+
+Private Function MBR_TryIndexRow(ByVal line As String, ByRef reason As String) As Boolean
+    Dim f As Variant, n As Long
+    On Error GoTo Rejected
+    If Left$(line, 6) = "MBS3" & vbTab & "N" Or Left$(line, 6) = "MBS3" & vbTab & "T" Or _
+       Left$(line, 6) = "MBS3" & vbTab & "R" Then
+        f = MB_ReadCheckedLine(line, 17)
+        If CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
+    Else
+        f = MB_ReadCheckedLine(line, 16)
+        If CStr(f(0)) <> "MBS2" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
+    End If
+    If Not MB_IsHexKey(CStr(f(2))) Or Not MB_IsHexKey(CStr(f(5))) Or Not MB_IsHexKey(CStr(f(6))) Then _
+        Err.Raise MB_ERR + 25, , "Invalid source/revision/file digest."
+    ' This is the REAL index semantic validator, in isolated temporary caches.
+    ' R rows must refer to a previously accepted same-store, same-byte record.
+    MBX_CacheRecord f
+    MBR_TryIndexRow = True
+    Exit Function
+Rejected:
+    n = Err.Number: reason = Err.Description
+    If (n >= MB_ERR + 15 And n <= MB_ERR + 25) Or _
+       (n >= MB_ERR + 263 And n <= MB_ERR + 269) Or n = MB_ERR + 326 Or _
+       (n >= MB_ERR + 600 And n <= MB_ERR + 610) Or n = MBH_ERR_BASE + 2 Then Exit Function
+    ' Unexpected resource/crypto/runtime failures are not corrupt-row evidence.
+    Err.Raise n, "MBR_TryIndexRow", reason
+End Function
+
+Private Function MBR_SalvageJournal(ByVal recoveryRoot As String) As String
+    Dim oldIndex As Object, oldExternal As Object, oldMeta As Object, oldStores As Object
+    Dim oldBindings As Object, oldSources As Object, oldOwners As Object
+    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object
+    Dim inputStream As Object, outputStream As Object, source As String, stage As String, target As String, dir As String
+    Dim line As String, reason As String, accepted As Long, rejected As Long, cached As Boolean
+    Dim digest As String, bytes As Double, n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    source = MB_StatePath("journal.tsv")
+    If Not gFSO.FileExists(source) Then Exit Function
+    MBY_NoReparse source, True
+    guard = MBH_GuardFile(source)
+    Set oldIndex = gIndex: Set oldExternal = gExternalRoots: Set oldMeta = gRecordMeta: Set oldStores = gStoreTokens
+    Set oldBindings = gLegacyBindings: Set oldSources = gLegacySources: Set oldOwners = gLegacyOwners
+    Set oldBuckets = gIdentityBuckets: Set oldSeen = gIdentitySeen: Set oldKnown = gWindowKnown
+    Set oldHeads = gRevisionHeads
+    cached = True
+    Set gIndex = CreateObject("Scripting.Dictionary")
+    Set gExternalRoots = CreateObject("Scripting.Dictionary")
+    Set gRecordMeta = CreateObject("Scripting.Dictionary")
+    Set gStoreTokens = CreateObject("Scripting.Dictionary"): gStoreTokens.CompareMode = vbTextCompare
+    Set gLegacyBindings = CreateObject("Scripting.Dictionary")
+    Set gLegacySources = CreateObject("Scripting.Dictionary")
+    Set gLegacyOwners = CreateObject("Scripting.Dictionary"): gLegacyOwners.CompareMode = vbTextCompare
+    Set gIdentityBuckets = Nothing: Set gIdentitySeen = Nothing: Set gRevisionHeads = Nothing
+    Set gWindowKnown = CreateObject("Scripting.Dictionary")
+    dir = MBH_JoinPath(recoveryRoot, "salvages")
+    MBY_NoReparse dir, False
+    MBH_EnsureDirectory dir
+    target = MBH_JoinPath(dir, "journal_" & Left$(MBH_HashText(gRunId & gFSO.GetTempName), 24) & ".tsv")
+    stage = MBH_NewStagePath(target)
+    Set inputStream = gFSO.OpenTextFile(source, 1, False, -1)
+    Set outputStream = gFSO.CreateTextFile(stage, True, True)
+    Do Until inputStream.AtEndOfStream
+        line = inputStream.ReadLine
+        If Len(line) > 0 Then
+            If MBR_TryIndexRow(line, reason) Then
+                outputStream.WriteLine line: accepted = accepted + 1
+            Else
+                rejected = rejected + 1
+                MBR_Log "WARNING", "RECOVERY_INDEX_ROW_REJECTED", CStr(accepted + rejected), source, 0, reason
+            End If
+        End If
+    Loop
+    inputStream.Close: Set inputStream = Nothing
+    outputStream.Close: Set outputStream = Nothing
+    If accepted > 0 Then
+        MBM_FlushPath stage
+        digest = MBH_HashFile(stage): bytes = CDbl(gFSO.GetFile(stage).Size)
+        MBH_CommitStage stage, target, digest, bytes: stage = ""
+        MBR_SalvageJournal = "SALVAGE|" & CStr(gFSO.GetFileName(target)) & "|" & _
+            Format$(bytes, "0") & "|" & digest & "|" & CStr(accepted)
+        gRecoverySalvagedRows = accepted
+    End If
+    GoTo Cleanup
+Failed:
+    n = Err.Number: detail = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not inputStream Is Nothing Then inputStream.Close
+    If Not outputStream Is Nothing Then outputStream.Close
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    MBH_CloseGuard guard
+    If cached Then
+        Set gIndex = oldIndex: Set gExternalRoots = oldExternal: Set gRecordMeta = oldMeta: Set gStoreTokens = oldStores
+        Set gLegacyBindings = oldBindings: Set gLegacySources = oldSources: Set gLegacyOwners = oldOwners
+        Set gIdentityBuckets = oldBuckets: Set gIdentitySeen = oldSeen: Set gWindowKnown = oldKnown
+        Set gRevisionHeads = oldHeads
+    End If
+    On Error GoTo 0
+    If n <> 0 Then Err.Raise n, "MBR_SalvageJournal", detail
+End Function
+
+Private Sub MBR_RestoreSalvage(ByVal recoveryRoot As String, ByVal pointer As String)
+    Dim f As Variant, path As String, finalPath As String, stage As String, reason As String
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    f = Split(pointer, "|")
+    If UBound(f) <> 4 Then Err.Raise MB_ERR + 871, , "Invalid salvage pointer."
+    If CStr(f(0)) <> "SALVAGE" Or Not MBR_IsStateLeaf(CStr(f(1))) Or Not MB_IsHexKey(CStr(f(3))) Then _
+        Err.Raise MB_ERR + 872, , "Unsafe salvage pointer."
+    path = MBH_JoinPath(MBH_JoinPath(recoveryRoot, "salvages"), CStr(f(1)))
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) <> MB_ByteCount(CStr(f(2))) Or MBH_HashFile(path) <> CStr(f(3)) Then _
+        Err.Raise MB_ERR + 873, , "Salvaged historical proof no longer matches its durable intent."
+    If Not MBR_CheckedStateValid(path, reason) Then Err.Raise MB_ERR + 874, , "Salvaged rows are damaged: " & reason
+    finalPath = MB_StatePath("journal.tsv")
+    If gFSO.FileExists(finalPath) Then MBR_PreserveFile finalPath, MB_StatePath("preserved")
+    stage = MBH_NewStagePath(finalPath)
+    gFSO.CopyFile path, stage, True
+    MBH_CommitStage stage, finalPath, CStr(f(3)), MB_ByteCount(CStr(f(2))): stage = ""
+    gRecoverySalvagedRows = CLng(MB_ByteCount(CStr(f(4))))
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBR_RestoreSalvage", detail
+End Sub
+
+Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As String, _
+                             Optional ByVal forceRepair As Boolean = False)
+    Dim recoveryRoot As String, manifest As String, pending As String, reason As String
+    Dim files As Object, chunks As Object, key As Variant, meta As Variant, blocks As Collection
+    Dim emptyFiles As Object, stream As Object, healthy As Boolean, intent As String
+    Dim leaf As String, needsPrimary As Boolean, needsMirror As Boolean
+    Dim overlayFiles As Object, baseReference As String, baseDigest As String
+    accountRoot = MBH_NormalizePath(accountRoot)
+    recoveryRoot = MBR_RecoveryRoot(accountRoot, storeId)
+    leaf = MBR_ReconcileLeaf(accountRoot, storeId)
+    needsPrimary = MBR_TokenNeeds(MB_StatePath(leaf), accountRoot, storeId)
+    needsMirror = MBR_TokenNeeds(MBH_JoinPath(recoveryRoot, leaf), accountRoot, storeId)
+    If needsPrimary Or needsMirror Or gStateMigrated Then gRecoveryForceFull = True
+    pending = MBR_PendingIntent(recoveryRoot, accountRoot, storeId)
+    manifest = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, files, chunks)
+    healthy = MBR_StateHealthy(files, reason)
+    If forceRepair Then healthy = False
+    If healthy And Len(pending) = 0 Then
+        If gRecoveryForceFull Then
+            MBR_RequireReconcile recoveryRoot, accountRoot, storeId
+            gRecoveryNote = "RECOVERY_RECONCILE_PENDING: state is readable; repeat the incomplete full reconciliation without restoring again."
+        End If
+        Exit Sub
+    End If
+    MBR_RequireReconcile recoveryRoot, accountRoot, storeId
+    If Left$(pending, 6) = "MERGE|" Then
+        intent = pending
+    Else
+        ' Convert an earlier snapshot/SALVAGE/MSG_ONLY intent into one durable
+        ' plan without discarding any still-available current proof.
+        If Len(pending) > 0 Then
+            If MBR_HasPreservedState() Then Err.Raise MB_ERR + 1157, , _
+                "Legacy interrupted recovery has preserved history outside a bound overlay. Review those originals before resuming; no proof may be discarded."
+            baseReference = pending
+        Else
+            manifest = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, files, chunks, True)
+            baseReference = "MSG_ONLY"
+            If Len(manifest) > 0 Then baseReference = manifest
+        End If
+        intent = MBR_CaptureOverlay(recoveryRoot, accountRoot, storeId, baseReference)
+    End If
+    MBR_ReadOverlay recoveryRoot, accountRoot, storeId, intent, overlayFiles, baseReference, baseDigest
+    If baseReference <> "MSG_ONLY" And Left$(baseReference, 8) <> "SALVAGE|" Then
+        MBR_LoadOverlayBase recoveryRoot, accountRoot, storeId, baseReference, baseDigest, files, chunks
+    Else
+        Set files = Nothing: Set chunks = Nothing
+    End If
+    ' Immutable raw copies + a checked bound manifest exist BEFORE START.
+    ' Restart always uses that SAME plan, not the partly reconstructed primary.
+    MBR_WriteIntent recoveryRoot, accountRoot, storeId, intent, "START"
+    If Not files Is Nothing Then
+        MBR_PreserveExtraState files
+        For Each key In files.Keys
+            meta = MBM_Unpack(CStr(files(key)), 3): Set blocks = chunks(key)
+            MBR_ReconstructFile recoveryRoot, CStr(key), meta, blocks
+        Next key
+    Else
+        MBR_PreserveExtraState emptyFiles
+        MBH_EnsureDirectory gFSO.GetParentFolderName(MB_StatePath("journal.tsv"))
+        If Left$(baseReference, 8) = "SALVAGE|" Then
+            MBR_RestoreSalvage recoveryRoot, baseReference
+        ElseIf Not gFSO.FileExists(MB_StatePath("journal.tsv")) Then
+            Set stream = gFSO.CreateTextFile(MB_StatePath("journal.tsv"), False, True)
+            stream.Close: Set stream = Nothing
+            MBM_FlushPath MB_StatePath("journal.tsv")
+        End If
+        gRecoveryRebased = True
+    End If
+    MBR_ApplyOverlay recoveryRoot, overlayFiles, accountRoot, storeId
+    ' No DONE is emitted if valid historical proofs conflict or any owned
+    ' merge could not be published. Both original byte sets remain available.
+    MBR_WriteIntent recoveryRoot, accountRoot, storeId, intent, "DONE"
+    If Not files Is Nothing Then
+        gRecoveryNote = "RECOVERED_SNAPSHOT: snapshot restored and surviving later proof merged; full current-mail reconciliation required."
+        MBR_Log "WARNING", "RECOVERY_SNAPSHOT_RESTORED", "", baseReference, 0, gRecoveryNote
+    Else
+        gRecoveryNote = "MSG_ONLY_REBASELINED: surviving checked proof retained; files without historical proof require fresh content matching."
+        If gRecoveryMergedRows > 0 Or gRecoverySalvagedRows > 0 Then _
+            gRecoveryNote = "PARTIAL_STATE_REBUILT: surviving valid expected hashes retained; missing historical equality remains unproven."
+        MBR_Log "WARNING", "RECOVERY_MSG_ONLY", "", accountRoot, 0, gRecoveryNote
+    End If
+    If gRecoveryOverlayRejected > 0 Then gRecoveryNote = gRecoveryNote & _
+        " Some raw rows could not be proven; immutable originals remain in recovery/overlays."
+    ' A restored or retained old token cannot erase this recovery obligation.
+    MBR_RequireReconcile recoveryRoot, accountRoot, storeId
+End Sub
+
+Private Function MBR_Fingerprint(ByVal files As Object) As String
+    Dim keys As Variant, i As Long, value As String
+    If files Is Nothing Then Exit Function
+    If files.Count = 0 Then Exit Function
+    keys = files.Keys: MBW_SortKeys keys, LBound(keys), UBound(keys)
+    For i = LBound(keys) To UBound(keys)
+        value = value & MB_EncodeFields(Array(LCase$(CStr(keys(i))), CStr(files(keys(i))))) & vbLf
+    Next i
+    MBR_Fingerprint = MBH_HashText(value)
+End Function
+
+Private Function MBR_NextGeneration(ByVal snapshotsDir As String) As String
+    Dim item As Object, candidate As String, number As Double, maximum As Double, i As Long, valid As Boolean
+    For Each item In gFSO.GetFolder(snapshotsDir).Files
+        candidate = CStr(item.Name)
+        If LCase$(Left$(candidate, 9)) = "snapshot_" And Len(candidate) > 22 Then
+            candidate = Mid$(candidate, 10, 12): valid = True
+            For i = 1 To Len(candidate)
+                If Mid$(candidate, i, 1) < "0" Or Mid$(candidate, i, 1) > "9" Then valid = False
+            Next i
+            If valid Then
+                number = MB_ByteCount(candidate)
+                If number > maximum Then maximum = number
+            End If
+        End If
+    Next item
+    If maximum >= 999999999998# Then Err.Raise MB_ERR + 864, , "Recovery generation counter is exhausted."
+    MBR_NextGeneration = Format$(maximum + 1, "000000000000")
+End Function
+
+Private Sub MBR_SaveSnapshot(ByVal accountRoot As String, ByVal storeId As String)
+    Dim recoveryRoot As String, stateDir As String, snapshotsDir As String, manifest As String, stage As String
+    Dim files As Object, chunks As Object, previousFiles As Object, previousChunks As Object, items As Object
+    Dim item As Object, key As Variant, keys As Variant, i As Long, blocks As Collection, block As Variant
+    Dim bytes As Double, digest As String, reason As String, stream As Object, count As Long
+    Dim n As Long, detail As String, previous As String, meta As Variant
+    On Error GoTo Failed
+    ' Caller closes ALL writers and holds the account/root locks until return.
+    If Not gFSO.FileExists(MB_StatePath("journal.tsv")) Then Exit Sub
+    recoveryRoot = MBR_RecoveryRoot(accountRoot, storeId)
+    stateDir = gFSO.GetParentFolderName(MB_StatePath("journal.tsv"))
+    Set files = CreateObject("Scripting.Dictionary"): files.CompareMode = vbTextCompare
+    Set chunks = CreateObject("Scripting.Dictionary"): chunks.CompareMode = vbTextCompare
+    Set items = CreateObject("Scripting.Dictionary"): items.CompareMode = vbTextCompare
+    For Each item In gFSO.GetFolder(stateDir).Files
+        If MBR_IsStateLeaf(CStr(item.Name)) Then items(CStr(item.Name)) = CStr(item.Path)
+    Next item
+    If Not items.Exists("journal.tsv") Then Exit Sub
+    keys = items.Keys: MBW_SortKeys keys, LBound(keys), UBound(keys)
+    For i = LBound(keys) To UBound(keys)
+        key = keys(i)
+        If Not MBR_CheckedStateValid(CStr(items(key)), reason) Then _
+            Err.Raise MB_ERR + 856, , "Invalid primary state is not promoted to recovery: " & CStr(key) & ": " & reason
+        Set blocks = MBR_CaptureState(CStr(items(key)), recoveryRoot, bytes, digest)
+        files.Add CStr(key), MB_EncodeFields(Array(Format$(bytes, "0"), digest, CStr(blocks.Count)))
+        chunks.Add CStr(key), blocks
+    Next i
+    previous = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, previousFiles, previousChunks)
+    If Len(previous) > 0 Then
+        If MBR_Fingerprint(files) = MBR_Fingerprint(previousFiles) Then Exit Sub
+    End If
+    snapshotsDir = MBH_JoinPath(recoveryRoot, "snapshots")
+    MBY_NoReparse snapshotsDir, False
+    MBH_EnsureDirectory snapshotsDir
+    manifest = MBH_JoinPath(snapshotsDir, "snapshot_" & MBR_NextGeneration(snapshotsDir) & "_" & MBC_FileStamp(MBC_UtcNow()) & "_" & _
+                            Left$(MBH_HashText(gRunId & gFSO.GetTempName), 12) & ".tsv")
+    stage = MBH_NewStagePath(manifest)
+    Set stream = gFSO.CreateTextFile(stage, True, True)
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRSNAP1", "HEADER", gRoot, accountRoot, storeId, MBC_UtcStamp(MBC_UtcNow()), gRunId))
+    For i = LBound(keys) To UBound(keys)
+        key = keys(i): Set blocks = chunks(key)
+        meta = MBM_Unpack(CStr(files(key)), 3)
+        MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRSNAP1", "FILE", CStr(key), meta(0), meta(1), meta(2)))
+        For Each block In blocks
+            MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRSNAP1", "CHUNK", CStr(key), block(0), block(1), block(2)))
+            count = count + 1
+        Next block
+    Next i
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBRSNAP1", "END", CStr(files.Count), CStr(count)))
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath stage
+    MBH_CommitStage stage, manifest: stage = ""
+    gRecoverySnapshotsSaved = gRecoverySnapshotsSaved + 1
+    MBR_Log "INFO", "RECOVERY_SNAPSHOT_SAVED", "", manifest, 0, _
+                "Metadata-only immutable chunks; MSG files were neither copied nor changed."
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBR_SaveSnapshot", detail
+End Sub
+
+Private Function MBR_BaselinePath(ByVal accountRoot As String, ByVal storeId As String) As String
+    MBR_BaselinePath = MB_StatePath("baseline_" & Left$(MBH_HashText(MB_EncodeFields(Array(gRoot, accountRoot, storeId))), 32) & ".tsv")
+End Function
+
+Private Sub MBR_LoadBaseline(ByVal accountRoot As String, ByVal storeId As String)
+    Dim path As String, stream As Object, line As String, f As Variant, resolved As String, root As String
+    Dim existing As Variant, n As Long, detail As String
+    On Error GoTo Failed
+    If gRecoveryFiles Is Nothing Then MBR_Reset
+    path = MBR_BaselinePath(accountRoot, storeId)
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            f = MB_ReadCheckedLine(line, 9)
+            If CStr(f(0)) <> "MBBASE1" Or StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+               StrComp(CStr(f(2)), storeId, vbTextCompare) <> 0 Or StrComp(CStr(f(3)), accountRoot, vbTextCompare) <> 0 Or _
+               CStr(f(8)) <> "MSG_ONLY_REBASELINED" Or Not MB_IsHexKey(CStr(f(6))) Or MB_ByteCount(CStr(f(5))) <= 0 Then _
+                Err.Raise MB_ERR + 857, , "Baseline ownership/hash/provenance is invalid."
+            root = MBM_ResolvedRoot(CStr(f(4)), CStr(f(6)), accountRoot)
+            resolved = MBY_CanonicalFilePath(MBM_ResolvePath(CStr(f(4)), CStr(f(6))), root)
+            If gRecoveryFiles.Exists(resolved) Then
+                existing = MBM_Unpack(CStr(gRecoveryFiles(resolved)), 5)
+                If CStr(existing(2)) <> CStr(f(6)) Or MB_ByteCount(CStr(existing(1))) <> MB_ByteCount(CStr(f(5))) Then _
+                    Err.Raise MB_ERR + 858, , "A baseline path has conflicting historical expected bytes."
+            End If
+            gRecoveryFiles(resolved) = MB_EncodeFields(Array(resolved, f(5), f(6), root, f(8)))
+            MBR_AddDigestPath resolved, MB_ByteCount(CStr(f(5))), CStr(f(6)), root
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBR_LoadBaseline", detail
+End Sub
+
+Private Function MBR_CaptureBaseline(ByVal path As String, ByVal accountRoot As String, ByVal storeId As String, _
+                                     ByRef reason As String) As Boolean
+    Dim obj As Object, bytes As Double, digest As String, stream As Object, payload As String, stamp As Date
+    Dim n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    guard = 0
+    On Error GoTo Invalid
+    path = MBY_CanonicalFilePath(path, accountRoot, True)
+    guard = MBH_GuardFile(path)
+    bytes = CDbl(gFSO.GetFile(path).Size)
+    If bytes <= 0 Then Err.Raise MB_ERR + 859, , "MSG-only file is empty."
+    digest = MBH_HashFile(path)
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 860, , "MSG-only file does not reopen as MailItem."
+    stamp = obj.SentOn
+    If MBC_ValidDate(stamp) Then gRecoverySentHints(path) = MBC_FileStamp(stamp)
+    obj.Close olDiscard: Set obj = Nothing
+    If CDbl(gFSO.GetFile(path).Size) <> bytes Or MBH_HashFile(path) <> digest Then _
+        Err.Raise MB_ERR + 861, , "MSG-only file changed during baseline creation."
+    payload = MB_EncodeFields(Array("MBBASE1", gRoot, storeId, accountRoot, path, Format$(bytes, "0"), _
+                              digest, MBC_UtcStamp(MBC_UtcNow()), "MSG_ONLY_REBASELINED"))
+    MBY_NoReparse MBR_BaselinePath(accountRoot, storeId), False
+    Set stream = gFSO.OpenTextFile(MBR_BaselinePath(accountRoot, storeId), 8, True, -1)
+    stream.WriteLine "": MB_WriteCheckedLine stream, payload
+    stream.Close: Set stream = Nothing
+    mbrBaselineWrites = mbrBaselineWrites + 1
+    If mbrBaselineWrites >= MB_JOURNAL_FLUSH_EVERY Then
+        MBM_FlushPath MBR_BaselinePath(accountRoot, storeId)
+        mbrBaselineWrites = 0
+    End If
+    gRecoveryFiles(path) = MB_EncodeFields(Array(path, Format$(bytes, "0"), digest, accountRoot, "MSG_ONLY_REBASELINED"))
+    MBR_AddDigestPath path, bytes, digest, accountRoot
+    MBH_CloseGuard guard
+    gRecoveryNewBaselines = gRecoveryNewBaselines + 1
+    MBR_CaptureBaseline = True
+    Exit Function
+Invalid:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not obj Is Nothing Then obj.Close olDiscard
+    If Not stream Is Nothing Then stream.Close
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    reason = "Error " & CStr(n) & ": " & detail
+End Function
+
+Private Sub MBR_AddDigestPath(ByVal path As String, ByVal bytes As Double, ByVal digest As String, ByVal accountRoot As String)
+    Dim key As String, paths As Collection, oldPath As String, candidate As Variant
+    If mbrDigestFiles Is Nothing Then
+        Set mbrDigestFiles = CreateObject("Scripting.Dictionary")
+        mbrDigestFiles.CompareMode = vbBinaryCompare
+    End If
+    key = LCase$(MBH_NormalizePath(accountRoot)) & "|" & digest & "|" & Format$(bytes, "0")
+    path = MBH_NormalizePath(path)
+    If mbrDigestFiles.Exists(key) Then
+        If IsObject(mbrDigestFiles(key)) Then
+            Set paths = mbrDigestFiles(key)
+            For Each candidate In paths
+                If StrComp(CStr(candidate), path, vbTextCompare) = 0 Then Exit Sub
+            Next candidate
+            paths.Add path
+        Else
+            oldPath = CStr(mbrDigestFiles(key))
+            If StrComp(oldPath, path, vbTextCompare) = 0 Then Exit Sub
+            Set paths = New Collection
+            paths.Add oldPath: paths.Add path
+            mbrDigestFiles.Remove key
+            mbrDigestFiles.Add key, paths
+        End If
+    Else
+        ' One string per ordinary unique hash; allocate a collection only when
+        ' a second distinct path has the same expected bytes. Avoid 100k COM maps.
+        mbrDigestFiles.Add key, path
+    End If
+End Sub
+
+Private Function MBR_FindExpectedFile(ByVal digest As String, ByVal bytes As Double, ByVal accountRoot As String) As String
+    Dim key As String, paths As Collection, candidate As Variant, chosen As String, count As Long
+    If mbrDigestFiles Is Nothing Then Exit Function
+    If Not MB_IsHexKey(digest) Or bytes <= 0 Then Exit Function
+    key = LCase$(MBH_NormalizePath(accountRoot)) & "|" & digest & "|" & Format$(bytes, "0")
+    If Not mbrDigestFiles.Exists(key) Then Exit Function
+    If IsObject(mbrDigestFiles(key)) Then
+        Set paths = mbrDigestFiles(key)
+    Else
+        Set paths = New Collection
+        paths.Add CStr(mbrDigestFiles(key))
+    End If
+    For Each candidate In paths
+        If gFSO.FileExists(CStr(candidate)) Then
+            MBY_CanonicalFilePath CStr(candidate), accountRoot, True
+            If CDbl(gFSO.GetFile(CStr(candidate)).Size) = bytes Then
+                If MBH_HashFile(CStr(candidate)) = digest Then
+                    chosen = CStr(candidate): count = count + 1
+                    If count > 1 Then Exit Function
+                End If
+            End If
+        End If
+    Next candidate
+    If count = 1 Then MBR_FindExpectedFile = chosen
+End Function
+
+Private Sub MBR_MergeStageProof(ByVal accountRoot As String)
+    Dim key As Variant, f As Variant, existing As Variant, root As String, path As String
+    If gStageExpected Is Nothing Then Exit Sub
+    For Each key In gStageExpected.Keys
+        f = MBM_Unpack(CStr(gStageExpected(key)), 5)
+        If CStr(f(4)) = "VERIFIED_PUBLICATION" And LCase$(Right$(CStr(f(0)), 4)) = ".msg" Then
+            root = MBM_ResolvedRoot(CStr(f(0)), CStr(f(2)), CStr(f(3)))
+            path = MBY_CanonicalFilePath(MBM_ResolvePath(CStr(f(0)), CStr(f(2))), root)
+            If StrComp(root, accountRoot, vbTextCompare) = 0 Then
+                If gRecoveryFiles.Exists(path) Then
+                    existing = MBM_Unpack(CStr(gRecoveryFiles(path)), 5)
+                    If CStr(existing(2)) <> CStr(f(2)) Or MB_ByteCount(CStr(existing(1))) <> MB_ByteCount(CStr(f(1))) Then
+                        gRecoveryReviewCount = gRecoveryReviewCount + 1
+                        MBR_Log "WARNING", "RECOVERY_EXPECTED_PROOF_CONFLICT", "", path, 0, _
+                            "Prior baseline and verified publication disagree; neither is silently overwritten."
+                    Else
+                        gRecoveryFiles(path) = MB_EncodeFields(Array(path, f(1), f(2), root, "VERIFIED_PUBLICATION"))
+                    End If
+                Else
+                    gRecoveryFiles(path) = MB_EncodeFields(Array(path, f(1), f(2), root, "VERIFIED_PUBLICATION"))
+                End If
+                MBR_AddDigestPath path, MB_ByteCount(CStr(f(1))), CStr(f(2)), root
+            End If
+        End If
+    Next key
+End Sub
+
+Private Sub MBR_BuildBaseline(ByVal accountRoot As String, ByVal storeId As String)
+    Dim pending As New Collection, known As Object, folder As Object, child As Object, item As Object
+    Dim key As Variant, fields As Variant, path As String, current As String, reason As String
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    If gRecoveryFiles Is Nothing Then MBR_Reset
+    MBR_LoadBaseline accountRoot, storeId
+    MBR_MergeStageProof accountRoot
+    Set known = CreateObject("Scripting.Dictionary"): known.CompareMode = vbTextCompare
+    For Each key In gIndex.Keys
+        fields = MB_IndexFields(CStr(key))
+        known(MBX_IndexedPath(CStr(key), fields)) = True
+    Next key
+    pending.Add accountRoot
+    Do While pending.Count > 0
+        If Not MB_ContinueWork() Then GoTo Finish
+        current = CStr(pending(pending.Count)): pending.Remove pending.Count
+        MBY_NoReparse current, True
+        If Not MBR_IsRecoveryDirectory(current) And Not MB_PathWithin(current, gRoot) Then
+            Set folder = gFSO.GetFolder(current)
+            For Each item In folder.Files
+                If Not MB_ContinueWork() Then GoTo Finish
+                If LCase$(gFSO.GetExtensionName(CStr(item.Name))) = "msg" Then
+                    path = MBH_NormalizePath(CStr(item.Path))
+                    If Not known.Exists(path) And Not gRecoveryFiles.Exists(path) Then
+                        If Not MBR_CaptureBaseline(path, accountRoot, storeId, reason) Then
+                            gRecoveryReviewCount = gRecoveryReviewCount + 1
+                            MBR_Log "WARNING", "RECOVERY_BASELINE_REVIEW", "", path, 0, reason
+                        End If
+                    End If
+                End If
+            Next item
+            For Each child In folder.SubFolders
+                If (CLng(child.Attributes) And 1024) <> 0 Then _
+                    Err.Raise MB_ERR + 862, , "Recovery inventory cannot traverse a reparse folder."
+                pending.Add CStr(child.Path)
+            Next child
+        End If
+    Loop
+Finish:
+    If gFSO.FileExists(MBR_BaselinePath(accountRoot, storeId)) Then
+        MBM_FlushPath MBR_BaselinePath(accountRoot, storeId)
+        mbrBaselineWrites = 0
+    End If
+    If gRecoveryNewBaselines > 0 Then
+        MBR_Log "WARNING", "RECOVERY_NEW_BASELINE", "", accountRoot, 0, _
+            "Newly readable MSG baselines=" & CStr(gRecoveryNewBaselines) & _
+            "; no statement about equality to deleted historical hashes."
+    End If
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If gFSO.FileExists(MBR_BaselinePath(accountRoot, storeId)) Then MBM_FlushPath MBR_BaselinePath(accountRoot, storeId)
+    On Error GoTo 0
+    Err.Raise n, "MBR_BuildBaseline", detail
+End Sub

@@ -1,0 +1,569 @@
+' ---------- One exclusive OS lock per backup output root ----------
+
+Public Sub MBH_AcquireRunLock(ByVal path As String)
+    ' OPEN_ALWAYS preserves an existing lock file. The open handle, not file
+    ' existence, is the lock. A process crash releases the OS handle.
+    Dim lastError As Long
+#If VBA7 Then
+    Dim fileHandle As LongPtr
+#Else
+    Dim fileHandle As Long
+#End If
+    If MBH_RunLock <> 0 Then MBH_Fail "AcquireRunLock", "This VBA session already owns a run lock."
+    path = MBH_NormalizePath(path)
+    fileHandle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ Or MBH_GENERIC_WRITE, 0, 0, _
+                                MBH_OPEN_ALWAYS, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If fileHandle = -1 Then
+        lastError = Err.LastDllError
+        MBH_Fail "AcquireRunLock", "Cannot acquire exclusive run lock; Win32=" & CStr(lastError) & "; path=" & path
+    End If
+    MBH_RunLock = fileHandle
+End Sub
+
+Public Sub MBH_ReleaseRunLock()
+    ' Keep the lock file; deleting it after closing would introduce a race.
+    Dim lastError As Long
+    If MBH_RunLock <> 0 Then
+        If MBH_CloseHandle(MBH_RunLock) = 0 Then
+            lastError = Err.LastDllError
+            MBH_Fail "ReleaseRunLock", "Cannot release run lock; Win32=" & CStr(lastError)
+        End If
+        MBH_RunLock = 0
+    End If
+End Sub
+
+' ---------- SHA-256: real CNG hashes; text = UTF-16LE without BOM ----------
+
+Private Sub MBH_CheckStatus(ByVal status As Long, ByVal operation As String)
+    If status < 0 Then
+        Err.Raise MBH_ERR_BASE + 1, "MailBackup.Helpers." & operation, _
+                  "Windows CNG failed: NTSTATUS 0x" & Right$("00000000" & Hex$(status), 8)
+    End If
+End Sub
+
+Private Sub MBH_Fail(ByVal operation As String, ByVal description As String)
+    Err.Raise MBH_ERR_BASE + 2, "MailBackup.Helpers." & operation, description
+End Sub
+
+Private Sub MBH_HashOpen(ByRef context As MBH_HashContext)
+    Dim algorithmName As String
+    algorithmName = "SHA256"
+    If MBH_Algorithm = 0 Then
+        MBH_CheckStatus MBH_BCryptOpenAlgorithmProvider(MBH_Algorithm, StrPtr(algorithmName), 0, 0), "OpenSHA256"
+    End If
+    ' CNG allocates the object and releases its memory in BCryptDestroyHash.
+    MBH_CheckStatus MBH_BCryptCreateHash(MBH_Algorithm, context.Handle, 0, 0, 0, 0, 0), "CreateSHA256"
+    MBH_OpenHashes = MBH_OpenHashes + 1
+End Sub
+
+Private Sub MBH_HashClose(ByRef context As MBH_HashContext)
+    Dim status As Long
+    If context.Handle <> 0 Then
+        status = MBH_BCryptDestroyHash(context.Handle)
+        MBH_CheckStatus status, "DestroySHA256"
+        context.Handle = 0
+        MBH_OpenHashes = MBH_OpenHashes - 1
+    End If
+End Sub
+
+Public Sub MBH_ReleaseCrypto()
+    ' Call once from the run's final cleanup, after all hash calls have returned.
+    If MBH_OpenHashes <> 0 Then MBH_Fail "ReleaseCrypto", "Hash objects are still active."
+    If MBH_Algorithm <> 0 Then
+        MBH_CheckStatus MBH_BCryptCloseAlgorithmProvider(MBH_Algorithm, 0), "CloseSHA256"
+        MBH_Algorithm = 0
+    End If
+    Set MBH_FileSystemCache = Nothing
+    Set MBH_NormalizedPaths = Nothing
+End Sub
+
+Private Function MBH_HashFinish(ByRef context As MBH_HashContext) As String
+    Dim digest(0 To 31) As Byte
+    Dim i As Long, result As String
+    MBH_CheckStatus MBH_BCryptFinishHash(context.Handle, VarPtr(digest(0)), 32, 0), "FinishSHA256"
+    For i = 0 To 31
+        result = result & Right$("0" & Hex$(digest(i)), 2)
+    Next i
+    MBH_HashFinish = LCase$(result)
+End Function
+
+Public Function MBH_HashText(ByVal value As String) As String
+    ' SHA-256 of the exact Windows BSTR payload: UTF-16LE, no BOM or terminator.
+    ' Do not compare this to the hash of UTF-8/ASCII text with the same letters.
+    Dim context As MBH_HashContext
+    Dim errorNumber As Long, errorSource As String, errorDescription As String
+    On Error GoTo Failed
+    MBH_HashOpen context
+    If LenB(value) > 0 Then
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, StrPtr(value), LenB(value), 0), "HashText"
+    End If
+    MBH_HashText = MBH_HashFinish(context)
+    MBH_HashClose context
+    Exit Function
+Failed:
+    errorNumber = Err.Number: errorSource = Err.Source: errorDescription = Err.Description
+    On Error Resume Next
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise errorNumber, errorSource, errorDescription
+End Function
+
+Public Function MBH_HashFile(ByVal path As String) As String
+    ' Streams the file bytes, not Outlook properties or a metadata approximation.
+    ' ReadFile avoids VBA LOF/Get's signed-Long size/offset limitation.
+    Dim context As MBH_HashContext
+    Dim buffer(0 To 65535) As Byte
+    Dim bytesRead As Long, lastError As Long, closeResult As Long
+    Dim errorNumber As Long, errorSource As String, errorDescription As String
+#If VBA7 Then
+    Dim fileHandle As LongPtr
+#Else
+    Dim fileHandle As Long
+#End If
+    fileHandle = -1
+    On Error GoTo Failed
+    path = MBH_NormalizePath(path)
+    MBH_HashOpen context
+    ' Deny write/delete while hashing; concurrent read handles remain allowed.
+    fileHandle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                                 MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL Or MBH_FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    If fileHandle = -1 Then
+        lastError = Err.LastDllError
+        MBH_Fail "HashFile", "Cannot open file; Win32=" & CStr(lastError) & "; path=" & path
+    End If
+    Do
+        If MBH_ReadFile(fileHandle, buffer(0), 65536, bytesRead, 0) = 0 Then
+            lastError = Err.LastDllError
+            MBH_Fail "HashFile", "Cannot read file; Win32=" & CStr(lastError) & "; path=" & path
+        End If
+        If bytesRead = 0 Then Exit Do
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), bytesRead, 0), "HashFileData"
+    Loop
+    MBH_HashFile = MBH_HashFinish(context)
+    closeResult = MBH_CloseHandle(fileHandle)
+    lastError = Err.LastDllError
+    If closeResult = 0 Then MBH_Fail "HashFile", "Cannot close file; Win32=" & CStr(lastError)
+    fileHandle = -1
+    MBH_HashClose context
+    Exit Function
+Failed:
+    errorNumber = Err.Number: errorSource = Err.Source: errorDescription = Err.Description
+    On Error Resume Next
+    If fileHandle <> -1 Then closeResult = MBH_CloseHandle(fileHandle)
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise errorNumber, errorSource, errorDescription
+End Function
+
+' A held read handle permits readers but denies all write/delete handles. Use
+' this around final content verification and the corresponding journal commit.
+#If VBA7 Then
+Private Function MBH_GuardFile(ByVal path As String) As LongPtr
+    Dim handle As LongPtr
+#Else
+Private Function MBH_GuardFile(ByVal path As String) As Long
+    Dim handle As Long
+#End If
+    Dim winError As Long
+    path = MBH_NormalizePath(path)
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        MBH_Fail "GuardFile", "Cannot protect final file verification; Win32=" & CStr(winError) & "; path=" & path
+    End If
+    MBH_GuardFile = handle
+End Function
+
+#If VBA7 Then
+Private Sub MBH_CloseGuard(ByRef handle As LongPtr)
+#Else
+Private Sub MBH_CloseGuard(ByRef handle As Long)
+#End If
+    Dim winError As Long, detail As String
+    If handle = 0 Then Exit Sub
+    If MBH_CloseHandle(handle) = 0 Then
+        winError = Err.LastDllError
+        detail = "Cannot close verification guard; Win32=" & CStr(winError)
+        ' Cleanup callers may suppress a second close exception. Persist the
+        ' failure as run-level state so coverage cannot advance nevertheless.
+        gCleanupIssue = gCleanupIssue & " Verification guard: " & detail
+        gFatal = True
+        If Len(gFatalText) > 0 Then gFatalText = gFatalText & " | "
+        gFatalText = gFatalText & detail
+        MBH_Fail "CloseGuard", detail
+    End If
+    handle = 0
+End Sub
+
+' ---------- Safe Windows path components ----------
+
+Private Function MBH_FileSystem() As Object
+    ' Reuse the late-bound COM service; do not cache filesystem query results.
+    If MBH_FileSystemCache Is Nothing Then
+        Set MBH_FileSystemCache = CreateObject("Scripting.FileSystemObject")
+    End If
+    Set MBH_FileSystem = MBH_FileSystemCache
+End Function
+
+Private Function MBH_Unit(ByVal text As String, ByVal position As Long) As Long
+    MBH_Unit = CLng(AscW(Mid$(text, position, 1))) And &HFFFF&
+End Function
+
+Public Function MBH_LeftUtf16(ByVal text As String, ByVal maximumUnits As Long) As String
+    ' Len/Left count UTF-16 units. Never leave a high surrogate at the cut.
+    Dim lastUnit As Long
+    If maximumUnits < 0 Then MBH_Fail "LeftUtf16", "maximumUnits must not be negative."
+    If Len(text) <= maximumUnits Then
+        MBH_LeftUtf16 = text
+    ElseIf maximumUnits > 0 Then
+        lastUnit = MBH_Unit(text, maximumUnits)
+        If lastUnit >= &HD800& And lastUnit <= &HDBFF& Then maximumUnits = maximumUnits - 1
+        MBH_LeftUtf16 = Left$(text, maximumUnits)
+    End If
+End Function
+
+Private Function MBH_TrimEndDotsSpaces(ByVal value As String) As String
+    Do While Len(value) > 0
+        If Right$(value, 1) <> " " And Right$(value, 1) <> "." Then Exit Do
+        value = Left$(value, Len(value) - 1)
+    Loop
+    MBH_TrimEndDotsSpaces = value
+End Function
+
+Private Function MBH_IsReservedName(ByVal value As String) As Boolean
+    Dim stem As String, dotAt As Long, tail As String
+    stem = UCase$(value)
+    dotAt = InStr(1, stem, ".", vbBinaryCompare)
+    If dotAt > 0 Then stem = Left$(stem, dotAt - 1)
+    stem = MBH_TrimEndDotsSpaces(stem)
+    Select Case stem
+        Case "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"
+            MBH_IsReservedName = True
+            Exit Function
+    End Select
+    If Len(stem) = 4 Then
+        If Left$(stem, 3) = "COM" Or Left$(stem, 3) = "LPT" Then
+            tail = Right$(stem, 1)
+            If (tail >= "1" And tail <= "9") Or tail = ChrW$(&HB9) Or _
+               tail = ChrW$(&HB2) Or tail = ChrW$(&HB3) Then MBH_IsReservedName = True
+        End If
+    End If
+End Function
+
+Public Function MBH_SafeComponent(ByVal raw As String, Optional ByVal maximumUnits As Long = 120, _
+                                  Optional ByVal fallback As String = "unnamed") As String
+    Dim i As Long, code As Long, nextCode As Long
+    Dim one As String, result As String
+    If maximumUnits < 1 Or maximumUnits > 255 Then MBH_Fail "SafeComponent", "maximumUnits must be 1..255."
+    i = 1
+    Do While i <= Len(raw)
+        code = MBH_Unit(raw, i)
+        one = Mid$(raw, i, 1)
+        If code >= &HD800& And code <= &HDBFF& Then
+            If i < Len(raw) Then
+                nextCode = MBH_Unit(raw, i + 1)
+                If nextCode >= &HDC00& And nextCode <= &HDFFF& Then
+                    result = result & Mid$(raw, i, 2)
+                    i = i + 2
+                Else
+                    result = result & "_": i = i + 1
+                End If
+            Else
+                result = result & "_": i = i + 1
+            End If
+        ElseIf (code >= &HDC00& And code <= &HDFFF&) Or code < 32 Or _
+               InStr(1, "<>:""/\|?*", one, vbBinaryCompare) > 0 Then
+            result = result & "_": i = i + 1
+        Else
+            result = result & one: i = i + 1
+        End If
+    Loop
+    result = MBH_TrimEndDotsSpaces(Trim$(result))
+    If Len(result) = 0 Then
+        If raw = fallback Or Len(fallback) = 0 Then
+            result = "unnamed"
+        Else
+            result = MBH_SafeComponent(fallback, maximumUnits, vbNullString)
+        End If
+    End If
+    result = MBH_TrimEndDotsSpaces(MBH_LeftUtf16(result, maximumUnits))
+    If Len(result) = 0 Then result = MBH_LeftUtf16("unnamed", maximumUnits)
+    ' Recheck after truncation: truncating e.g. CONX to 3 units creates CON.
+    If MBH_IsReservedName(result) Then
+        result = "_" & MBH_LeftUtf16(result, maximumUnits - 1)
+    End If
+    MBH_SafeComponent = result
+End Function
+
+Public Function MBH_NormalizePath(ByVal path As String) As String
+    Dim fso As Object, value As String, relative As String
+    Dim parts As Variant, item As Variant, driveLetter As String, cacheKey As String
+    value = Replace(path, "/", "\")
+    cacheKey = value
+    If MBH_NormalizedPaths Is Nothing Then
+        Set MBH_NormalizedPaths = CreateObject("Scripting.Dictionary")
+        MBH_NormalizedPaths.CompareMode = vbBinaryCompare
+    End If
+    ' Only lexical normalization of absolute paths is cached. File existence,
+    ' reparse attributes, hashes, permissions and account ownership are NEVER cached here.
+    If MBH_NormalizedPaths.Exists(cacheKey) Then
+        MBH_PathCacheHits = MBH_PathCacheHits + 1
+        MBH_NormalizePath = CStr(MBH_NormalizedPaths(cacheKey))
+        Exit Function
+    End If
+    MBH_PathCacheMisses = MBH_PathCacheMisses + 1
+    If Len(value) = 0 Then MBH_Fail "NormalizePath", "An absolute path is required."
+    If Left$(value, 4) = "\\?\" Or Left$(value, 4) = "\\.\" Then _
+        MBH_Fail "NormalizePath", "Device/extended path namespaces are not supported."
+    If Left$(value, 2) = "\\" Then
+        parts = Split(Mid$(value, 3), "\")
+        If UBound(parts) < 1 Then MBH_Fail "NormalizePath", "UNC server and share are required."
+        If Len(parts(0)) = 0 Or Len(parts(1)) = 0 Then MBH_Fail "NormalizePath", "Invalid UNC root."
+    Else
+        If Len(value) < 3 Then MBH_Fail "NormalizePath", "An absolute drive path is required."
+        driveLetter = UCase$(Left$(value, 1))
+        If Mid$(value, 2, 2) <> ":\" Or driveLetter < "A" Or driveLetter > "Z" Then _
+            MBH_Fail "NormalizePath", "An absolute drive or UNC path is required."
+    End If
+    Set fso = MBH_FileSystem()
+    value = fso.GetAbsolutePathName(value)
+    Do While Len(value) > 3 And Right$(value, 1) = "\"
+        value = Left$(value, Len(value) - 1)
+    Loop
+    If Len(value) > MBH_MAX_PATH_UNITS Then _
+        MBH_Fail "NormalizePath", "Path exceeds conservative limit " & CStr(MBH_MAX_PATH_UNITS) & ": " & value
+    If Left$(value, 2) = "\\" Then
+        relative = Mid$(value, 3)
+    Else
+        relative = Mid$(value, 4)
+    End If
+    If Len(relative) > 0 Then
+        parts = Split(relative, "\")
+        For Each item In parts
+            If Len(CStr(item)) = 0 Then MBH_Fail "NormalizePath", "Empty path component."
+            If StrComp(MBH_SafeComponent(CStr(item), 255), CStr(item), vbBinaryCompare) <> 0 Then _
+                MBH_Fail "NormalizePath", "Unsafe path component: " & CStr(item)
+        Next item
+    End If
+    If MBH_NormalizedPaths.Count >= 512 Then MBH_NormalizedPaths.RemoveAll
+    MBH_NormalizedPaths(cacheKey) = value
+    MBH_NormalizePath = value
+End Function
+
+Public Function MBH_JoinPath(ByVal basePath As String, ByVal leaf As String) As String
+    basePath = MBH_NormalizePath(basePath)
+    If Len(leaf) = 0 Or leaf = "." Or leaf = ".." Then MBH_Fail "JoinPath", "A filename or directory name is required."
+    If InStr(leaf, "\") > 0 Or InStr(leaf, "/") > 0 Or InStr(leaf, ":") > 0 Then _
+        MBH_Fail "JoinPath", "leaf must be one path component."
+    If StrComp(MBH_SafeComponent(leaf, 255), leaf, vbBinaryCompare) <> 0 Then _
+        MBH_Fail "JoinPath", "leaf is not a safe Windows component."
+    If Right$(basePath, 1) <> "\" Then basePath = basePath & "\"
+    MBH_JoinPath = MBH_NormalizePath(basePath & leaf)
+End Function
+
+Public Sub MBH_EnsureDirectory(ByVal path As String)
+    Dim fso As Object, parentPath As String
+    path = MBH_NormalizePath(path)
+    Set fso = MBH_FileSystem()
+    If fso.FolderExists(path) Then Exit Sub
+    If fso.FileExists(path) Then MBH_Fail "EnsureDirectory", "A file occupies the directory path: " & path
+    parentPath = fso.GetParentFolderName(path)
+    If Len(parentPath) = 0 Or StrComp(parentPath, path, vbTextCompare) = 0 Then _
+        MBH_Fail "EnsureDirectory", "Drive/share root is unavailable: " & path
+    MBH_EnsureDirectory parentPath
+    fso.CreateFolder path
+End Sub
+
+' ---------- Reserved stage files and no-overwrite commit ----------
+
+Private Sub MBH_EnsureStageRegistry()
+    If MBH_Stages Is Nothing Then
+        Set MBH_Stages = CreateObject("Scripting.Dictionary")
+        MBH_Stages.CompareMode = vbTextCompare
+    End If
+End Sub
+
+Public Function MBH_NewStagePath(ByVal finalPath As String) As String
+    ' Creates/reserves an EMPTY file with CREATE_NEW. Caller writes over this
+    ' owned stage only. Its extension is kept for Outlook OpenSharedItem.
+    Dim fso As Object, parentPath As String, extension As String
+    Dim candidate As String, attempt As Long, lastError As Long, closeResult As Long
+    Dim reservedHere As Boolean, registeredHere As Boolean, persistenceAttempted As Boolean
+    Dim errorNumber As Long, errorSource As String, errorDescription As String
+#If VBA7 Then
+    Dim fileHandle As LongPtr
+#Else
+    Dim fileHandle As Long
+#End If
+    fileHandle = -1
+    On Error GoTo Failed
+    finalPath = MBH_NormalizePath(finalPath)
+    Set fso = MBH_FileSystem()
+    parentPath = fso.GetParentFolderName(finalPath)
+    If Not fso.FolderExists(parentPath) Then MBH_Fail "NewStagePath", "Parent directory does not exist."
+    extension = fso.GetExtensionName(finalPath)
+    If Len(extension) > 0 Then extension = "." & extension
+    MBH_EnsureStageRegistry
+    For attempt = 1 To 64
+        candidate = MBH_JoinPath(parentPath, "~mb_" & fso.GetBaseName(fso.GetTempName) & extension)
+        If Not MBH_Stages.Exists(candidate) Then
+            fileHandle = MBH_CreateFileW(StrPtr(candidate), MBH_GENERIC_WRITE, 0, 0, MBH_CREATE_NEW, MBH_FILE_ATTRIBUTE_NORMAL, 0)
+            If fileHandle <> -1 Then
+                reservedHere = True
+                ' Track ownership before closing so failure cleanup remains safe.
+                MBH_Stages.Add candidate, finalPath
+                registeredHere = True
+                closeResult = MBH_CloseHandle(fileHandle)
+                lastError = Err.LastDllError
+                If closeResult = 0 Then MBH_Fail "NewStagePath", "Cannot close stage; Win32=" & CStr(lastError)
+                fileHandle = -1
+                ' Reserve is durable before the caller may start SaveAs/write.
+                ' A persistence failure preserves this stage for recovery.
+                persistenceAttempted = True
+                MBS_StageReserve candidate, finalPath
+                MBH_NewStagePath = candidate
+                Exit Function
+            End If
+            lastError = Err.LastDllError
+            If lastError <> MBH_ERROR_FILE_EXISTS And lastError <> MBH_ERROR_ALREADY_EXISTS Then _
+                MBH_Fail "NewStagePath", "Cannot reserve stage; Win32=" & CStr(lastError) & "; path=" & candidate
+        End If
+    Next attempt
+    MBH_Fail "NewStagePath", "Could not reserve a unique stage name after 64 attempts."
+Failed:
+    errorNumber = Err.Number: errorSource = Err.Source: errorDescription = Err.Description
+    On Error Resume Next
+    If fileHandle <> -1 Then closeResult = MBH_CloseHandle(fileHandle)
+    If registeredHere And Not persistenceAttempted Then
+        MBH_DeleteStage candidate
+    ElseIf reservedHere And Not persistenceAttempted Then
+        ' This invocation created this file but registration failed.
+        closeResult = MBH_DeleteFileW(StrPtr(candidate))
+    End If
+    On Error GoTo 0
+    Err.Raise errorNumber, errorSource, errorDescription
+End Function
+
+Public Sub MBH_CommitStage(ByVal stagePath As String, ByVal finalPath As String, _
+                           Optional ByVal expectedDigest As String = "", _
+                           Optional ByVal expectedBytes As Double = -1)
+    ' Data is flushed before publication; publication is same-directory,
+    ' WRITE_THROUGH and never REPLACE_EXISTING/COPY_ALLOWED. The published file
+    ' is flushed and checked again before this function can report success.
+    ' Hardware/filesystem durability still requires Windows execution testing.
+    Dim fso As Object, lastError As Long, actualDigest As String, actualBytes As Double
+    Dim errorNumber As Long, errorSource As String, errorDescription As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    stagePath = MBH_NormalizePath(stagePath)
+    finalPath = MBH_NormalizePath(finalPath)
+    MBH_EnsureStageRegistry
+    If Not MBH_Stages.Exists(stagePath) Then MBH_Fail "CommitStage", "Stage is not owned by this session."
+    If StrComp(CStr(MBH_Stages(stagePath)), finalPath, vbTextCompare) <> 0 Then _
+        MBH_Fail "CommitStage", "The final path differs from the stage reservation."
+    Set fso = MBH_FileSystem()
+    If StrComp(fso.GetParentFolderName(stagePath), fso.GetParentFolderName(finalPath), vbTextCompare) <> 0 Then _
+        MBH_Fail "CommitStage", "Stage and final must be in the same directory."
+    If Not fso.FileExists(stagePath) Then MBH_Fail "CommitStage", "Stage file is missing."
+    If fso.FileExists(finalPath) Or fso.FolderExists(finalPath) Then _
+        MBH_Fail "CommitStage", "Destination already exists; overwrite refused: " & finalPath
+    If Len(expectedDigest) > 0 Then
+        If Not MB_IsHexKey(expectedDigest) Then MBH_Fail "CommitStage", "Invalid expected file digest."
+    End If
+    If expectedBytes < -1 Then MBH_Fail "CommitStage", "Invalid expected file size."
+    ' These are newly created, owned files; old/read-only legacy MSGs are never
+    ' opened for write or flushed merely to adopt them.
+    MBM_FlushPath stagePath
+    guard = MBH_GuardFile(stagePath)
+    actualDigest = MBH_HashFile(stagePath)
+    actualBytes = CDbl(fso.GetFile(stagePath).Size)
+    If Len(expectedDigest) = 0 Then expectedDigest = actualDigest
+    If expectedBytes = -1 Then expectedBytes = actualBytes
+    If actualDigest <> expectedDigest Or actualBytes <> expectedBytes Then _
+        MBH_Fail "CommitStage", "Stage changed after its content verification."
+    ' Persist verified expectations before rename, while the stage cannot be
+    ' changed. Release the read guard only because rename requires delete access.
+    MBS_StagePrepared stagePath, finalPath, expectedDigest, expectedBytes
+    MBH_CloseGuard guard
+    If MBM_MoveFileExW(StrPtr(stagePath), StrPtr(finalPath), 8) = 0 Then
+        lastError = Err.LastDllError
+        MBH_Fail "CommitStage", "Rename failed; Win32=" & CStr(lastError) & "; path=" & finalPath
+    End If
+    ' A published final is never a deletable stage, even if the following flush,
+    ' verification or durable ledger update fails. Recovery retains PREPARED.
+    MBH_Stages.Remove stagePath
+    MBM_FlushPath finalPath
+    guard = MBH_GuardFile(finalPath)
+    actualDigest = MBH_HashFile(finalPath)
+    actualBytes = CDbl(fso.GetFile(finalPath).Size)
+    If actualDigest <> expectedDigest Or actualBytes <> expectedBytes Then _
+        MBH_Fail "CommitStage", "Published file differs from the verified stage."
+    MBS_StagePublished stagePath, finalPath, actualDigest, actualBytes
+    MBH_CloseGuard guard
+    Exit Sub
+Failed:
+    errorNumber = Err.Number: errorSource = Err.Source: errorDescription = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise errorNumber, errorSource, errorDescription
+End Sub
+
+Public Sub MBH_DeleteStage(ByVal stagePath As String)
+    ' Only files registered by NewStagePath in this VBA session may be removed.
+    Dim fso As Object, lastError As Long
+    stagePath = MBH_NormalizePath(stagePath)
+    MBH_EnsureStageRegistry
+    If Not MBH_Stages.Exists(stagePath) Then MBH_Fail "DeleteStage", "Stage is not owned by this session."
+    Set fso = MBH_FileSystem()
+    If fso.FileExists(stagePath) Then
+        If MBH_DeleteFileW(StrPtr(stagePath)) = 0 Then
+            lastError = Err.LastDllError
+            MBH_Fail "DeleteStage", "Cannot remove stage; Win32=" & CStr(lastError)
+        End If
+    End If
+    MBH_Stages.Remove stagePath
+    MBS_StageAborted stagePath
+End Sub
+
+' ---------- Manually runnable Windows self-test (not run in Linux) ----------
+
+Public Function MBH_HashSelfTest() As Boolean
+    Const EMPTY_SHA As String = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    Const UTF16_ABC_SHA As String = "13e228567e8249fce53337f25d7970de3bd68ab2653424c7b8f9fd05e33caedf"
+    Const ASCII_ABC_SHA As String = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    Dim fso As Object, stagePath As String, finalPath As String
+    Dim bytes(0 To 2) As Byte, fileNumber As Integer, fileIsOpen As Boolean
+    Dim errorNumber As Long, errorSource As String, errorDescription As String
+    On Error GoTo Failed
+    If MBH_HashText(vbNullString) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty UTF-16 hash mismatch."
+    If MBH_HashText("abc") <> UTF16_ABC_SHA Then MBH_Fail "HashSelfTest", "UTF-16 abc hash mismatch."
+    Set fso = MBH_FileSystem()
+    finalPath = MBH_JoinPath(CStr(fso.GetSpecialFolder(2).Path), "mailbackup_hash_selftest.bin")
+    stagePath = MBH_NewStagePath(finalPath)
+    If MBH_HashFile(stagePath) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty file hash mismatch."
+    bytes(0) = 97: bytes(1) = 98: bytes(2) = 99
+    fileNumber = FreeFile
+    Open stagePath For Binary Access Write Lock Read Write As #fileNumber
+    fileIsOpen = True
+    Put #fileNumber, 1, bytes
+    Close #fileNumber
+    fileIsOpen = False
+    If MBH_HashFile(stagePath) <> ASCII_ABC_SHA Then MBH_Fail "HashSelfTest", "ASCII abc file hash mismatch."
+    MBH_DeleteStage stagePath
+    stagePath = vbNullString
+    MBH_HashSelfTest = True
+    Exit Function
+Failed:
+    errorNumber = Err.Number: errorSource = Err.Source: errorDescription = Err.Description
+    On Error Resume Next
+    If fileIsOpen Then Close #fileNumber
+    If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
+    On Error GoTo 0
+    Err.Raise errorNumber, errorSource, errorDescription
+End Function

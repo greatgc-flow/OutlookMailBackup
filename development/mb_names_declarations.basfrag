@@ -1,0 +1,5 @@
+' Search-friendly names for NEW MSG files only. Existing paths remain indexed.
+' Keep the original timestamp_sender_subject ordering and sender width.
+Private Const MBN_SENDER_UNITS As Long = 10
+Private Const MBN_COLLISION_RESERVE As Long = 8
+

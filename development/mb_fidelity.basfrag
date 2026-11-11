@@ -1,0 +1,212 @@
+' =================== Bounded ordinary metadata fidelity ====================
+' Importance, Sensitivity and category NAME membership are stable comparison
+' fields. Compare the documented PT_MV_UNICODE Keywords property, rather than
+' splitting Categories on a guessed locale separator or trimming category names.
+' Commas, semicolons, Unicode, case and significant spaces remain exact names.
+' UserProperties are explicitly outside this comparator: any nonzero collection
+' makes a new MSG BASIC/limited, and prevents an equal-content legacy/R alias.
+' Flags/tasks/reminders and arbitrary MAPI properties remain outside this scope.
+
+Private Function MBE_CategorySet(ByVal value As Variant, ByVal displayCategories As String) As Object
+    Dim names As Object, lower As Long, upper As Long, dimension As Long, n As Long
+    Dim hasSecondDimension As Boolean, i As Long, name As String
+    Set names = CreateObject("Scripting.Dictionary")
+    names.CompareMode = vbBinaryCompare
+    If MBL_MissingProperty(value, "message category Keywords") Then
+        If Len(displayCategories) > 0 Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+            "Categories are present but their exact Keywords names are unavailable."
+        Set MBE_CategorySet = names
+        Exit Function
+    End If
+    If Not IsArray(value) Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+        "Category Keywords did not return a string array."
+    ' A malformed/unallocated/multidimensional array is unknown, never empty.
+    On Error Resume Next
+    Err.Clear
+    lower = LBound(value, 1): upper = UBound(value, 1): n = Err.Number
+    Err.Clear
+    dimension = LBound(value, 2): hasSecondDimension = (Err.Number = 0)
+    Err.Clear
+    On Error GoTo 0
+    If n <> 0 Or hasSecondDimension Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+        "Category Keywords array shape is unsupported."
+    If CDbl(upper) - CDbl(lower) + 1# > MBE_MAX_CATEGORIES Then _
+        Err.Raise MB_ERR + 1124, "MBE_CategorySet", "Category count exceeds the bounded comparison limit."
+    For i = lower To upper
+        If VarType(value(i)) <> vbString Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+            "Category Keywords contains a non-string name."
+        name = CStr(value(i))
+        If Len(name) = 0 Or Len(name) >= 256 Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+            "Category name length is outside the documented supported range."
+        names(name) = True
+    Next i
+    If names.Count = 0 Then
+        If Len(displayCategories) > 0 Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+            "Nonempty Categories has no exact Keywords names."
+    Else
+        If Len(displayCategories) = 0 Then Err.Raise MB_ERR + 1124, "MBE_CategorySet", _
+            "Category Keywords and the item Categories view disagree."
+    End If
+    Set MBE_CategorySet = names
+End Function
+
+Private Function MBE_ReadCategorySet(ByVal mail As Outlook.MailItem) As Object
+    Dim values As Variant, first As Long
+    values = MBL_ReadProperties(mail, Array(MBE_CATEGORY_KEYWORDS), 1)
+    first = LBound(values)
+    Set MBE_ReadCategorySet = MBE_CategorySet(values(first), mail.Categories)
+End Function
+
+Private Function MBE_SameCategorySets(ByVal first As Object, ByVal second As Object) As Boolean
+    Dim key As Variant
+    If first.Count <> second.Count Then Exit Function
+    For Each key In first.Keys
+        If Not second.Exists(CStr(key)) Then Exit Function
+    Next key
+    MBE_SameCategorySets = True
+End Function
+
+Private Function MBE_MetadataComplete(ByVal source As Outlook.MailItem, ByVal copy As Outlook.MailItem) As Boolean
+    Dim firstImportance As Long, secondImportance As Long, firstSensitivity As Long, secondSensitivity As Long
+    Dim firstCategories As Object, secondCategories As Object, firstCustom As Long, secondCustom As Long
+    firstImportance = CLng(source.Importance): secondImportance = CLng(copy.Importance)
+    If firstImportance < 0 Or firstImportance > 2 Or secondImportance < 0 Or secondImportance > 2 Then _
+        Err.Raise MB_ERR + 1124, "MBE_MetadataComplete", "Unsupported Importance value."
+    If firstImportance <> secondImportance Then _
+        Err.Raise MB_ERR + 1120, "MBE_MetadataComplete", "Message Importance mismatch."
+    firstSensitivity = CLng(source.Sensitivity): secondSensitivity = CLng(copy.Sensitivity)
+    If firstSensitivity < 0 Or firstSensitivity > 3 Or secondSensitivity < 0 Or secondSensitivity > 3 Then _
+        Err.Raise MB_ERR + 1124, "MBE_MetadataComplete", "Unsupported Sensitivity value."
+    If firstSensitivity <> secondSensitivity Then _
+        Err.Raise MB_ERR + 1121, "MBE_MetadataComplete", "Message Sensitivity mismatch."
+    Set firstCategories = MBE_ReadCategorySet(source)
+    Set secondCategories = MBE_ReadCategorySet(copy)
+    If Not MBE_SameCategorySets(firstCategories, secondCategories) Then _
+        Err.Raise MB_ERR + 1122, "MBE_MetadataComplete", "Message category name membership mismatch."
+    firstCustom = source.UserProperties.Count: secondCustom = copy.UserProperties.Count
+    If firstCustom < 0 Or secondCustom < 0 Then _
+        Err.Raise MB_ERR + 1124, "MBE_MetadataComplete", "Invalid custom-property count."
+    ' Do not infer equal custom values from equal names/counts. Custom formulas,
+    ' types and provider-specific fields require a separately declared contract.
+    MBE_MetadataComplete = (firstCustom = 0 And secondCustom = 0)
+End Function
+
+Private Sub MBE_RequireMetadataComplete(ByVal source As Outlook.MailItem, ByVal copy As Outlook.MailItem)
+    If Not MBE_MetadataComplete(source, copy) Then Err.Raise MB_ERR + 1123, "MBE_RequireMetadataComplete", _
+        "Custom UserProperties are present; full bounded metadata equality is unproven. Existing MSG is retained for review."
+End Sub
+
+Private Function MBE_CategorySelfTest() As Boolean
+    Dim first As Object, second As Object, missing As Variant, unicodeName As String
+    On Error GoTo Failed
+    missing = CVErr(MBL_MAPI_NOT_FOUND)
+    Set first = MBE_CategorySet(missing, "")
+    Set second = MBE_CategorySet(Array(), "")
+    If Not MBE_SameCategorySets(first, second) Then Exit Function
+    unicodeName = ChrW(&HD55C) & ChrW(&HAE00)
+    Set first = MBE_CategorySet(Array("comma,name", "semi;colon", " padded ", unicodeName), "display A")
+    Set second = MBE_CategorySet(Array(unicodeName, " padded ", "semi;colon", "comma,name"), "display B")
+    If Not MBE_SameCategorySets(first, second) Then Exit Function
+    Set second = MBE_CategorySet(Array(unicodeName, "padded", "semi;colon", "comma,name"), "display B")
+    If MBE_SameCategorySets(first, second) Then Exit Function
+    If Not MBE_CategoryRejects(missing, "present") Then Exit Function
+    If Not MBE_CategoryRejects(Null, "") Then Exit Function
+    If Not MBE_CategoryRejects(Empty, "") Then Exit Function
+    If Not MBE_CategoryRejects("single", "single") Then Exit Function
+    If Not MBE_CategoryRejects(Array(123), "123") Then Exit Function
+    If Not MBE_CategoryRejects(Array(""), "") Then Exit Function
+    If Not MBE_CategoryRejects(Array("present"), "") Then Exit Function
+    If Not MBE_CategoryRejects(CVErr(&H80070005), "") Then Exit Function
+    MBE_CategorySelfTest = True
+Failed:
+End Function
+
+Private Function MBE_CategoryRejects(ByVal value As Variant, ByVal display As String) As Boolean
+    Dim names As Object
+    On Error GoTo Rejected
+    Set names = MBE_CategorySet(value, display)
+    Exit Function
+Rejected:
+    MBE_CategoryRejects = True
+End Function
+
+Private Function MBE_MetadataResultCode(ByVal source As Outlook.MailItem, ByVal copy As Outlook.MailItem) As Long
+    On Error GoTo DifferentOrUnknown
+    MBE_RequireMetadataComplete source, copy
+    Exit Function
+DifferentOrUnknown:
+    MBE_MetadataResultCode = Err.Number - MB_ERR
+End Function
+
+Private Function MBE_SyntheticMetadataTest(ByVal source As Outlook.MailItem, ByVal path As String, _
+                                          ByRef detail As String) As Boolean
+    Dim obj As Object, copy As Outlook.MailItem, custom As Outlook.UserProperty
+    Dim oldImportance As Long, oldSensitivity As Long, oldCategories As String, captured As Boolean
+    Dim n As Long, reason As String, cleanupIssue As String
+    On Error GoTo Failed
+    ' This mutation test is private to the already-owned, unsent acceptance MSG.
+    ' It never calls Save/Send/SaveAs and never receives a live mailbox item.
+    If gMode <> "SELFTEST_MSG" Or gRunId <> "synthetic_msg" Then _
+        Err.Raise MB_ERR + 1125, , "Metadata mutation test requires the disposable acceptance context."
+    If Not MB_PathWithin(path, gRoot) Then _
+        Err.Raise MB_ERR + 1125, , "Metadata test MSG is outside the disposable test root."
+    If source.Sent Then Err.Raise MB_ERR + 1125, , "Metadata test source must be unsent."
+    If source.UserProperties.Count <> 0 Then _
+        Err.Raise MB_ERR + 1125, , "Metadata test source already has unowned custom properties."
+    oldImportance = source.Importance: oldSensitivity = source.Sensitivity: oldCategories = source.Categories
+    captured = True
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 1125, , "Metadata test copy is not MailItem."
+    Set copy = obj: Set obj = Nothing
+    If MBE_MetadataResultCode(source, copy) <> 0 Then _
+        Err.Raise MB_ERR + 1125, , "Initial stable metadata does not match its owned MSG."
+    source.Importance = (oldImportance + 1) Mod 3
+    If MBE_MetadataResultCode(source, copy) <> 1120 Then _
+        Err.Raise MB_ERR + 1125, , "Importance-only change was not identified."
+    source.Importance = oldImportance
+    source.Sensitivity = (oldSensitivity + 1) Mod 4
+    If MBE_MetadataResultCode(source, copy) <> 1121 Then _
+        Err.Raise MB_ERR + 1125, , "Sensitivity-only change was not identified."
+    source.Sensitivity = oldSensitivity
+    source.Categories = "MB34_Fidelity_" & ChrW(&HD55C) & ChrW(&HAE00)
+    If MBE_MetadataResultCode(source, copy) <> 1122 Then _
+        Err.Raise MB_ERR + 1125, , "Category-only change was not identified."
+    source.Categories = oldCategories
+    Set custom = source.UserProperties.Add("MB34FidelityCustom", olText, False)
+    custom.Value = "Owned unsaved metadata test"
+    If MBE_MetadataComplete(source, copy) Then _
+        Err.Raise MB_ERR + 1125, , "Custom properties were incorrectly classified as complete."
+    If MBE_MetadataResultCode(source, copy) <> 1123 Then _
+        Err.Raise MB_ERR + 1125, , "Custom-property reuse was not held for review."
+    custom.Delete: Set custom = Nothing
+    If MBE_MetadataResultCode(source, copy) <> 0 Then _
+        Err.Raise MB_ERR + 1125, , "Restored in-memory metadata did not return to equality."
+    GoTo Cleanup
+Failed:
+    n = Err.Number: reason = Err.Description
+Cleanup:
+    On Error Resume Next
+    Err.Clear
+    If Not custom Is Nothing Then custom.Delete
+    If Err.Number <> 0 Then cleanupIssue = " Custom-property cleanup failed: " & Err.Description
+    Set custom = Nothing
+    Err.Clear
+    If captured Then
+        source.Importance = oldImportance
+        source.Sensitivity = oldSensitivity
+        source.Categories = oldCategories
+    End If
+    If Err.Number <> 0 Then cleanupIssue = cleanupIssue & " Metadata restore failed: " & Err.Description
+    Err.Clear
+    If Not copy Is Nothing Then copy.Close olDiscard
+    If Not obj Is Nothing Then obj.Close olDiscard
+    If Err.Number <> 0 Then cleanupIssue = cleanupIssue & " Copy close failed: " & Err.Description
+    Set copy = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    MBE_SyntheticMetadataTest = (n = 0 And Len(cleanupIssue) = 0)
+    If MBE_SyntheticMetadataTest Then
+        detail = "PASS: owned unsaved Importance/Sensitivity/Unicode-category differences and custom-property REVIEW."
+    Else
+        detail = "FAIL: " & CStr(n) & " - " & reason & cleanupIssue
+    End If
+End Function

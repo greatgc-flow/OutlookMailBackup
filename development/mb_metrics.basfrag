@@ -1,0 +1,188 @@
+' ================= Actual normal-run performance observations ===============
+' Observe MB_ProcessOne only. Never issue extra SaveAs, alter the backup decision,
+' extrapolate a synthetic acceptance test, or treat REUSE/REVIEW as NEW work.
+' The histogram retains EVERY timed observation using fixed memory. Reported
+' p50/p95 are containing intervals, not exact percentiles or a confidence band.
+Private Sub MBF_Reset()
+    Erase gMetricObserved
+    Erase gMetricTimed
+    Erase gMetricSeconds
+    Erase gMetricMinimum
+    Erase gMetricMaximum
+    Erase gMetricZeros
+    Erase gMetricHistogram
+    gMetricFault = False: gMetricFaultText = ""
+End Sub
+
+Private Function MBF_GroupFor(ByVal outcome As Long, ByVal contentLimited As Boolean) As Long
+    Select Case outcome
+        Case 1
+            If contentLimited Then MBF_GroupFor = 9 Else MBF_GroupFor = 1
+        Case 2
+            If contentLimited Then MBF_GroupFor = 10 Else MBF_GroupFor = 2
+        Case 3 To 8
+            MBF_GroupFor = outcome
+        Case 0
+            ' The queue error handler uses 0 only for an attempt still in flight.
+            MBF_GroupFor = 11
+        Case Else
+            MBF_GroupFor = 12
+    End Select
+End Function
+
+Private Function MBF_GroupLabel(ByVal group As Long) As String
+    Select Case group
+        Case 1: MBF_GroupLabel = "NEW_SUCCESS"
+        Case 2: MBF_GroupLabel = "REUSE_SUCCESS"
+        Case 3: MBF_GroupLabel = "FAILED"
+        Case 4: MBF_GroupLabel = "SOURCE_CHANGED"
+        Case 5: MBF_GroupLabel = "CANCELLED_ATTEMPT"
+        Case 6: MBF_GroupLabel = "POLICY_SKIP"
+        Case 7: MBF_GroupLabel = "REVIEW_NO_SAVEAS"
+        Case 8: MBF_GroupLabel = "UNMATCHED_NO_SAVEAS"
+        Case 9: MBF_GroupLabel = "NEW_LIMITED_VALIDATION"
+        Case 10: MBF_GroupLabel = "REUSE_LIMITED_VALIDATION"
+        Case 11: MBF_GroupLabel = "ABORTED_ATTEMPT"
+        Case Else: MBF_GroupLabel = "UNEXPECTED_RESULT"
+    End Select
+End Function
+
+Private Function MBF_BinUpper(ByVal bin As Long) As Double
+    MBF_BinUpper = MBF_FIRST_UPPER_SECONDS * (2# ^ (bin - 1))
+End Function
+
+Private Function MBF_BinFor(ByVal seconds As Double) As Long
+    Dim bin As Long, upper As Double
+    upper = MBF_FIRST_UPPER_SECONDS
+    For bin = 1 To MBF_BIN_COUNT - 1
+        If seconds <= upper Then MBF_BinFor = bin: Exit Function
+        upper = upper * 2#
+    Next bin
+    MBF_BinFor = MBF_BIN_COUNT
+End Function
+
+Private Sub MBF_Record(ByVal mode As String, ByVal outcome As Long, _
+                       ByVal elapsedSeconds As Double, Optional ByVal contentLimited As Boolean = False)
+    Dim group As Long, bin As Long
+    If mode <> "AUTO" Then Exit Sub
+    On Error GoTo Unavailable
+    group = MBF_GroupFor(outcome, contentLimited)
+    gMetricObserved(group) = gMetricObserved(group) + 1#
+    ' A broken/backwards clock is an untimed result, never a zero-second sample.
+    If elapsedSeconds < 0# Then Exit Sub
+    bin = MBF_BinFor(elapsedSeconds)
+    If gMetricTimed(group) = 0# Then
+        gMetricMinimum(group) = elapsedSeconds
+        gMetricMaximum(group) = elapsedSeconds
+    Else
+        If elapsedSeconds < gMetricMinimum(group) Then gMetricMinimum(group) = elapsedSeconds
+        If elapsedSeconds > gMetricMaximum(group) Then gMetricMaximum(group) = elapsedSeconds
+    End If
+    gMetricSeconds(group) = gMetricSeconds(group) + elapsedSeconds
+    gMetricTimed(group) = gMetricTimed(group) + 1#
+    gMetricHistogram(group, bin) = gMetricHistogram(group, bin) + 1#
+    If elapsedSeconds = 0# Then gMetricZeros(group) = gMetricZeros(group) + 1#
+    Exit Sub
+Unavailable:
+    ' Telemetry must not turn a durable backup into a failed backup. Suppress all
+    ' forecasts after a metrics error; partially updated statistics are not proof.
+    gMetricFault = True
+    gMetricFaultText = CStr(Err.Number) & " - " & Err.Description
+    Err.Clear
+End Sub
+
+Private Function MBF_QuantileInterval(ByVal group As Long, ByVal fraction As Double) As String
+    Dim target As Double, cumulative As Double, bin As Long
+    If gMetricTimed(group) = 0# Then MBF_QuantileInterval = "NOT_MEASURED": Exit Function
+    target = -Int(-gMetricTimed(group) * fraction)
+    For bin = 1 To MBF_BIN_COUNT
+        cumulative = cumulative + gMetricHistogram(group, bin)
+        If cumulative >= target Then
+            If bin = 1 Then
+                MBF_QuantileInterval = "[0, " & Format$(MBF_BinUpper(bin), "0.000000") & "]"
+            ElseIf bin = MBF_BIN_COUNT Then
+                MBF_QuantileInterval = "(" & Format$(MBF_BinUpper(bin - 1), "0.000000") & ", +infinity)"
+            Else
+                MBF_QuantileInterval = "(" & Format$(MBF_BinUpper(bin - 1), "0.000000") & ", " & _
+                                       Format$(MBF_BinUpper(bin), "0.000000") & "]"
+            End If
+            Exit Function
+        End If
+    Next bin
+    MBF_QuantileInterval = "UNAVAILABLE_INCONSISTENT_COUNTERS"
+End Function
+
+Private Function MBF_GroupSummary(ByVal group As Long) As String
+    Dim s As String
+    s = MBF_GroupLabel(group) & ": observed=" & Format$(gMetricObserved(group), "0") & _
+        "; timed=" & Format$(gMetricTimed(group), "0") & _
+        "; untimed=" & Format$(gMetricObserved(group) - gMetricTimed(group), "0")
+    If gMetricTimed(group) > 0# Then
+        s = s & "; total seconds=" & Format$(gMetricSeconds(group), "0.000000") & _
+            "; mean=" & Format$(gMetricSeconds(group) / gMetricTimed(group), "0.000000") & _
+            "; min/max=" & Format$(gMetricMinimum(group), "0.000000") & "/" & _
+            Format$(gMetricMaximum(group), "0.000000")
+        s = s & "; histogram p50=" & MBF_QuantileInterval(group, 0.5) & _
+            "; p95=" & MBF_QuantileInterval(group, 0.95) & _
+            "; zero-duration=" & Format$(gMetricZeros(group), "0")
+    Else
+        s = s & "; seconds=NOT_MEASURED"
+    End If
+    MBF_GroupSummary = s
+End Function
+
+Private Function MBF_Forecast(ByVal group As Long, ByVal label As String) As String
+    Dim s As String, mean As Double
+    s = "100,000 " & label & " indicative processing hours: "
+    If gMetricFault Then
+        MBF_Forecast = s & "UNAVAILABLE_METRICS_ERROR": Exit Function
+    End If
+    If gMetricObserved(group) <> gMetricTimed(group) Then
+        MBF_Forecast = s & "UNAVAILABLE_UNTIMED_RESULTS": Exit Function
+    End If
+    If gMetricTimed(group) = 0# Then
+        MBF_Forecast = s & "NOT_MEASURED (no eligible actual AUTO observations)": Exit Function
+    End If
+    If gMetricTimed(group) < MBF_MIN_FORECAST_COUNT Then
+        MBF_Forecast = s & "NOT_ESTIMATED (eligible timed observations=" & _
+                       Format$(gMetricTimed(group), "0") & "; minimum=" & CStr(MBF_MIN_FORECAST_COUNT) & ")"
+        Exit Function
+    End If
+    mean = gMetricSeconds(group) / gMetricTimed(group)
+    If mean <= 0# Then
+        MBF_Forecast = s & "NOT_ESTIMATED (clock resolution insufficient)": Exit Function
+    End If
+    MBF_Forecast = s & Format$(mean * 100000# / 3600#, "0.0000") & _
+                   " (eligible timed observations=" & Format$(gMetricTimed(group), "0") & _
+                   "; observed mean seconds=" & Format$(mean, "0.000000") & ")"
+End Function
+
+Private Function MBF_Summary(ByVal mode As String) As String
+    Dim s As String, group As Long
+    If mode <> "AUTO" Then Exit Function
+    On Error GoTo Unavailable
+    s = vbCrLf & "Automatic performance observations: actual AUTO item processing; no extra SaveAs." & vbCrLf
+    If gMetricFault Then
+        s = s & "METRICS ERROR: counters may be incomplete; all forecasts suppressed. " & gMetricFaultText & vbCrLf
+    End If
+    For group = 1 To MBF_GROUP_COUNT
+        s = s & MBF_GroupSummary(group) & vbCrLf
+    Next group
+    s = s & MBF_Forecast(1, "NEW") & vbCrLf & MBF_Forecast(2, "REUSE") & vbCrLf
+    s = s & "Histogram intervals contain p50/p95 of all timed observations; they are not exact percentiles." & vbCrLf
+    s = s & "Forecasts cover only successful NEW or REUSE item processing; limited-validation results, " & _
+            "failures, REVIEW and cancelled/aborted attempts are separate above." & vbCrLf
+    s = s & "Forecasts exclude inventory, legacy registration, organization, recovery, archive audits, " & _
+            "final commits/reports and future retries. No whole-run duration is predicted." & vbCrLf
+    s = s & "Observed item costs include the current configured export, candidate checks, validation and staging. " & _
+            "Comparable mail sizes, attachments, provider, disk/network and cache are required." & vbCrLf
+    s = s & "REUSE cost also depends on the selected content-audit scope. Work can grow nonlinearly as " & _
+            "metadata, journals and output grow; a daily success mix is not a 100,000-item workload." & vbCrLf
+    s = s & "The minimum observation count is a reporting threshold, not a statistical confidence guarantee. " & _
+            "These observations do not replace a real 100,000-item test or every-MAPI fidelity testing."
+    MBF_Summary = s
+    Exit Function
+Unavailable:
+    MBF_Summary = vbCrLf & "Automatic performance observations: REPORT_UNAVAILABLE; no forecast is valid."
+    Err.Clear
+End Function

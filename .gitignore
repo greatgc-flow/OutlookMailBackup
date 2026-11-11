@@ -1,0 +1,26 @@
+# Python tooling and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Generated local validation output
+development/vba_parser_review/
+
+# Mail payloads and runtime state belong outside the source repository.
+*.msg
+*.eml
+*.pst
+*.ost
+SafeV2/
+_MailBackup_Data/
+_MailBackup_Recovery/
+locations/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

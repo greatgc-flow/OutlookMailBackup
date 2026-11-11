@@ -1,0 +1,257 @@
+' ================= One default Outlook store per managed root ===============
+' Central snapshots cover the whole state directory. A second store must not
+' share that directory and later restore an older view of another store's data.
+' The root-level marker and HKCU copy survive deletion of the central data.
+' If every historical binding is gone, this is a NEW observation of the chosen
+' store, not proof that the old root was historically exclusive to that store.
+
+Private Function MBS_StoreBindingValue(ByVal line As String, Optional ByVal rootPath As String = "") As String
+    Dim fields As Variant
+    If Len(rootPath) = 0 Then rootPath = gRoot
+    fields = MB_ReadCheckedLine(line, 4)
+    If CStr(fields(0)) <> "MBSTORE1" Or CStr(fields(3)) <> "SINGLE_DEFAULT_STORE" Then _
+        Err.Raise MB_ERR + 930, , "Unknown managed-root store binding."
+    If StrComp(CStr(fields(1)), MBH_NormalizePath(rootPath), vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 931, , "Store binding belongs to another managed root."
+    If Len(CStr(fields(2))) = 0 Then Err.Raise MB_ERR + 932, , "Store binding has no StoreID."
+    MBS_StoreBindingValue = CStr(fields(2))
+End Function
+
+Private Sub MBS_CheckCandidateStore(ByVal rootPath As String, ByVal storeId As String, ByVal fso As Object)
+    ' Read-only gate before remembering a folder, with no dependence on gRoot.
+    ' A foreign saved root should lead to the folder chooser, not trap every run.
+    Dim path As String, saved As String, found As String, bound As Boolean
+    path = MBH_JoinPath(rootPath, "operating-store.tsv")
+    If fso.FileExists(path) Then
+        found = MBS_StoreBindingValue(MBP_ReadOneLine(path, fso), rootPath)
+        If StrComp(found, storeId, vbTextCompare) <> 0 Then _
+            Err.Raise MB_ERR + 934, , "[FOREIGN_STORE] This managed root is bound to another Outlook store: " & rootPath
+        bound = True
+    End If
+    saved = MBP_GetSettingText("OperatingStore_" & MBH_HashText(LCase$(MBH_NormalizePath(rootPath))), "")
+    If Len(saved) > 0 Then
+        found = MBS_StoreBindingValue(saved, rootPath)
+        If StrComp(found, storeId, vbTextCompare) <> 0 Then _
+            Err.Raise MB_ERR + 934, , "[FOREIGN_STORE] This managed root is bound to another Outlook store: " & rootPath
+        bound = True
+    End If
+    If Not bound Then MBS_PreflightCandidateEvidence rootPath, storeId, fso
+End Sub
+
+Private Function MBS_ReadStoreBinding(ByVal path As String) As String
+    Dim stream As Object, line As String, n As Long, detail As String
+    On Error GoTo Failed
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then _
+        Err.Raise MB_ERR + 933, , "Managed-root store binding is truncated."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 933, , "Managed-root store binding is empty."
+    line = stream.ReadLine
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 933, , "Managed-root store binding has extra data."
+    stream.Close: Set stream = Nothing
+    MBS_ReadStoreBinding = MBS_StoreBindingValue(line)
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBS_ReadStoreBinding", detail
+End Function
+
+Private Sub MBS_RequireStore(ByVal foundStore As String, ByVal storeId As String, ByVal source As String)
+    If Len(foundStore) = 0 Then Exit Sub
+    If StrComp(foundStore, storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 934, , "[FOREIGN_STORE] This managed root contains a binding to another Outlook store: " & source & _
+                  ". Use a separate managed backup root for each default store; existing files were preserved."
+End Sub
+
+Private Function MBS_TryStoreRow(ByVal line As String, ByVal fieldCount As Long, ByRef fields As Variant) As Boolean
+    Dim n As Long, detail As String
+    On Error GoTo Invalid
+    fields = MB_ReadCheckedLine(line, fieldCount)
+    MBS_TryStoreRow = True
+    Exit Function
+Invalid:
+    n = Err.Number: detail = Err.Description
+    ' A damaged row is not ownership evidence. The normal recovery loader will
+    ' preserve/repair it; unrelated I/O or cryptographic failures must propagate.
+    If n = MB_ERR + 15 Or n = MB_ERR + 16 Or n = MB_ERR + 17 Then Exit Function
+    Err.Raise n, "MBS_TryStoreRow", detail
+End Function
+
+Private Sub MBS_CheckStoreRow(ByVal line As String, ByVal kind As String, ByVal storeId As String, _
+                              ByVal source As String, Optional ByVal accountPath As String = "", _
+                              Optional ByVal rootPath As String = "", Optional ByVal strictAsOwned As Boolean = False)
+    Dim fields As Variant, fieldCount As Long, foundStore As String
+    If Len(rootPath) = 0 Then rootPath = gRoot
+    Select Case kind
+        Case "JOURNAL"
+            If Left$(line, 5) = "MBS2" & vbTab Then
+                fieldCount = 16
+            ElseIf Left$(line, 5) = "MBS3" & vbTab Then
+                fieldCount = 17
+            Else
+                GoTo Unproven
+            End If
+            If Not MBS_TryStoreRow(line, fieldCount, fields) Then GoTo Unproven
+            foundStore = CStr(fields(7))
+        Case "ACCOUNT"
+            If Not MBS_TryStoreRow(line, 4, fields) Then GoTo Unproven
+            If CStr(fields(0)) <> "MBAC3" Then GoTo Unproven
+            If StrComp(CStr(fields(3)), rootPath, vbTextCompare) <> 0 Then GoTo Unproven
+            If Len(accountPath) > 0 Then
+                If StrComp(CStr(fields(2)), accountPath, vbTextCompare) <> 0 Then GoTo Unproven
+            End If
+            foundStore = CStr(fields(1))
+        Case "RECOVERY"
+            If Not MBS_TryStoreRow(line, 5, fields) Then GoTo Unproven
+            If CStr(fields(0)) <> "MBRECOVERY1" Or CStr(fields(4)) <> "1" Then GoTo Unproven
+            If StrComp(CStr(fields(1)), rootPath, vbTextCompare) <> 0 Then GoTo Unproven
+            If StrComp(CStr(fields(2)), accountPath, vbTextCompare) <> 0 Then GoTo Unproven
+            foundStore = CStr(fields(3))
+        Case Else
+            Err.Raise MB_ERR + 935, , "Unknown store-evidence kind."
+    End Select
+    If Len(foundStore) = 0 Then GoTo Unproven
+    MBS_RequireStore foundStore, storeId, source
+    Exit Sub
+Unproven:
+    If strictAsOwned Then Err.Raise MB_ERR + 937, , _
+        "The existing managed root has unreadable or conflicting store evidence; it was preserved for review: " & source
+End Sub
+
+Private Sub MBS_PreflightStoreFile(ByVal path As String, ByVal kind As String, ByVal storeId As String, _
+                                   ByVal rootPath As String, ByVal fso As Object, ByVal strictAsOwned As Boolean, _
+                                   Optional ByVal accountPath As String = "")
+    Dim stream As Object, line As String, n As Long, detail As String
+    On Error GoTo Failed
+    If Not fso.FileExists(path) Then Exit Sub
+    MBP_NoReparse path, fso
+    If CDbl(fso.GetFile(path).Size) Mod 2 <> 0 Then
+        If strictAsOwned Then Err.Raise MB_ERR + 937, , "Truncated managed-root store evidence needs review: " & path
+        Exit Sub
+    End If
+    Set stream = fso.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then MBS_CheckStoreRow line, kind, storeId, path, accountPath, rootPath, strictAsOwned
+    Loop
+    stream.Close: Set stream = Nothing
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBS_PreflightStoreFile", detail
+End Sub
+
+Private Sub MBS_PreflightCandidateAccount(ByVal accountPath As String, ByVal storeId As String, _
+                                          ByVal rootPath As String, ByVal fso As Object)
+    ' Only an exact checked sibling marker is evidence for this root. Unrelated
+    ' malformed sibling files are not borrowed as authority to bind any store.
+    MBS_PreflightStoreFile MBH_JoinPath(accountPath, MBY_ACCOUNT_MARKER), "ACCOUNT", storeId, rootPath, fso, False, accountPath
+    MBS_PreflightStoreFile MBH_JoinPath(MBH_JoinPath(accountPath, MBR_FOLDER), MBR_OWNER_FILE), _
+                           "RECOVERY", storeId, rootPath, fso, False, accountPath
+End Sub
+
+Private Sub MBS_PreflightCandidateEvidence(ByVal rootPath As String, ByVal storeId As String, ByVal fso As Object)
+    Dim stateLeaf As Variant, state As String, parent As String, folder As Object, account As String
+    ' The first upgrade of an old root has no MBSTORE1 marker. Inspect owned
+    ' state before the chooser returns, so a different default store can choose
+    ' its separate root through the same single public macro.
+    For Each stateLeaf In Array(MBS_DATA_LEAF, "_state")
+        state = MBH_JoinPath(rootPath, CStr(stateLeaf))
+        MBS_PreflightStoreFile MBH_JoinPath(state, "journal.tsv"), "JOURNAL", storeId, rootPath, fso, True
+        MBS_PreflightStoreFile MBH_JoinPath(state, MBY_MAP_FILE), "ACCOUNT", storeId, rootPath, fso, True
+    Next stateLeaf
+    account = MBP_OwnerAccountHint(storeId, rootPath)
+    If Len(account) > 0 Then MBS_PreflightCandidateAccount account, storeId, rootPath, fso
+    parent = CStr(fso.GetParentFolderName(rootPath))
+    If Len(parent) = 0 Or Not fso.FolderExists(parent) Then Exit Sub
+    MBP_NoReparse parent, fso
+    MBS_PreflightCandidateAccount parent, storeId, rootPath, fso
+    For Each folder In fso.GetFolder(parent).SubFolders
+        If (CLng(folder.Attributes) And 1024) = 0 Then _
+            MBS_PreflightCandidateAccount CStr(folder.Path), storeId, rootPath, fso
+    Next folder
+End Sub
+
+Private Sub MBS_CheckStoreFile(ByVal path As String, ByVal kind As String, ByVal storeId As String, _
+                               Optional ByVal accountPath As String = "")
+    Dim stream As Object, line As String, n As Long, detail As String
+    On Error GoTo Failed
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then MBS_CheckStoreRow line, kind, storeId, path, accountPath
+    Loop
+    stream.Close: Set stream = Nothing
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBS_CheckStoreFile", detail
+End Sub
+
+Private Sub MBS_CheckAccountStoreEvidence(ByVal accountPath As String, ByVal storeId As String)
+    MBS_CheckStoreFile MBH_JoinPath(accountPath, MBY_ACCOUNT_MARKER), "ACCOUNT", storeId, accountPath
+    MBS_CheckStoreFile MBH_JoinPath(MBH_JoinPath(accountPath, MBR_FOLDER), MBR_OWNER_FILE), _
+                       "RECOVERY", storeId, accountPath
+End Sub
+
+Private Sub MBS_CheckInitialStoreEvidence(ByVal storeId As String)
+    Dim oldState As String, parent As String, folder As Object
+    MBS_CheckStoreFile MB_StatePath("journal.tsv"), "JOURNAL", storeId
+    MBS_CheckStoreFile MB_StatePath(MBY_MAP_FILE), "ACCOUNT", storeId
+    oldState = MBH_JoinPath(gRoot, "_state")
+    MBS_CheckStoreFile MBH_JoinPath(oldState, "journal.tsv"), "JOURNAL", storeId
+    MBS_CheckStoreFile MBH_JoinPath(oldState, MBY_MAP_FILE), "ACCOUNT", storeId
+    parent = CStr(gFSO.GetParentFolderName(gRoot))
+    If Len(parent) = 0 Then Exit Sub
+    MBY_NoReparse parent, True
+    ' The archive may be the parent itself or a sibling of the state folder.
+    ' Custom roots elsewhere remain guarded when their exact owner is opened.
+    MBS_CheckAccountStoreEvidence parent, storeId
+    For Each folder In gFSO.GetFolder(parent).SubFolders
+        If (CLng(folder.Attributes) And 1024) = 0 Then _
+            MBS_CheckAccountStoreEvidence CStr(folder.Path), storeId
+    Next folder
+End Sub
+
+Private Sub MBS_BindStore(ByVal storeId As String)
+    Dim path As String, settingKey As String, saved As String, diskStore As String
+    Dim registryStore As String, payload As String, checkedLine As String
+    If Len(storeId) = 0 Or Len(gRoot) = 0 Then Err.Raise MB_ERR + 936, , "Root store binding needs a root and StoreID."
+    MBY_NoReparse gRoot, True
+    path = MBH_JoinPath(gRoot, "operating-store.tsv")
+    settingKey = "OperatingStore_" & MBH_HashText(LCase$(MBH_NormalizePath(gRoot)))
+    If gFSO.FileExists(path) Then diskStore = MBS_ReadStoreBinding(path)
+    saved = MBP_GetSettingText(settingKey, "")
+    If Len(saved) > 0 Then registryStore = MBS_StoreBindingValue(saved)
+    MBS_RequireStore diskStore, storeId, path
+    MBS_RequireStore registryStore, storeId, "HKCU " & settingKey
+    ' A surviving exact binding is authority: no full journal scan on every run.
+    If Len(diskStore) = 0 And Len(registryStore) = 0 Then MBS_CheckInitialStoreEvidence storeId
+    payload = MB_EncodeFields(Array("MBSTORE1", MBH_NormalizePath(gRoot), LCase$(storeId), "SINGLE_DEFAULT_STORE"))
+    checkedLine = payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+    ' Each durable copy can repair a DELETED peer. A malformed or foreign peer
+    ' stops above and is retained for review; it never authorizes a new store.
+    If Len(diskStore) = 0 Then MBS_WriteAtomic path, checkedLine & vbCrLf
+    If Len(registryStore) = 0 Then MBP_SaveSettingText settingKey, checkedLine
+End Sub
+
+Private Sub MBS_CheckRestoredStore(ByVal storeId As String)
+    ' A structurally healthy no-op restore does not need another O(N) scan.
+    ' Force-repair can replay identical bytes, so its explicit outcome also
+    ' triggers validation even if no physical file was reconstructed.
+    If gRecoveryRestoredCount = 0 And Not gRecoveryRebased And _
+       InStr(1, gRecoveryNote, "RECOVERED_SNAPSHOT:", vbBinaryCompare) <> 1 Then Exit Sub
+    MBS_CheckStoreFile MB_StatePath("journal.tsv"), "JOURNAL", storeId
+    MBS_CheckStoreFile MB_StatePath(MBY_MAP_FILE), "ACCOUNT", storeId
+End Sub

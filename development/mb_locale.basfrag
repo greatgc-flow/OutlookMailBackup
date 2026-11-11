@@ -1,0 +1,316 @@
+' ======================= Locale / time contracts ============================
+' MBC_Stamp retains the v2/v3 19-character LOCAL journal format. It does not
+' reinterpret a legacy local stamp as UTC. Only the new watermark uses ...Z.
+' VBA Calendar is project-wide. Helpers restore it without yielding. Run-level
+' wrappers may also use Enter/Leave to protect older date/file-name code paths.
+' No locale-formatted string is accepted as an archive control date.
+Private Sub MBC_EnterGregorian(ByRef savedCalendar As Long, ByRef entered As Boolean)
+    If entered Then Err.Raise MBC_ERR + 1, , "Gregorian calendar guard is already active."
+    savedCalendar = Calendar
+    Calendar = vbCalGreg
+    entered = True
+End Sub
+
+Private Sub MBC_LeaveGregorian(ByVal savedCalendar As Long, ByRef entered As Boolean)
+    If Not entered Then Exit Sub
+    Calendar = savedCalendar
+    entered = False
+End Sub
+
+Private Function MBC_Digits(ByVal value As Long, ByVal width As Long) As String
+    Dim result As String, i As Long
+    If value < 0 Or width < 1 Or width > 10 Then Err.Raise MBC_ERR + 2, , "Invalid unsigned integer field."
+    result = String$(width, "0")
+    For i = width To 1 Step -1
+        Mid$(result, i, 1) = Chr$(48 + (value Mod 10))
+        value = value \ 10
+    Next i
+    If value <> 0 Then Err.Raise MBC_ERR + 3, , "Unsigned integer exceeds field width."
+    MBC_Digits = result
+End Function
+
+Private Function MBC_ReadDigits(ByVal value As String, ByVal offset As Long, ByVal count As Long) As Long
+    Dim i As Long, digit As Long, result As Long
+    If offset < 1 Or count < 1 Or count > 4 Or offset + count - 1 > Len(value) Then
+        Err.Raise MBC_ERR + 4, , "Invalid numeric date field."
+    End If
+    For i = offset To offset + count - 1
+        digit = AscW(Mid$(value, i, 1)) - 48
+        If digit < 0 Or digit > 9 Then Err.Raise MBC_ERR + 5, , "Control date requires ASCII digits."
+        result = result * 10 + digit
+    Next i
+    MBC_ReadDigits = result
+End Function
+
+Private Function MBC_GregorianDate(ByVal yyyy As Long, ByVal mm As Long, ByVal dd As Long, _
+    Optional ByVal hh As Long = 0, Optional ByVal nn As Long = 0, Optional ByVal ss As Long = 0) As Date
+    Dim savedCalendar As Long, entered As Boolean, result As Date
+    Dim n As Long, reason As String
+    On Error GoTo Failed
+    If yyyy < 100 Or yyyy > 9999 Or mm < 1 Or mm > 12 Or dd < 1 Or dd > 31 _
+        Or hh < 0 Or hh > 23 Or nn < 0 Or nn > 59 Or ss < 0 Or ss > 59 Then
+        Err.Raise MBC_ERR + 6, , "Date field is out of range."
+    End If
+    MBC_EnterGregorian savedCalendar, entered
+    result = DateSerial(yyyy, mm, dd)
+    If CDbl(result) < 0 Then
+        result = result - TimeSerial(hh, nn, ss)
+    Else
+        result = result + TimeSerial(hh, nn, ss)
+    End If
+    ' DateSerial normalizes impossible dates. Reject, for example, 2025-02-29.
+    If Year(result) <> yyyy Or Month(result) <> mm Or Day(result) <> dd _
+        Or Hour(result) <> hh Or Minute(result) <> nn Or Second(result) <> ss Then
+        Err.Raise MBC_ERR + 7, , "Invalid Gregorian calendar date."
+    End If
+    MBC_LeaveGregorian savedCalendar, entered
+    MBC_GregorianDate = result
+    Exit Function
+Failed:
+    n = Err.Number: reason = Err.Description
+    On Error Resume Next
+    MBC_LeaveGregorian savedCalendar, entered
+    On Error GoTo 0
+    Err.Raise n, "MBC_GregorianDate", reason
+End Function
+
+Private Function MBC_Stamp(ByVal value As Date) As String
+    Dim savedCalendar As Long, entered As Boolean, result As String
+    Dim n As Long, reason As String
+    If value = 0 Then Exit Function
+    On Error GoTo Failed
+    MBC_EnterGregorian savedCalendar, entered
+    result = MBC_Digits(Year(value), 4) & "-" & MBC_Digits(Month(value), 2) & "-" & _
+             MBC_Digits(Day(value), 2) & "T" & MBC_Digits(Hour(value), 2) & ":" & _
+             MBC_Digits(Minute(value), 2) & ":" & MBC_Digits(Second(value), 2)
+    MBC_LeaveGregorian savedCalendar, entered
+    MBC_Stamp = result
+    Exit Function
+Failed:
+    n = Err.Number: reason = Err.Description
+    On Error Resume Next
+    MBC_LeaveGregorian savedCalendar, entered
+    On Error GoTo 0
+    Err.Raise n, "MBC_Stamp", reason
+End Function
+
+Private Function MBC_ParseStamp(ByVal value As String) As Date
+    Dim result As Date
+    If Len(value) <> 19 Then Err.Raise MBC_ERR + 8, , "Control timestamp must have 19 characters."
+    If Mid$(value, 5, 1) <> "-" Or Mid$(value, 8, 1) <> "-" Or Mid$(value, 11, 1) <> "T" _
+        Or Mid$(value, 14, 1) <> ":" Or Mid$(value, 17, 1) <> ":" Then
+        Err.Raise MBC_ERR + 9, , "Invalid control timestamp separators."
+    End If
+    result = MBC_GregorianDate(MBC_ReadDigits(value, 1, 4), MBC_ReadDigits(value, 6, 2), _
+        MBC_ReadDigits(value, 9, 2), MBC_ReadDigits(value, 12, 2), _
+        MBC_ReadDigits(value, 15, 2), MBC_ReadDigits(value, 18, 2))
+    If MBC_Stamp(result) <> value Then Err.Raise MBC_ERR + 10, , "Noncanonical control timestamp."
+    MBC_ParseStamp = result
+End Function
+
+Private Function MBC_ParseLegacyStamp(ByVal value As String) As Date
+    Dim separator As String, number As Long
+    ' v2/v3 Format$(..., "hh:nn:ss") expanded ':' to the OS time separator.
+    ' An old fixed-width plan can therefore contain 10.20.30. The date and
+    ' component order were still fixed; normalize ONLY that unambiguous legacy
+    ' separator. Never use this tolerant reader for a new UTC checkpoint.
+    If Len(value) <> 19 Then Err.Raise MBC_ERR + 17, , "Invalid legacy timestamp width."
+    separator = Mid$(value, 14, 1)
+    If Mid$(value, 17, 1) <> separator Then Err.Raise MBC_ERR + 18, , "Inconsistent legacy time separators."
+    number = CLng(AscW(separator)) And &HFFFF&
+    If number < 32 Or number = 127 Or (number >= 48 And number <= 57) _
+        Or (number >= 65 And number <= 90) Or (number >= 97 And number <= 122) Then
+        Err.Raise MBC_ERR + 19, , "Invalid legacy time separator."
+    End If
+    Mid$(value, 14, 1) = ":"
+    Mid$(value, 17, 1) = ":"
+    MBC_ParseLegacyStamp = MBC_ParseStamp(value)
+End Function
+
+Private Function MBC_FileStamp(ByVal value As Date) As String
+    Dim stamp As String
+    stamp = MBC_Stamp(value)
+    If Len(stamp) <> 19 Then Err.Raise MBC_ERR + 11, , "Filename requires a nonempty date."
+    MBC_FileStamp = Replace(Replace(Replace(stamp, "-", ""), ":", ""), "T", "_")
+End Function
+
+Private Function MBC_ParseFileStamp(ByVal value As String) As Date
+    If Len(value) <> 15 Or Mid$(value, 9, 1) <> "_" Then
+        Err.Raise MBC_ERR + 12, , "Filename date must be yyyyMMdd_HHmmss."
+    End If
+    MBC_ParseFileStamp = MBC_ParseStamp(Left$(value, 4) & "-" & Mid$(value, 5, 2) & "-" & _
+        Mid$(value, 7, 2) & "T" & Mid$(value, 10, 2) & ":" & Mid$(value, 12, 2) & ":" & Right$(value, 2))
+End Function
+
+Private Function MBC_YearMonth(ByVal value As Date) As String
+    Dim stamp As String
+    stamp = MBC_Stamp(value)
+    If Len(stamp) <> 19 Then Err.Raise MBC_ERR + 13, , "Year/month filing requires a nonempty date."
+    MBC_YearMonth = Left$(stamp, 4) & "\" & Mid$(stamp, 6, 2)
+End Function
+
+Private Function MBC_ShiftMonths(ByVal value As Date, ByVal months As Long) As Date
+    Dim savedCalendar As Long, entered As Boolean, result As Date
+    Dim n As Long, reason As String
+    On Error GoTo Failed
+    MBC_EnterGregorian savedCalendar, entered
+    result = DateAdd("m", months, value)
+    MBC_LeaveGregorian savedCalendar, entered
+    MBC_ShiftMonths = result
+    Exit Function
+Failed:
+    n = Err.Number: reason = Err.Description
+    On Error Resume Next
+    MBC_LeaveGregorian savedCalendar, entered
+    On Error GoTo 0
+    Err.Raise n, "MBC_ShiftMonths", reason
+End Function
+
+Private Function MBC_ValidDate(ByVal value As Date) As Boolean
+    ' OLE DATE numeric boundaries: 1900-01-01 (2) <= date < 2100-01-01 (73051).
+    ' This intentionally preserves the existing mail-date acceptance policy.
+    MBC_ValidDate = (CDbl(value) >= 2# And CDbl(value) < 73051#)
+End Function
+
+Private Function MBC_UtcNow() As Date
+    Dim value As MBC_SYSTEMTIME
+    MBC_GetSystemTime value
+    ' A watermark is a whole UTC second. Do not derive it by converting Now:
+    ' a local time in the repeated DST hour has two possible UTC meanings.
+    MBC_UtcNow = MBC_GregorianDate(value.wYear, value.wMonth, value.wDay, _
+        value.wHour, value.wMinute, value.wSecond)
+End Function
+
+Private Function MBC_UtcStamp(ByVal utcValue As Date) As String
+    If utcValue = 0 Then Exit Function
+    MBC_UtcStamp = MBC_Stamp(utcValue) & "Z"
+End Function
+
+Private Function MBC_ParseUtcStamp(ByVal value As String) As Date
+    If Len(value) <> 20 Or Right$(value, 1) <> "Z" Then
+        Err.Raise MBC_ERR + 14, , "UTC control timestamp must end in Z."
+    End If
+    MBC_ParseUtcStamp = MBC_ParseStamp(Left$(value, 19))
+End Function
+
+Private Function MBC_LocalToUtc(ByVal localValue As Date) As Date
+    ' Only a convenience for legacy user-selected local ranges. Never use for
+    ' a durable checkpoint or to disambiguate the repeated DST fall-back hour.
+    MBC_LocalToUtc = Application.Session.DefaultStore.PropertyAccessor.LocalTimeToUTC(localValue)
+End Function
+
+Private Function MBC_UtcToLocal(ByVal utcValue As Date) As Date
+    MBC_UtcToLocal = Application.Session.DefaultStore.PropertyAccessor.UTCToLocalTime(utcValue)
+End Function
+
+Private Function MBC_DateUTC(ByVal item As Object, ByVal schemaName As String, _
+    ByRef result As Date, ByRef reason As String) As Boolean
+    Dim value As Variant
+    On Error GoTo Failed
+    result = 0: reason = ""
+    value = item.PropertyAccessor.GetProperty(schemaName)
+    If VarType(value) <> vbDate Then
+        reason = "MAPI UTC date did not return VT_DATE: " & schemaName
+        Exit Function
+    End If
+    result = CDate(value)
+    If Not MBC_ValidDate(result) Then
+        result = 0
+        reason = "MAPI UTC date is missing or outside the supported range: " & schemaName
+        Exit Function
+    End If
+    MBC_DateUTC = True
+    Exit Function
+Failed:
+    result = 0
+    reason = "MAPI UTC date unavailable: " & schemaName & "; " & Trim$(Str$(Err.Number)) & " " & Err.Description
+End Function
+
+Private Function MBC_TimeRule(ByRef value As MBC_SYSTEMTIME) As String
+    MBC_TimeRule = MBC_Digits(value.wYear, 4) & ":" & MBC_Digits(value.wMonth, 2) & ":" & _
+        MBC_Digits(value.wDayOfWeek, 1) & ":" & MBC_Digits(value.wDay, 2) & ":" & _
+        MBC_Digits(value.wHour, 2) & ":" & MBC_Digits(value.wMinute, 2) & ":" & _
+        MBC_Digits(value.wSecond, 2) & ":" & MBC_Digits(value.wMilliseconds, 3)
+End Function
+
+Private Function MBC_TimeContext() As String
+    Dim value As MBC_DYNAMIC_TIME_ZONE_INFORMATION, status As Long
+    Dim zoneKey As String, i As Long, number As Long, payload As String
+    If LenB(value) <> 432 Then Err.Raise MBC_ERR + 15, , "Unexpected Windows timezone structure layout."
+    status = MBC_GetDynamicTimeZoneInformation(value)
+    If status = -1 Then Err.Raise MBC_ERR + 16, , "Windows timezone information is unavailable."
+    For i = 0 To 127
+        number = CLng(value.TimeZoneKeyName(i)) And &HFFFF&
+        If number = 0 Then Exit For
+        zoneKey = zoneKey & ChrW$(number)
+    Next i
+    ' Display names vary with Windows UI language; omit them. Normal seasonal
+    ' DST state (status=1/2) is also omitted: the transition RULES identify it.
+    ' This is a settings-change detector, not a hash of every historical rule.
+    payload = "MBTZ2|" & zoneKey & "|" & Trim$(Str$(value.Bias)) & "|" & _
+        Trim$(Str$(value.StandardBias)) & "|" & Trim$(Str$(value.DaylightBias)) & "|" & _
+        MBC_TimeRule(value.StandardDate) & "|" & MBC_TimeRule(value.DaylightDate) & "|" & _
+        IIf(value.DynamicDaylightTimeDisabled = 0, "0", "1") & "|NUM=" & _
+        Replace(Format$(12345.5, "0.0000000000"), ",", ".")
+    ' NUM detects a locale change that can affect the preserved MBREV2 numeric
+    ' formatter (including native digits/custom decimal separators). It does
+    ' not alter any existing source/revision key or infer prior calendar use.
+    MBC_TimeContext = MBH_HashText(payload)
+End Function
+
+Private Function MBC_RejectStamp(ByVal value As String, ByVal utcMode As Boolean) As Boolean
+    Dim parsed As Date
+    On Error GoTo Rejected
+    If utcMode Then parsed = MBC_ParseUtcStamp(value) Else parsed = MBC_ParseStamp(value)
+    Exit Function
+Rejected:
+    MBC_RejectStamp = True
+End Function
+
+Private Function MBC_LocaleSelfTest(ByRef detail As String) As Boolean
+    Dim originalCalendar As Long, haveCalendar As Boolean, value As Date, currentUtc As Date
+    Dim context As String, bad As Variant, candidate As Variant
+    Dim n As Long, reason As String
+    On Error GoTo Failed
+    originalCalendar = Calendar: haveCalendar = True
+    value = MBC_GregorianDate(2024, 2, 29, 23, 59, 58)
+    Calendar = vbCalHijri
+    If MBC_Stamp(value) <> "2024-02-29T23:59:58" Then Err.Raise MBC_ERR + 20, , "Gregorian stamp varies with Calendar."
+    If Calendar <> vbCalHijri Then Err.Raise MBC_ERR + 21, , "Stamp helper did not restore Calendar."
+    If MBC_ParseStamp("2024-02-29T23:59:58") <> value Then Err.Raise MBC_ERR + 22, , "Strict Gregorian parser failed."
+    If MBC_ParseLegacyStamp("2024-02-29T23.59.58") <> value Then Err.Raise MBC_ERR + 22, , "Localized legacy timestamp failed."
+    If Calendar <> vbCalHijri Then Err.Raise MBC_ERR + 23, , "Parser did not restore Calendar."
+    If MBC_FileStamp(value) <> "20240229_235958" Then Err.Raise MBC_ERR + 24, , "ASCII filename stamp failed."
+    If MBC_ParseFileStamp("20240229_235958") <> value Then Err.Raise MBC_ERR + 25, , "Filename parser failed."
+    If MBC_YearMonth(value) <> "2024\02" Then Err.Raise MBC_ERR + 26, , "Gregorian year/month failed."
+    If MBC_ShiftMonths(MBC_GregorianDate(2024, 3, 31), -1) <> MBC_GregorianDate(2024, 2, 29) Then
+        Err.Raise MBC_ERR + 27, , "Gregorian calendar-month subtraction failed."
+    End If
+    bad = Array("2025-02-29T00:00:00", "2024-13-01T00:00:00", "2024-02-30T00:00:00", _
+        "2024-01-00T00:00:00", "2024-01-01T24:00:00", "2024-01-01T00:60:00", _
+        "2024-01-01T00:00:60", "2024/01/01T00:00:00", "2024-01-01 00:00:00", _
+        "02/03/2024 04:05:06", "2024-01-01T00:00:00Z", " 2024-01-01T00:00:00", _
+        ChrW$(&HFF12) & "024-01-01T00:00:00")
+    For Each candidate In bad
+        If Not MBC_RejectStamp(CStr(candidate), False) Then Err.Raise MBC_ERR + 28, , "Invalid local stamp was accepted."
+        If Calendar <> vbCalHijri Then Err.Raise MBC_ERR + 29, , "Failed parse did not restore Calendar."
+    Next candidate
+    If MBC_UtcStamp(value) <> "2024-02-29T23:59:58Z" Then Err.Raise MBC_ERR + 30, , "UTC stamp failed."
+    If MBC_ParseUtcStamp("2024-02-29T23:59:58Z") <> value Then Err.Raise MBC_ERR + 31, , "UTC parser failed."
+    If Not MBC_RejectStamp("2024-02-29T23:59:58", True) Then Err.Raise MBC_ERR + 32, , "Unqualified local stamp accepted as UTC."
+    currentUtc = MBC_UtcNow()
+    If Not MBC_ValidDate(currentUtc) Then Err.Raise MBC_ERR + 33, , "Windows UTC clock returned an unusable date."
+    context = MBC_TimeContext()
+    If Len(context) <> 64 Then Err.Raise MBC_ERR + 34, , "Timezone-context hash failed."
+    If Calendar <> vbCalHijri Then Err.Raise MBC_ERR + 35, , "Locale helper changed caller Calendar."
+    Calendar = originalCalendar: haveCalendar = False
+    detail = "PASS: ASCII Gregorian stamps, strict date rejection, Hijri restoration, UTC clock, timezone ABI."
+    MBC_LocaleSelfTest = True
+    Exit Function
+Failed:
+    n = Err.Number: reason = Err.Description
+    On Error Resume Next
+    If haveCalendar Then Calendar = originalCalendar
+    On Error GoTo 0
+    detail = "FAIL: locale/time check " & Trim$(Str$(n)) & " - " & reason
+End Function

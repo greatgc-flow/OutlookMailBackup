@@ -1,0 +1,4 @@
+' Bounded stable metadata comparison. Arbitrary MAPI/custom fields are not equal
+' merely because Subject/Body/attachments compare equal.
+Private Const MBE_CATEGORY_KEYWORDS As String = "http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/Keywords"
+Private Const MBE_MAX_CATEGORIES As Long = 1024

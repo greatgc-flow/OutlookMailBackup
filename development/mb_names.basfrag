@@ -1,0 +1,102 @@
+' v3.2: recover filename space previously used by the 64-hex revision suffix.
+' Full identity/revision and the full subject remain in the checked journal.
+' A filename is a search/display hint, never the authority for deduplication.
+
+Private Function MBN_SenderLabel(ByVal raw As String) As String
+    Dim value As String, parenthesis As Long
+    value = raw
+    parenthesis = InStr(1, value, "(", vbBinaryCompare)
+    If parenthesis > 0 Then value = Left$(value, parenthesis - 1)
+    ' Same original sender convention, without splitting a surrogate pair.
+    value = MBH_LeftUtf16(value, MBN_SENDER_UNITS)
+    If Len(Trim$(value)) = 0 Then value = "unknown"
+    MBN_SenderLabel = value
+End Function
+
+Private Function MBN_MessageLeaf(ByVal stamp15 As String, ByVal senderName As String, _
+                                 ByVal subject As String, ByVal parent As String) As String
+    Dim sender As String, prefix As String, stem As String, stemBudget As Long, code As Long, i As Long
+    ' The caller supplies a Gregorian, ASCII yyyyMMdd_HHmmss timestamp.
+    ' Do not call Format here: its result can depend on VBA.Calendar.
+    If Len(stamp15) <> 15 Or Mid$(stamp15, 9, 1) <> "_" Then
+        Err.Raise MB_ERR + 820, "MBN_MessageLeaf", "Invalid invariant filename timestamp."
+    End If
+    For i = 1 To 15
+        If i <> 9 Then
+            code = AscW(Mid$(stamp15, i, 1))
+            If code < 48 Or code > 57 Then
+                Err.Raise MB_ERR + 820, "MBN_MessageLeaf", "Filename timestamp must use ASCII digits."
+            End If
+        End If
+    Next i
+    sender = MBN_SenderLabel(senderName)
+    prefix = stamp15 & "_" & sender & "_"
+    stemBudget = MBH_MAX_PATH_UNITS - Len(parent) - 1 - Len(".msg") - MBN_COLLISION_RESERVE
+    If stemBudget < Len(prefix) + 1 Then
+        Err.Raise MB_ERR + 821, "MBN_MessageLeaf", "Message parent path leaves no subject space."
+    End If
+    ' Sanitizing the final leaf preserves literal spaces and valid Unicode,
+    ' including apostrophes and dots before the extension. Windows-forbidden
+    ' characters become underscores. Only the tail is shortened if required.
+    ' The 8-unit reserve accommodates the existing _r00001 collision suffix;
+    ' MB_UnusedFinal/CommitStage still provide no-overwrite collision handling.
+    If Len(Trim$(subject)) = 0 Then subject = vbNullString
+    stem = MBH_LeftUtf16(prefix & subject, stemBudget)
+    MBN_MessageLeaf = MBH_SafeComponent(stem & ".msg", stemBudget + 4, "message.msg")
+End Function
+
+Private Function MBN_TestRejectName(ByVal stamp15 As String, ByVal parent As String) As Boolean
+    Dim ignored As String
+    On Error GoTo Rejected
+    ignored = MBN_MessageLeaf(stamp15, "sender", "subject", parent)
+    Exit Function
+Rejected:
+    MBN_TestRejectName = True
+End Function
+
+Private Function MBN_SelfTest() As Boolean
+    ' Pure string tests: no mail creation, filesystem mutation or public macro.
+    Const STAMP As String = "20241107_093012"
+    Dim parent As String, leaf As String, prefix As String, subject As String
+    Dim emoji As String, stemBudget As Long, subjectBudget As Long, unicodeText As String
+    parent = "C:\Mail\account\2024\11"
+    leaf = MBN_MessageLeaf(STAMP, "ABCDEFGHIJK(Team)", "Quarterly report", parent)
+    If leaf <> STAMP & "_ABCDEFGHIJ_Quarterly report.msg" Then Exit Function
+    leaf = MBN_MessageLeaf(STAMP, "Kim (Team)", "O'Brien  Q4", parent)
+    If leaf <> STAMP & "_Kim _O'Brien  Q4.msg" Then Exit Function
+    leaf = MBN_MessageLeaf(STAMP, "sender", "A...  ", parent)
+    If leaf <> STAMP & "_sender_A...  .msg" Then Exit Function
+    subject = String$(120, "S")
+    leaf = MBN_MessageLeaf(STAMP, "sender", subject, parent)
+    If InStr(1, leaf, subject, vbBinaryCompare) = 0 Then Exit Function
+    If InStr(1, leaf, "__", vbBinaryCompare) > 0 Then Exit Function
+    unicodeText = ChrW$(&HD55C) & ChrW$(&HAE00) & ChrW$(&H4E2D) & ChrW$(&H6587)
+    leaf = MBN_MessageLeaf(STAMP, "sender", unicodeText, parent)
+    If leaf <> STAMP & "_sender_" & unicodeText & ".msg" Then Exit Function
+    leaf = MBN_MessageLeaf(STAMP, "sender", "CON.txt: A/B?*" & vbTab, parent)
+    If leaf <> STAMP & "_sender_CON.txt_ A_B___.msg" Then Exit Function
+    If MBN_MessageLeaf(STAMP, "   (Team)", "   ", parent) <> STAMP & "_unknown_.msg" Then Exit Function
+    If MBN_MessageLeaf(STAMP, "sender", "", parent) <> STAMP & "_sender_.msg" Then Exit Function
+    ' Account root 80 + \yyyy\mm 8 = parent 88 UTF-16 units.
+    parent = "C:\" & String$(77, "p") & "\2024\11"
+    prefix = STAMP & "_ABCDEFGHIJ_"
+    stemBudget = MBH_MAX_PATH_UNITS - Len(parent) - 1 - 4 - MBN_COLLISION_RESERVE
+    subjectBudget = stemBudget - Len(prefix)
+    If subjectBudget <> 107 Then Exit Function
+    leaf = MBN_MessageLeaf(STAMP, "ABCDEFGHIJ", String$(500, "X"), parent)
+    If Len(leaf) <> stemBudget + 4 Then Exit Function
+    If Len(parent) + 1 + Len(leaf) + MBN_COLLISION_RESERVE <> MBH_MAX_PATH_UNITS Then Exit Function
+    If InStr(1, leaf, "__", vbBinaryCompare) > 0 Then Exit Function
+    emoji = ChrW$(&HD83D) & ChrW$(&HDE00)
+    subject = String$(subjectBudget - 1, "X") & emoji & "tail"
+    leaf = MBN_MessageLeaf(STAMP, "ABCDEFGHIJ", subject, parent)
+    If leaf <> prefix & String$(subjectBudget - 1, "X") & ".msg" Then Exit Function
+    subject = String$(subjectBudget - 2, "X") & emoji & "tail"
+    leaf = MBN_MessageLeaf(STAMP, "ABCDEFGHIJ", subject, parent)
+    If leaf <> prefix & String$(subjectBudget - 2, "X") & emoji & ".msg" Then Exit Function
+    If MBN_SenderLabel(String$(9, "S") & emoji & "tail") <> String$(9, "S") Then Exit Function
+    If Not MBN_TestRejectName("20241107-093012", parent) Then Exit Function
+    If Not MBN_TestRejectName("20241107_09A012", parent) Then Exit Function
+    If Not MBN_TestRejectName(STAMP, "C:\" & String$(220, "P")) Then Exit Function
+    MBN_SelfTest = True
+End Function

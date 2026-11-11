@@ -1,0 +1,195 @@
+' Repair only a damaged stage record whose complete original payload is also
+' present as an independently checked record in the other ledger. Unknown
+' fragments are never dropped, inferred or converted into ownership proof.
+Private Function MBSR_Payload(ByVal raw As Variant) As String
+    Dim values(0 To 9) As String, i As Long
+    For i = 0 To 9
+        values(i) = CStr(raw(i))
+    Next i
+    MBSR_Payload = Join(values, vbTab)
+End Function
+
+Private Function MBSR_Identity(ByVal f As Variant) As String
+    Dim sequence As Double, stamp As Date, stage As String, final As String
+    If CStr(f(0)) <> "MBSTAGE1" Or StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 960, , "Stage repair payload has a different archive binding."
+    sequence = MB_ByteCount(CStr(f(8)))
+    If sequence < 1 Or sequence > 2000000000# Or sequence <> Fix(sequence) Then _
+        Err.Raise MB_ERR + 961, , "Stage repair payload has an invalid sequence."
+    stamp = MBC_ParseUtcStamp(CStr(f(9)))
+    If Not MBC_ValidDate(stamp) Then Err.Raise MB_ERR + 962, , "Stage repair payload lacks a complete UTC timestamp."
+    stage = MBH_NormalizePath(CStr(f(2)))
+    final = MBH_NormalizePath(CStr(f(3)))
+    If Len(stage) = 0 Or Len(final) = 0 Then Err.Raise MB_ERR + 963, , "Stage repair payload lacks a path."
+    MBSR_Identity = LCase$(stage) & "|" & Format$(sequence, "0")
+End Function
+
+Private Function MBSR_CheckedRecord(ByVal line As String, ByRef payload As String, ByRef identity As String) As Boolean
+    Dim f As Variant, raw As Variant
+    On Error GoTo Invalid
+    f = MB_ReadCheckedLine(line, 10)
+    identity = MBSR_Identity(f)
+    raw = Split(line, vbTab)
+    payload = MBSR_Payload(raw)
+    MBSR_CheckedRecord = True
+Invalid:
+End Function
+
+Private Function MBSR_UnprovenPayload(ByVal line As String, ByRef payload As String, ByRef identity As String) As Boolean
+    Dim raw As Variant, f As Variant
+    On Error GoTo Invalid
+    If Len(line) > 16384 Then Exit Function
+    raw = Split(line, vbTab)
+    ' Only the normal checksum/END framing may be damaged or truncated. Extra
+    ' fields could contain another unknown record and are never discarded.
+    If UBound(raw) < 9 Or UBound(raw) > 11 Then Exit Function
+    If UBound(raw) >= 10 Then
+        If Len(CStr(raw(10))) > 64 Then Exit Function
+    End If
+    If UBound(raw) = 11 Then
+        If Len(CStr(raw(11))) > 3 Then Exit Function
+    End If
+    payload = MBSR_Payload(raw)
+    f = MBM_Unpack(payload, 10)
+    identity = MBSR_Identity(f)
+    ' This is only a candidate, NOT a validated record. The other file must
+    ' supply an exact payload with its original valid checksum and END marker.
+    MBSR_UnprovenPayload = True
+Invalid:
+End Function
+
+Private Function MBSR_RepairOne(ByVal target As String, ByVal counterpart As String, _
+                                ByVal recoveryRoot As String) As Long
+    Const MAX_BAD_ROWS As Long = 64
+    Dim reader As Object, writer As Object, bad As Object, wanted As Object, proven As Object
+    Dim line As String, payload As String, identity As String, rowKey As Variant
+    Dim rowNumber As Long, targetRows As Long, rewritten As Long, expected As String
+    Dim sourceHash As String, newHash As String, preservedRoot As String, preserved As String, stage As String
+    Dim n As Long, detail As String
+#If VBA7 Then
+    Dim targetGuard As LongPtr, counterpartGuard As LongPtr, stageGuard As LongPtr
+#Else
+    Dim targetGuard As Long, counterpartGuard As Long, stageGuard As Long
+#End If
+    On Error GoTo Failed
+    If Not gFSO.FileExists(target) Or Not gFSO.FileExists(counterpart) Then Exit Function
+    MBY_NoReparse target, True: MBY_NoReparse counterpart, True
+    targetGuard = MBH_GuardFile(target)
+    counterpartGuard = MBH_GuardFile(counterpart)
+    Set bad = CreateObject("Scripting.Dictionary")
+    Set wanted = CreateObject("Scripting.Dictionary")
+    Set proven = CreateObject("Scripting.Dictionary")
+    bad.CompareMode = vbBinaryCompare: wanted.CompareMode = vbTextCompare: proven.CompareMode = vbBinaryCompare
+    Set reader = gFSO.OpenTextFile(target, 1, False, -1)
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine: rowNumber = rowNumber + 1
+        If Len(line) > 0 Then
+            If Not MBSR_CheckedRecord(line, payload, identity) Then
+                If bad.Count >= MAX_BAD_ROWS Then GoTo Unproven
+                If Not MBSR_UnprovenPayload(line, payload, identity) Then GoTo Unproven
+                If wanted.Exists(identity) Then
+                    If CStr(wanted(identity)) <> payload Then GoTo Unproven
+                End If
+                wanted(identity) = payload
+                bad(CStr(rowNumber)) = payload
+            End If
+        End If
+    Loop
+    targetRows = rowNumber
+    reader.Close: Set reader = Nothing
+    If bad.Count = 0 Then GoTo Unproven
+    Set reader = gFSO.OpenTextFile(counterpart, 1, False, -1)
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine
+        If Len(line) > 0 Then
+            If MBSR_CheckedRecord(line, payload, identity) Then
+                If wanted.Exists(identity) Then
+                    If CStr(wanted(identity)) <> payload Then GoTo Unproven
+                    proven(payload) = line
+                End If
+            End If
+        End If
+    Loop
+    reader.Close: Set reader = Nothing
+    For Each rowKey In bad.Keys
+        If Not proven.Exists(CStr(bad(rowKey))) Then GoTo Unproven
+    Next rowKey
+    sourceHash = MBH_HashFile(target)
+    stage = MBH_JoinPath(CStr(gFSO.GetParentFolderName(target)), "_mb_stage_repair_" & gFSO.GetTempName)
+    Set writer = gFSO.CreateTextFile(stage, False, True)
+    Set reader = gFSO.OpenTextFile(target, 1, False, -1)
+    rowNumber = 0
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine: rowNumber = rowNumber + 1
+        If bad.Exists(CStr(rowNumber)) Then
+            expected = CStr(bad(CStr(rowNumber)))
+            If Not MBSR_UnprovenPayload(line, payload, identity) Then _
+                Err.Raise MB_ERR + 964, , "Stage repair source changed during guarded rewrite."
+            If payload <> expected Then Err.Raise MB_ERR + 964, , "Stage repair payload changed during rewrite."
+            writer.WriteLine CStr(proven(expected))
+            rewritten = rewritten + 1
+        Else
+            ' Preserve every valid/blank historical row, including other accounts.
+            writer.WriteLine line
+        End If
+    Loop
+    reader.Close: Set reader = Nothing
+    writer.Close: Set writer = Nothing
+    If rowNumber <> targetRows Or rewritten <> bad.Count Then _
+        Err.Raise MB_ERR + 965, , "Stage repair row reconciliation failed."
+    MBM_FlushPath stage
+    stageGuard = MBH_GuardFile(stage)
+    newHash = MBH_HashFile(stage)
+    preservedRoot = MBH_JoinPath(recoveryRoot, "preserved")
+    MBY_NoReparse preservedRoot, False
+    MBH_EnsureDirectory preservedRoot
+    preserved = MBH_JoinPath(preservedRoot, "stage_repair_" & gRunId & "_" & _
+        gFSO.GetBaseName(gFSO.GetTempName) & ".raw")
+    gFSO.CopyFile target, preserved, False
+    MBM_FlushPath preserved
+    If MBH_HashFile(preserved) <> sourceHash Or MBH_HashFile(target) <> sourceHash Then _
+        Err.Raise MB_ERR + 966, , "Original stage ledger was not preserved exactly."
+    ' No replacement occurs until the original is independently durable and
+    ' every changed row has an exact independently verified counterpart.
+    MBH_CloseGuard stageGuard
+    MBH_CloseGuard targetGuard
+    MBH_CloseGuard counterpartGuard
+    If MBM_MoveFileExW(StrPtr(stage), StrPtr(target), 9) = 0 Then _
+        Err.Raise MB_ERR + 967, , "Atomic stage-ledger repair failed. Win32=" & CStr(Err.LastDllError)
+    MBM_FlushPath target
+    If MBH_HashFile(target) <> newHash Then Err.Raise MB_ERR + 968, , "Repaired stage ledger changed after publication."
+    MB_LogEvent "WARNING", "STAGE_LEDGER_REPAIRED_FROM_COUNTERPART", "", target, 0, _
+        "Repaired checked rows=" & CStr(rewritten) & "; exact original preserved at " & preserved
+    MBSR_RepairOne = rewritten
+    Exit Function
+Unproven:
+    If Not reader Is Nothing Then reader.Close: Set reader = Nothing
+    MBH_CloseGuard targetGuard
+    MBH_CloseGuard counterpartGuard
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not reader Is Nothing Then reader.Close
+    If Not writer Is Nothing Then writer.Close
+    MBH_CloseGuard stageGuard
+    MBH_CloseGuard targetGuard
+    MBH_CloseGuard counterpartGuard
+    ' Keep any owned intermediate for diagnosis; never remove unknown bytes.
+    On Error GoTo 0
+    Err.Raise n, "MBSR_RepairOne", detail
+End Function
+
+Private Function MBS_RepairStageLedgers(ByVal primary As String, ByVal mirror As String) As Long
+    Dim recoveryRoot As String
+    primary = MBH_NormalizePath(primary): mirror = MBH_NormalizePath(mirror)
+    If StrComp(primary, MB_StatePath("stages.tsv"), vbTextCompare) <> 0 Or _
+       StrComp(mirror, gStageMirror, vbTextCompare) <> 0 Or _
+       StrComp(CStr(gFSO.GetFileName(mirror)), "stage-intents.tsv", vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 969, , "Stage repair destinations do not match their exact owned bindings."
+    recoveryRoot = CStr(gFSO.GetParentFolderName(mirror))
+    If Not MBR_IsRecoveryDirectory(recoveryRoot) Then _
+        Err.Raise MB_ERR + 970, , "Stage repair requires a verified independent recovery directory."
+    MBS_RepairStageLedgers = MBSR_RepairOne(primary, mirror, recoveryRoot)
+    MBS_RepairStageLedgers = MBS_RepairStageLedgers + MBSR_RepairOne(mirror, primary, recoveryRoot)
+End Function

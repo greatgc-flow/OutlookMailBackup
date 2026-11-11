@@ -1,0 +1,494 @@
+' ======================== Adaptive backup coverage ==========================
+' The UTC checkpoint is the START of a completed inventory/backup pass, never
+' its end. A seven-day overlap repeats its boundary. There is NO elapsed-day cap
+' that silently drops a long absence. Unknown source IDs and changed modification
+' stamps are eligible at ANY mail date, including restored historical messages.
+' Every AUTO pass inventories all declared folders WITHOUT a regional date query.
+' Up to 500 recorded historical source identities also receive content comparison
+' in a deterministic rotating audit. This is a per-run budget, not a deadline or
+' proof against providers changing content without changing any metadata.
+Private Sub MBW_Reset()
+    Set gWindowKnown = Nothing: Set gWindowAudit = Nothing
+    Set gWindowAuditOrder = Nothing: Set gWindowAuditSeen = Nothing
+    Set gWindowAuditResults = Nothing: Set gWindowSourcePending = Nothing
+    gWindowAuditPath = "": gWindowAuditCommitted = False
+    gWindowAuditStateIssues = 0: gWindowAuditResultsWritten = 0: gWindowRetryQueued = 0
+    gWindowAuditPass = 0: gWindowAuditLoaded = False
+    gWindowStore = "": gWindowStartUTC = 0: gWindowPreviousUTC = 0
+    gWindowContext = "": gWindowPath = "": gWindowCursor = "": gWindowNextCursor = ""
+    gWindowFull = False: gWindowReady = False: gWindowInventoryComplete = False
+    gWindowCommitted = False: gWindowNote = ""
+    gWindowNew = 0: gWindowChanged = 0: gWindowRecent = 0: gWindowAuditQueued = 0
+    gWindowFullQueued = 0: gWindowHistoricalSkipped = 0: gWindowBadRows = 0: gWindowPolicyQueued = 0
+End Sub
+
+Private Sub MBW_Start(ByVal storeId As String)
+    gWindowStore = storeId
+    Set gWindowKnown = CreateObject("Scripting.Dictionary")
+    gWindowKnown.CompareMode = vbBinaryCompare
+    Set gWindowAudit = CreateObject("Scripting.Dictionary")
+    gWindowAudit.CompareMode = vbBinaryCompare
+    Set gWindowAuditSeen = CreateObject("Scripting.Dictionary")
+    gWindowAuditSeen.CompareMode = vbBinaryCompare
+    Set gWindowAuditResults = CreateObject("Scripting.Dictionary")
+    gWindowAuditResults.CompareMode = vbBinaryCompare
+    Set gWindowSourcePending = CreateObject("Scripting.Dictionary")
+    gWindowSourcePending.CompareMode = vbBinaryCompare
+    Set gWindowAuditOrder = New Collection
+    gWindowStartUTC = MBC_UtcNow()
+    If Not MBC_ValidDate(gWindowStartUTC) Then Err.Raise MB_ERR + 742, , "UTC clock is outside the supported 1900-2099 range."
+    gWindowContext = MBC_TimeContext()
+End Sub
+
+Private Sub MBW_CacheRecord(ByVal f As Variant)
+    Dim kind As String
+    If gWindowKnown Is Nothing Then Exit Sub
+    If StrComp(CStr(f(7)), gWindowStore, vbBinaryCompare) <> 0 Then Exit Sub
+    kind = CStr(f(1))
+    If kind <> "M" And kind <> "N" And kind <> "L" And kind <> "R" Then Exit Sub
+    ' f(4) is output-file bytes, NOT source MailItem.Size. Never compare those.
+    ' Normalize only the fixed Gregorian component order used by older records.
+    ' Unknown/corrupt forms remain different and force a content comparison.
+    gWindowKnown(CStr(f(6))) = MBW_NormalizeKnownStamp(CStr(f(10)))
+End Sub
+
+Private Sub MBW_Prepare()
+    Dim stream As Object, line As String, latest As Variant, f As Variant
+    Dim saved As Boolean, n As Long, detail As String
+    On Error GoTo Failed
+    If gWindowKnown Is Nothing Then Err.Raise MB_ERR + 740, , "Adaptive inventory was not initialized."
+    gWindowPath = MB_StatePath("coverage_" & _
+        Left$(MBH_HashText(MB_EncodeFields(Array(gWindowStore, LCase$(gAutoAccount)))), 32) & ".tsv")
+    MBY_NoReparse gWindowPath, False
+    If gFSO.FileExists(gWindowPath) Then
+        Set stream = gFSO.OpenTextFile(gWindowPath, 1, False, -1)
+        Do Until stream.AtEndOfStream
+            If Not MB_ContinueWork() Then stream.Close: Exit Sub
+            line = stream.ReadLine
+            If Len(line) > 0 Then
+                If MBW_ReadCheckpoint(line, f) Then
+                    latest = f: saved = True
+                Else
+                    gWindowBadRows = gWindowBadRows + 1
+                End If
+            End If
+        Loop
+        stream.Close: Set stream = Nothing
+    End If
+    If saved Then
+        gWindowPreviousUTC = MBC_ParseUtcStamp(CStr(latest(4)))
+        gWindowCursor = CStr(latest(7))
+        If CStr(latest(5)) <> gWindowContext Or CStr(latest(6)) <> MBW_POLICY Then
+            gWindowFull = True
+            gWindowNote = "Time-zone rules or coverage policy changed: reconcile all current mail."
+        ElseIf gWindowPreviousUTC > gWindowStartUTC Then
+            gWindowFull = True
+            gWindowNote = "Clock is earlier than the last checkpoint: reconcile all current mail."
+        Else
+            If CDbl(gWindowPreviousUTC) < 2# + MBW_OVERLAP_DAYS Then
+                gWindowFull = True
+                gWindowNote = "Coverage overlap reaches before the supported mail epoch: reconcile all current mail."
+            Else
+                gSince = MBC_UtcToLocal(DateAdd("d", -MBW_OVERLAP_DAYS, gWindowPreviousUTC))
+                gWindowNote = "Last successful scan START in UTC minus 7 days; no maximum-gap cutoff."
+            End If
+        End If
+    Else
+        If gWindowKnown.Count > 0 Then
+            gWindowFull = True
+            gWindowNote = "No valid UTC checkpoint with existing indexed history: reconcile all current mail."
+        ElseIf CDbl(gWindowStartUTC) < 2# + MBW_INITIAL_DAYS Then
+            gWindowFull = True
+            gWindowNote = "Initial range reaches before the supported mail epoch: reconcile all current mail."
+        Else
+            gSince = MBC_UtcToLocal(DateAdd("d", -MBW_INITIAL_DAYS, gWindowStartUTC))
+            gWindowNote = "No UTC checkpoint: 30-day baseline plus every unknown/changed identity at any date."
+        End If
+    End If
+    If gRecoveryForceFull Then
+        gWindowFull = True
+        gWindowNote = "Recovered control state or rebuilt MSG baseline: reconcile every current source before advancing coverage."
+    End If
+    If gWindowFull Then gSince = 0
+    gUntil = MBC_UtcToLocal(gWindowStartUTC)
+    MBW_LoadAuditState
+    MBW_BuildAudit
+    MB_LogEvent "INFO", "ADAPTIVE_RANGE", "", gWindowPath, 0, gWindowNote & _
+        " UTC start=" & MBC_UtcStamp(gWindowStartUTC) & "; local since=" & MB_Stamp(gSince) & _
+        "; audit identities=" & CStr(gWindowAudit.Count) & "; invalid checkpoint rows=" & CStr(gWindowBadRows)
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBW_Prepare", detail
+End Sub
+
+Private Function MBW_ReadCheckpoint(ByVal line As String, ByRef f As Variant) As Boolean
+    Dim stamp As Date
+    On Error GoTo Invalid
+    f = MB_ReadCheckedLine(line, 9)
+    If CStr(f(0)) <> "MBWINDOW1" Then Exit Function
+    If StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), gWindowStore, vbBinaryCompare) <> 0 Or _
+       StrComp(CStr(f(3)), gAutoAccount, vbTextCompare) <> 0 Then Exit Function
+    stamp = MBC_ParseUtcStamp(CStr(f(4)))
+    If Not MBC_ValidDate(stamp) Then Exit Function
+    If Not MB_IsHexKey(CStr(f(5))) Then Exit Function
+    If Len(CStr(f(7))) > 0 Then
+        If Not MB_IsHexKey(CStr(f(7))) Then Exit Function
+    End If
+    If Len(CStr(f(6))) = 0 Or Len(CStr(f(8))) = 0 Then Exit Function
+    MBW_ReadCheckpoint = True
+Invalid:
+End Function
+
+Private Sub MBW_BuildAudit()
+    Dim keys As Variant, i As Long, first As Long, count As Long, picked As Long
+    gWindowAudit.RemoveAll
+    Set gWindowAuditOrder = New Collection
+    gWindowNextCursor = gWindowCursor
+    count = gWindowKnown.Count
+    If count = 0 Then Exit Sub
+    keys = gWindowKnown.Keys
+    MBW_SortKeys keys, LBound(keys), UBound(keys)
+    first = LBound(keys)
+    If Len(gWindowCursor) > 0 Then
+        Do While first <= UBound(keys)
+            If StrComp(CStr(keys(first)), gWindowCursor, vbBinaryCompare) > 0 Then Exit Do
+            first = first + 1
+        Loop
+        If first > UBound(keys) Then first = LBound(keys)
+    End If
+    i = first
+    Do
+        gWindowAudit(CStr(keys(i))) = True
+        gWindowAuditOrder.Add CStr(keys(i))
+        gWindowNextCursor = CStr(keys(i))
+        picked = picked + 1
+        If picked >= MBW_AUDIT_LIMIT Or picked >= count Then Exit Do
+        i = i + 1
+        If i > UBound(keys) Then i = LBound(keys)
+    Loop
+End Sub
+
+Private Sub MBW_SortKeys(ByRef keys As Variant, ByVal first As Long, ByVal last As Long)
+    Dim i As Long, j As Long, pivot As String, temporary As Variant
+    i = first: j = last: pivot = CStr(keys((first + last) \ 2))
+    Do While i <= j
+        Do While StrComp(CStr(keys(i)), pivot, vbBinaryCompare) < 0: i = i + 1: Loop
+        Do While StrComp(CStr(keys(j)), pivot, vbBinaryCompare) > 0: j = j - 1: Loop
+        If i <= j Then
+            temporary = keys(i): keys(i) = keys(j): keys(j) = temporary
+            i = i + 1: j = j - 1
+        End If
+    Loop
+    If first < j Then MBW_SortKeys keys, first, j
+    If i < last Then MBW_SortKeys keys, i, last
+End Sub
+
+Private Function MBW_ShouldQueue(ByVal sourceKey As String, ByVal observedMod As Date, _
+    ByVal effectiveDate As Date, ByVal sinceDate As Date, ByVal untilDate As Date) As Boolean
+    If gWindowKnown Is Nothing Then Err.Raise MB_ERR + 741, , "Adaptive source index is unavailable."
+    MBW_ShouldQueue = True
+    If Not gWindowAuditSeen Is Nothing Then
+        If gWindowAudit.Exists(sourceKey) Then gWindowAuditSeen(sourceKey) = True
+    End If
+    If Not gWindowSourcePending Is Nothing Then
+        If gWindowSourcePending.Exists(sourceKey) Then
+            gWindowRetryQueued = gWindowRetryQueued + 1
+            Exit Function
+        End If
+    End If
+    If Not gWindowKnown.Exists(sourceKey) Then
+        gWindowNew = gWindowNew + 1
+    ElseIf CStr(gWindowKnown(sourceKey)) <> MB_Stamp(observedMod) Then
+        gWindowChanged = gWindowChanged + 1
+    ElseIf MBV_RequiresCurrentPolicy(sourceKey) Then
+        gWindowPolicyQueued = gWindowPolicyQueued + 1
+    ElseIf gWindowFull Then
+        gWindowFullQueued = gWindowFullQueued + 1
+    ElseIf gWindowAudit.Exists(sourceKey) Then
+        gWindowAuditQueued = gWindowAuditQueued + 1
+    ElseIf (effectiveDate >= sinceDate And effectiveDate <= untilDate) Or _
+           (observedMod >= sinceDate And observedMod <= untilDate) Then
+        gWindowRecent = gWindowRecent + 1
+    Else
+        MBW_ShouldQueue = False
+        gWindowHistoricalSkipped = gWindowHistoricalSkipped + 1
+    End If
+End Function
+
+Private Function MBW_RequireContentCheck(ByVal sourceKey As String) As Boolean
+    If gMode <> "AUTO" Then Exit Function
+    If gWindowFull Then MBW_RequireContentCheck = True: Exit Function
+    If MBV_RequiresCurrentPolicy(sourceKey) Then MBW_RequireContentCheck = True: Exit Function
+    If Not gWindowSourcePending Is Nothing Then
+        If gWindowSourcePending.Exists(sourceKey) Then MBW_RequireContentCheck = True: Exit Function
+    End If
+    If Not gWindowAudit Is Nothing Then MBW_RequireContentCheck = gWindowAudit.Exists(sourceKey)
+End Function
+
+Private Function MBW_CanCommit() As Boolean
+    If gMode <> "AUTO" Or Len(gWindowPath) = 0 Or gAutoSetupPhase <> "READY" Then Exit Function
+    If Not gWindowInventoryComplete Then Exit Function
+    If MBR_HasReview() Then Exit Function
+    If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then Exit Function
+    If gMailFailed <> 0 Or gMailChanged <> 0 Or gMailPending <> 0 Or gMailReview <> 0 Or _
+       gMailPolicy <> 0 Or gContentReview <> 0 Or gAttFailed <> 0 Or gAttPending <> 0 Or _
+       gFolderFailures <> 0 Or gScanChanged <> 0 Or gJournalIssues <> 0 Or gAutoFailureCount <> 0 Then Exit Function
+    If gProcessed <> gPlanned Then Exit Function
+    MBW_CanCommit = True
+End Function
+
+Private Sub MBW_PrepareCommit()
+    gWindowReady = False
+    If Not MBW_CanCommit() Then Exit Sub
+    MB_FlushJournal
+    If gFSO.FileExists(gJournalPath) Then MBM_FlushPath gJournalPath
+    gWindowReady = True
+End Sub
+
+Private Sub MBW_CommitAfterClose()
+    Dim stream As Object, payload As String, n As Long, detail As String
+    If Not gWindowReady Or Not MBW_CanCommit() Then Exit Sub
+    On Error GoTo Failed
+    ' Caller still holds the archive/account locks; all journal/event streams
+    ' are closed. A torn checkpoint never advances past its last checked row.
+    MBY_NoReparse gWindowPath, False
+    payload = MB_EncodeFields(Array("MBWINDOW1", gRoot, gWindowStore, gAutoAccount, _
+        MBC_UtcStamp(gWindowStartUTC), gWindowContext, MBW_POLICY, gWindowCursor, gRunId))
+    Set stream = gFSO.OpenTextFile(gWindowPath, 8, True, -1)
+    stream.WriteLine ""
+    MB_WriteCheckedLine stream, payload
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath gWindowPath
+    gWindowCommitted = True
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBW_CommitAfterClose", detail
+End Sub
+
+Private Function MBW_Summary() As String
+    If Len(gWindowStore) = 0 Then Exit Function
+    MBW_Summary = vbCrLf & "Adaptive coverage: " & gWindowNote & vbCrLf & _
+        "UTC scan start: " & MBC_UtcStamp(gWindowStartUTC) & "; prior successful start: " & _
+        MBC_UtcStamp(gWindowPreviousUTC) & vbCrLf & _
+        "Inventory selections (exclusive): unknown=" & CStr(gWindowNew) & _
+        "; modified=" & CStr(gWindowChanged) & "; validation-policy=" & CStr(gWindowPolicyQueued) & _
+        "; context reconcile=" & CStr(gWindowFullQueued) & _
+        "; rotating audit=" & CStr(gWindowAuditQueued) & "; recent=" & CStr(gWindowRecent) & vbCrLf & _
+        "Older recorded unchanged items deferred: " & CStr(gWindowHistoricalSkipped) & _
+        "; source-audit budget=" & CStr(MBW_AUDIT_LIMIT) & " identities/run (independent file audit also runs)" & vbCrLf & _
+        "UTC coverage checkpoint advanced: " & CStr(gWindowCommitted) & _
+        "; invalid checkpoint rows ignored: " & CStr(gWindowBadRows) & vbCrLf & _
+        "Source-audit cursor committed independently: " & CStr(gWindowAuditCommitted) & _
+        "; durable outcomes=" & CStr(gWindowAuditResultsWritten) & _
+        "; outstanding source reviews=" & CStr(MBW_SourcePendingCount()) & _
+        "; forced review retries=" & CStr(gWindowRetryQueued) & _
+        "; invalid source-audit rows=" & CStr(gWindowAuditStateIssues)
+End Function
+' Source comparison progress is separate from mail coverage. A REVIEW result
+' advances the audit only after its retry obligation was written and flushed.
+' A cancelled/unvisited item never becomes a successful audit result.
+Private Function MBW_NormalizeKnownStamp(ByVal value As String) As String
+    Dim parsed As Date
+    MBW_NormalizeKnownStamp = value
+    On Error GoTo Unchanged
+    parsed = MBC_ParseLegacyStamp(value)
+    MBW_NormalizeKnownStamp = MB_Stamp(parsed)
+Unchanged:
+End Function
+
+Private Function MBW_SourcePendingCount() As Long
+    If Not gWindowSourcePending Is Nothing Then MBW_SourcePendingCount = gWindowSourcePending.Count
+End Function
+
+Private Function MBW_HasAuditReview() As Boolean
+    MBW_HasAuditReview = (MBW_SourcePendingCount() > 0 Or gWindowAuditStateIssues > 0)
+End Function
+
+Private Sub MBW_LoadAuditState()
+    Dim stream As Object, line As String, f As Variant, n As Long, detail As String
+    Dim sawCursor As Boolean
+    On Error GoTo Failed
+    gWindowAuditLoaded = False
+    gWindowAuditPath = MB_StatePath("source_audit_" & _
+        Left$(MBH_HashText(MB_EncodeFields(Array(gWindowStore, LCase$(gAutoAccount)))), 32) & ".tsv")
+    MBY_NoReparse gWindowAuditPath, False
+    If Not gFSO.FileExists(gWindowAuditPath) Then
+        gWindowAuditLoaded = True
+        Exit Sub
+    End If
+    gWindowSourcePending.RemoveAll
+    Set stream = gFSO.OpenTextFile(gWindowAuditPath, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        If Not MB_ContinueWork() Then stream.Close: Exit Sub
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            If sawCursor Then Err.Raise MB_ERR + 745, , "Unexpected data after source-audit snapshot terminator."
+            If MBW_ReadAuditRow(line, f) Then
+                Select Case CStr(f(5))
+                    Case "CURSOR"
+                        gWindowCursor = CStr(f(6))
+                        sawCursor = True
+                    Case "REVIEW"
+                        gWindowSourcePending(CStr(f(4))) = CStr(f(6))
+                    Case "OK"
+                        If gWindowSourcePending.Exists(CStr(f(4))) Then gWindowSourcePending.Remove CStr(f(4))
+                    Case "ABSENT"
+                        ' Absence is an inventory observation, not proof that an
+                        ' earlier content problem was repaired. Keep its review.
+                End Select
+            Else
+                gWindowAuditStateIssues = gWindowAuditStateIssues + 1
+                Err.Raise MB_ERR + 744, , "Source audit state is damaged; recover its last complete snapshot before resuming."
+            End If
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    If Not sawCursor Then Err.Raise MB_ERR + 746, , "Incomplete source-audit snapshot: terminal cursor is missing."
+    gWindowAuditLoaded = True
+    If gWindowAuditStateIssues > 0 Then MB_LogEvent "WARNING", "SOURCE_AUDIT_STATE_REVIEW", "", _
+        gWindowAuditPath, 0, "Invalid audit-state rows retained; unresolved history may be incomplete."
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBW_LoadAuditState", detail
+End Sub
+
+Private Function MBW_ReadAuditRow(ByVal line As String, ByRef f As Variant) As Boolean
+    Dim stamp As Date
+    On Error GoTo Invalid
+    f = MB_ReadCheckedLine(line, 9)
+    If CStr(f(0)) <> "MBSOURCEAUDIT1" Then Exit Function
+    If StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), gWindowStore, vbBinaryCompare) <> 0 Or _
+       StrComp(CStr(f(3)), gAutoAccount, vbTextCompare) <> 0 Then Exit Function
+    stamp = MBC_ParseUtcStamp(CStr(f(7)))
+    If Not MBC_ValidDate(stamp) Or Len(CStr(f(8))) = 0 Then Exit Function
+    Select Case CStr(f(5))
+        Case "CURSOR"
+            If Len(CStr(f(4))) > 0 Then Exit Function
+            If Len(CStr(f(6))) > 0 Then
+                If Not MB_IsHexKey(CStr(f(6))) Then Exit Function
+            End If
+        Case "OK", "REVIEW", "ABSENT"
+            If Not MB_IsHexKey(CStr(f(4))) Then Exit Function
+        Case Else
+            Exit Function
+    End Select
+    MBW_ReadAuditRow = True
+Invalid:
+End Function
+
+Private Sub MBW_RecordAuditResult(ByVal sourceKey As String, ByVal outcome As Long, _
+                                  Optional ByVal contentLimited As Boolean = False)
+    Dim detail As String, isSuccess As Boolean, relevant As Boolean
+    If (gMode <> "AUTO" And gMode <> "REGISTER_LEGACY") Or Len(gWindowAuditPath) = 0 Then Exit Sub
+    If outcome = 5 Then Exit Sub
+    If gMode = "REGISTER_LEGACY" And outcome = 8 Then Exit Sub
+    If Not MB_IsHexKey(sourceKey) Then Err.Raise MB_ERR + 743, , "Invalid source-audit identity."
+    isSuccess = ((outcome = 1 Or outcome = 2) And Not contentLimited)
+    relevant = Not isSuccess
+    If gWindowAudit.Exists(sourceKey) Or gWindowSourcePending.Exists(sourceKey) Then relevant = True
+    If Not relevant Then Exit Sub
+    If isSuccess Then
+        detail = "OK"
+    Else
+        detail = "REVIEW|outcome=" & CStr(outcome)
+        If contentLimited Then detail = detail & "; special attachment/content proof remains limited"
+    End If
+    gWindowAuditResults(sourceKey) = detail
+End Sub
+
+Private Sub MBW_AppendAuditRow(ByVal stream As Object, ByVal sourceKey As String, _
+                              ByVal state As String, ByVal detail As String)
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBSOURCEAUDIT1", gRoot, gWindowStore, _
+        gAutoAccount, sourceKey, state, detail, MBC_UtcStamp(MBC_UtcNow()), gRunId))
+End Sub
+
+Private Sub MBW_FinishAudit()
+    Dim stream As Object, key As Variant, value As String, cursor As String
+    Dim n As Long, detail As String, completed As Boolean, reportPath As String
+    Dim snapshot As Collection
+    If (gMode <> "AUTO" And gMode <> "REGISTER_LEGACY") Or Len(gWindowAuditPath) = 0 Then Exit Sub
+    If gWindowAuditResults Is Nothing Or gWindowAuditOrder Is Nothing Or Not gWindowAuditLoaded Then Exit Sub
+    On Error GoTo Failed
+    MB_EnsureDir CStr(gFSO.GetParentFolderName(gWindowAuditPath))
+    MBY_NoReparse gWindowAuditPath, False
+    gWindowAuditPass = gWindowAuditPass + 1
+    reportPath = MBH_JoinPath(gRunDir, "source_audit_" & MBC_Digits(gWindowAuditPass, 4) & ".tsv")
+    Set stream = gFSO.CreateTextFile(reportPath, False, True)
+    For Each key In gWindowAuditResults.Keys
+        value = CStr(gWindowAuditResults(key))
+        If value = "OK" Then
+            MBW_AppendAuditRow stream, CStr(key), "OK", "Current source content verified."
+            If gWindowSourcePending.Exists(CStr(key)) Then gWindowSourcePending.Remove CStr(key)
+        Else
+            MBW_AppendAuditRow stream, CStr(key), "REVIEW", value
+            gWindowSourcePending(CStr(key)) = value
+        End If
+        gWindowAuditResultsWritten = gWindowAuditResultsWritten + 1
+    Next key
+    cursor = gWindowCursor
+    If gWindowInventoryComplete Then
+        For Each key In gWindowAuditOrder
+            completed = gWindowAuditResults.Exists(CStr(key))
+            If Not completed And Not gWindowAuditSeen.Exists(CStr(key)) Then
+                MBW_AppendAuditRow stream, CStr(key), "ABSENT", _
+                    "Source absent from completed inventory; independent physical file audit remains applicable."
+                gWindowAuditResultsWritten = gWindowAuditResultsWritten + 1
+                completed = True
+            End If
+            If Not completed Then Exit For
+            cursor = CStr(key)
+        Next key
+    End If
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath reportPath
+    ' The compact snapshot contains every unresolved identity plus the cursor.
+    ' Atomic replacement cannot publish a cursor without its retry obligations.
+    Set snapshot = New Collection
+    For Each key In gWindowSourcePending.Keys
+        snapshot.Add MBW_CheckedText(Array("MBSOURCEAUDIT1", gRoot, gWindowStore, gAutoAccount, _
+            CStr(key), "REVIEW", CStr(gWindowSourcePending(key)), MBC_UtcStamp(MBC_UtcNow()), gRunId))
+    Next key
+    snapshot.Add MBW_CheckedText(Array("MBSOURCEAUDIT1", gRoot, gWindowStore, gAutoAccount, _
+        "", "CURSOR", cursor, MBC_UtcStamp(MBC_UtcNow()), gRunId))
+    MBS_WriteAtomic gWindowAuditPath, MBW_LinesText(snapshot)
+    gWindowCursor = cursor
+    gWindowAuditCommitted = True
+    gWindowAuditResults.RemoveAll
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBW_FinishAudit", detail
+End Sub
+
+Private Function MBW_CheckedText(ByVal values As Variant) As String
+    Dim payload As String
+    payload = MB_EncodeFields(values)
+    MBW_CheckedText = payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+End Function
+
+Private Function MBW_LinesText(ByVal rows As Collection) As String
+    Dim values() As String, i As Long
+    If rows.Count = 0 Then Exit Function
+    ReDim values(0 To rows.Count - 1)
+    For i = 1 To rows.Count
+        values(i - 1) = CStr(rows(i))
+    Next i
+    MBW_LinesText = Join(values, vbCrLf) & vbCrLf
+End Function

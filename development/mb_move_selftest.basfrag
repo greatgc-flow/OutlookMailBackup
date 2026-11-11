@@ -1,0 +1,177 @@
+' This disposable native Windows test is NOT executed while authoring on Linux.
+' It uses only a newly created Temp directory, synthetic TXT files and no settings.
+Public Sub MB_YearMonthSelfTest()
+    Dim resultDetail As String, passed As Boolean
+    If gBusy Then
+        MsgBox "Wait until the current job is finished.", vbInformation
+        Exit Sub
+    End If
+    gBusy = True
+    passed = MBT_YearMonthSelfTest(resultDetail)
+    gBusy = False
+    MsgBox resultDetail, IIf(passed, vbInformation, vbExclamation), "Year/month self-test"
+End Sub
+
+Private Function MBT_YearMonthSelfTest(ByRef resultDetail As String) As Boolean
+    ' The acceptance runner owns gBusy across this test and its sibling tests.
+    Dim testBase As String, account As String, topic As String, month As String
+    Dim a As String, b As String, occupied As String, destination As String, plan As String
+    Dim hashA As String, hashB As String, hashOccupied As String, fields As Variant
+    Dim c As String, targetC As String, d As String, targetD As String, planId As String
+    Dim reusedTarget As String, originalHash As String, reusedHash As String
+    Dim badPlan As String, stream As Object, contents As String, ignoredId As String, ignoredRoot As String
+    Dim owned As Boolean, rejected As Boolean, n As Long, detail As String, cleanup As String
+    On Error GoTo Failed
+    resultDetail = ""
+    MB_Reset
+    gMode = "SELFTEST_YEAR_MONTH": gPhase = "Testing organization with disposable files"
+    gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
+    Set gFSO = CreateObject("Scripting.FileSystemObject")
+    Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
+    testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBYM_" & gFSO.GetTempName)
+    gFSO.CreateFolder testBase
+    owned = True
+    gRoot = MBH_JoinPath(testBase, "state"): gBaseRoot = gRoot
+    account = MBH_JoinPath(testBase, "account")
+    MB_EnsureDir gRoot: MB_EnsureDir account
+    MB_EnsureDir MBH_JoinPath(gRoot, "_state")
+    gRunId = "selftest"
+    gRunDir = MBH_JoinPath(MBH_JoinPath(gRoot, "runs"), gRunId)
+    MB_EnsureDir gRunDir
+    Set gEvents = gFSO.CreateTextFile(MBH_JoinPath(gRunDir, "events.tsv"), False, True)
+    gEvents.WriteLine "Disposable year/month self-test"
+    MBM_LoadMoves
+    topic = MBH_JoinPath(account, "partly_organized")
+    month = MBY_MonthDirectory(account, DateSerial(2024, 1, 15))
+    MB_EnsureDir topic: MB_EnsureDir month
+    a = MBH_JoinPath(account, "20240115_120000_sender_A.txt")
+    occupied = MBH_JoinPath(month, "20240115_120000_sender_A.txt")
+    b = MBH_JoinPath(topic, "20231231_235959_sender_B.txt")
+    MBM_TestWrite a, "first source bytes"
+    MBM_TestWrite occupied, "different existing destination bytes"
+    MBM_TestWrite b, "nested source bytes"
+    MBM_TestWrite MBH_JoinPath(account, "notes.bin"), "unrelated file"
+    hashA = MBH_HashFile(a): hashB = MBH_HashFile(b): hashOccupied = MBH_HashFile(occupied)
+    plan = MBH_JoinPath(gRunDir, "organize_plan.tsv")
+    MBM_Assert MBM_BuildPlan(account, plan) = 2, "Preview did not find exactly two moves."
+    MBM_Assert gMoveKept = 1 And gMoveSkipped = 1, "Preview KEEP/SKIP totals are wrong."
+    MBM_Assert gFSO.FileExists(a) And gFSO.FileExists(b), "Preview moved a source file."
+    MBM_ApplyPlan plan
+    MBM_Assert gMoveApplied = 2, "Apply did not move exactly two files."
+    destination = MBM_ResolvePath(a, hashA)
+    MBM_Assert StrComp(destination, occupied, vbTextCompare) <> 0, "Collision did not preserve both names."
+    MBM_Assert MBH_HashFile(destination) = hashA, "Moved source bytes changed."
+    MBM_Assert MBH_HashFile(occupied) = hashOccupied, "Occupied destination was overwritten."
+    MBM_Assert Not gFSO.FileExists(a) And Not gFSO.FileExists(b), "Original paths remained after successful moves."
+    MBM_ApplyPlan plan
+    MBM_Assert gMoveApplied = 0 And gMoveAlready = 2, "Applying the same plan was not idempotent."
+    MBM_UndoPlan plan
+    MBM_Assert gMoveRestored = 2, "Undo did not restore exactly two files."
+    MBM_Assert MBH_HashFile(a) = hashA And MBH_HashFile(b) = hashB, "Undo bytes do not match originals."
+    MBM_Assert MBM_ResolvePath(a, hashA) = a, "Undo retained a forward redirect/cycle."
+    MBM_Assert MBM_ResolvePath(destination, hashA) = a, "Undo did not redirect newer references to the restored file."
+    MBM_Assert MBM_MoveFileExW(StrPtr(a), StrPtr(occupied), 8) = 0, "Native move overwrote an occupied destination."
+    MBM_Assert MBH_HashFile(a) = hashA And MBH_HashFile(occupied) = hashOccupied, "No-overwrite check changed bytes."
+
+    ' Simulate process interruption after a successful rename and before COMMIT.
+    c = MBH_JoinPath(account, "20240201_120000_sender_C.txt")
+    targetC = MBH_JoinPath(MBY_MonthDirectory(account, DateSerial(2024, 2, 1)), CStr(gFSO.GetFileName(c)))
+    MBM_TestWrite c, "recover renamed file"
+    MB_EnsureDir CStr(gFSO.GetParentFolderName(targetC))
+    planId = MBH_HashText("disposable-recovery-test")
+    hashB = MBH_HashFile(c)
+    fields = Array("MBMOVE3", MBM_OperationId(planId, c, targetC, hashB), planId, "PREPARE", _
+                   account, account, c, targetC, Format$(CDbl(gFSO.GetFile(c).Size), "0"), hashB, MB_Stamp(Now))
+    MBM_AppendMove fields, "PREPARE"
+    MBM_Assert MBM_MoveFileExW(StrPtr(c), StrPtr(targetC), 8) <> 0, "Could not simulate interrupted rename."
+    MBM_LoadMoves
+    MBM_Assert MBM_ResolvePath(c, hashB) = targetC, "Destination-only recovery did not commit the redirect."
+    MBM_Assert MBH_HashFile(targetC) = hashB, "Recovered destination bytes changed."
+
+    ' A different file can later occupy a formerly moved source pathname.
+    ' Its movement must retain both files' hash-bound historical references.
+    originalHash = hashB
+    MBM_TestWrite c, "different bytes at the reused original pathname"
+    reusedHash = MBH_HashFile(c)
+    reusedTarget = MBH_JoinPath(gFSO.GetParentFolderName(targetC), "20240201_120000_sender_C_reused.txt")
+    fields = Array("MBMOVE3", MBM_OperationId(planId, c, reusedTarget, reusedHash), planId, "PREPARE", _
+                   account, account, c, reusedTarget, Format$(CDbl(gFSO.GetFile(c).Size), "0"), reusedHash, MB_Stamp(Now))
+    MBM_DoMove fields, False
+    MBM_Assert MBM_ResolvePath(c, originalHash) = targetC, "Reused pathname erased the original file's redirect."
+    MBM_Assert MBM_ResolvePath(c, reusedHash) = reusedTarget, "Reused pathname did not retain the newer file's redirect."
+    MBM_LoadMoves
+    MBM_Assert MBM_ResolvePath(c, originalHash) = targetC, "Reload lost the older content version's redirect."
+    MBM_Assert MBM_ResolvePath(c, reusedHash) = reusedTarget, "Reload lost the newer content version's redirect."
+    MBM_DoMove fields, True
+    MBM_Assert MBM_ResolvePath(c, originalHash) = targetC, "Undo erased a different content version's redirect."
+    MBM_Assert MBM_ResolvePath(c, reusedHash) = c, "Undo failed to restore the reused-path file reference."
+    MBM_Assert MBH_HashFile(targetC) = originalHash And MBH_HashFile(c) = reusedHash, _
+                "Reused-path move/undo changed either file's bytes."
+
+    ' Simulate interruption after PREPARE while the original file is still present.
+    d = MBH_JoinPath(account, "20240301_120000_sender_D.txt")
+    targetD = MBH_JoinPath(MBY_MonthDirectory(account, DateSerial(2024, 3, 1)), CStr(gFSO.GetFileName(d)))
+    MBM_TestWrite d, "recover unmoved file"
+    hashB = MBH_HashFile(d)
+    fields = Array("MBMOVE3", MBM_OperationId(planId, d, targetD, hashB), planId, "PREPARE", _
+                   account, account, d, targetD, Format$(CDbl(gFSO.GetFile(d).Size), "0"), hashB, MB_Stamp(Now))
+    MBM_AppendMove fields, "PREPARE"
+    MBM_LoadMoves
+    MBM_Assert MBM_ResolvePath(d, hashB) = d And gFSO.FileExists(d), "Source-only recovery moved the file."
+
+    badPlan = MBH_JoinPath(gRunDir, "incomplete_plan.tsv")
+    Set stream = gFSO.OpenTextFile(plan, 1, False, -1): contents = stream.ReadAll: stream.Close
+    Set stream = gFSO.CreateTextFile(badPlan, False, True)
+    stream.Write Left$(contents, Len(contents) - 12): stream.Close: Set stream = Nothing
+    On Error Resume Next
+    Err.Clear
+    MBM_ValidatePlan badPlan, ignoredId, ignoredRoot
+    rejected = (Err.Number <> 0)
+    Err.Clear
+    On Error GoTo Failed
+    MBM_Assert rejected, "A truncated organization plan was accepted."
+    GoTo CleanUp
+Failed:
+    n = Err.Number: detail = Err.Description
+CleanUp:
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If Not gEvents Is Nothing Then gEvents.Close
+    Set gEvents = Nothing
+    Err.Clear
+    MBM_ReleaseAccountLocks
+    If Err.Number <> 0 Then cleanup = " Account lock cleanup: " & Err.Description
+    Err.Clear
+    MBH_ReleaseCrypto
+    If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    If owned Then
+        Err.Clear
+        gFSO.DeleteFolder testBase, True
+        If Err.Number <> 0 Then cleanup = cleanup & " Temp directory preserved: " & testBase & ": " & Err.Description
+    End If
+    MBM_Reset
+    Set gDirs = Nothing: Set gFSO = Nothing
+    gRoot = "": gBaseRoot = "": gRunDir = "": gRunId = ""
+    On Error GoTo 0
+    If n <> 0 Or Len(cleanup) > 0 Then
+        resultDetail = "Year/month self-test FAILED: " & detail & cleanup
+    Else
+        resultDetail = "Year/month native file self-test PASSED." & vbCrLf & _
+                       "Preview, collisions, apply/reapply, undo, interruption recovery, reused source paths, " & _
+                       "truncated plan and no-overwrite were checked." & vbCrLf & _
+                       "Synthetic TXT files only; Outlook provider behavior was not tested."
+        MBT_YearMonthSelfTest = True
+    End If
+End Function
+
+Private Sub MBM_TestWrite(ByVal path As String, ByVal contents As String)
+    Dim stream As Object
+    Set stream = gFSO.CreateTextFile(path, False, False)
+    stream.Write contents
+    stream.Close
+End Sub
+
+Private Sub MBM_Assert(ByVal condition As Boolean, ByVal detail As String)
+    If Not condition Then Err.Raise MB_ERR + 454, "MB_YearMonthSelfTest", detail
+End Sub
+

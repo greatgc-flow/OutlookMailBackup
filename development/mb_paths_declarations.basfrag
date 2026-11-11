@@ -1,0 +1,13 @@
+' Path settings persist per Windows user, independent of the imported module file.
+Private Const MBP_SETTINGS_APP As String = "OutlookMailBackup"
+Private Const MBP_SETTINGS_SECTION As String = "PathsV2"
+Private Const MBP_BASE_KEY As String = "BackupBase"
+Private Const MBP_MANAGED_LEAF As String = "SafeV2"
+Private Const MBP_LOCATOR_SCHEMA As String = "MBBASELOCATION1"
+Private mbpLocatorPath As String
+Private mbpLocatorHash As String
+Private mbpLocatorObserved As Boolean
+Private mbpLocatorStore As String
+Private mbpLocatorManaged As String
+Private mbpLocatorAccount As String
+

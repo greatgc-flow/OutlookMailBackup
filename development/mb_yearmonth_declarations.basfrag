@@ -1,0 +1,8 @@
+' Account roots are bound to StoreID and this managed state root, not display names.
+Private Const MBY_ACCOUNT_MARKER As String = "_mb_account.tsv"
+Private Const MBY_MAP_FILE As String = "account-roots.tsv"
+Private Const MBY_ATTACHMENT_EXTENSIONS As String = ";pdf;doc;docx;xls;xlsx;ppt;pptx;zip;txt;"
+Private mbyRoots As Object
+Private mbyValidated As Object
+Private mbyLoadedState As String
+

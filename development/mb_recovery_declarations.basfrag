@@ -1,0 +1,27 @@
+' Recoverable metadata: primary state is replaceable; MSG bytes are never rebuilt.
+Private Const MBR_FOLDER As String = "_MailBackup_Recovery"
+Private Const MBR_MIRROR_LEAF As String = "_independent_stage_mirror.tsv"
+Private Const MBR_OWNER_FILE As String = "recovery-owner.tsv"
+Private Const MBR_CHUNK_BYTES As Long = 1048576
+Private gRecoveryForceFull As Boolean
+Private gRecoveryRebased As Boolean
+Private gRecoveryFiles As Object
+Private gRecoverySentHints As Object
+Private gRecoveryReviewCount As Long
+Private gRecoveryRestoredCount As Long
+Private gRecoveryNewBaselines As Long
+Private gRecoveryNote As String
+Private mbrActiveRecoveryRoot As String
+Private mbrBaselineWrites As Long
+Private gRecoverySnapshotsSaved As Long
+Private gRecoverySalvagedRows As Long
+Private gRecoveryMergedRows As Long
+Private gRecoveryOverlayRejected As Long
+Private gRecoveryOverlayFiles As Long
+Private mbrDigestFiles As Object
+
+#If VBA7 Then
+Private Declare PtrSafe Function MBR_WriteFile Lib "kernel32" Alias "WriteFile" (ByVal handle As LongPtr, ByRef buffer As Any, ByVal count As Long, ByRef written As Long, ByVal overlapped As LongPtr) As Long
+#Else
+Private Declare Function MBR_WriteFile Lib "kernel32" Alias "WriteFile" (ByVal handle As Long, ByRef buffer As Any, ByVal count As Long, ByRef written As Long, ByVal overlapped As Long) As Long
+#End If

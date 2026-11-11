@@ -1,0 +1,425 @@
+' ==================== Independent physical archive audit ===================
+' Committed index hashes and immutable MSG-only recovery baselines are distinct
+' proof origins. A fresh baseline establishes current bytes/readability only.
+' Existing expected hashes are never replaced by a newly observed file hash.
+' One physical path+size+hash proof is read once per run even if many mailbox
+' identities refer to it. Missing sources do not remove their file from audit.
+Private Sub MBA_Reset()
+    Set gArchiveAuditEntries = Nothing: Set gArchiveAuditIssues = Nothing
+    Set gArchiveAuditCheckedPaths = Nothing: Set gArchiveAuditVisited = Nothing
+    gArchiveAuditStatePath = "": gArchiveAuditCursor = ""
+    gArchiveAuditStore = "": gArchiveAuditAccount = ""
+    gArchiveAuditChecked = 0: gArchiveAuditPassed = 0: gArchiveAuditFailed = 0
+    gArchiveAuditPending = 0: gArchiveAuditFilesRead = 0
+    gArchiveAuditReferenceReview = 0: gArchiveAuditStateIssues = 0
+    gArchiveAuditTotal = 0: gArchiveAuditCommitted = False
+End Sub
+
+Private Function MBA_ProofId(ByVal path As String, ByVal bytes As String, ByVal digest As String) As String
+    MBA_ProofId = MBH_HashText(MB_EncodeFields(Array(LCase$(MBH_NormalizePath(path)), _
+        Format$(MB_ByteCount(bytes), "0"), LCase$(digest))))
+End Function
+
+Private Sub MBA_Initialize()
+    Set gArchiveAuditEntries = CreateObject("Scripting.Dictionary")
+    Set gArchiveAuditIssues = CreateObject("Scripting.Dictionary")
+    Set gArchiveAuditCheckedPaths = CreateObject("Scripting.Dictionary")
+    Set gArchiveAuditVisited = CreateObject("Scripting.Dictionary")
+    gArchiveAuditEntries.CompareMode = vbBinaryCompare
+    gArchiveAuditIssues.CompareMode = vbBinaryCompare
+    gArchiveAuditCheckedPaths.CompareMode = vbBinaryCompare
+    gArchiveAuditVisited.CompareMode = vbBinaryCompare
+    gArchiveAuditStore = gWindowStore
+    gArchiveAuditAccount = MBH_NormalizePath(gAutoAccount)
+    gArchiveAuditStatePath = MB_StatePath("archive_audit_" & _
+        Left$(MBH_HashText(MB_EncodeFields(Array(gArchiveAuditStore, LCase$(gArchiveAuditAccount)))), 32) & ".tsv")
+End Sub
+
+Private Sub MBA_AddEntry(ByVal path As String, ByVal bytes As String, ByVal digest As String, _
+                         ByVal boundRoot As String, ByVal isMsg As Boolean, _
+                         ByVal reference As String, ByVal provenance As String)
+    Dim id As String, prior As Variant
+    path = MBY_CanonicalFilePath(path, boundRoot)
+    If Not MB_IsHexKey(digest) Then Err.Raise MB_ERR + 751, , "Invalid physical-audit expected digest."
+    If MB_ByteCount(bytes) < 0 Then Err.Raise MB_ERR + 752, , "Negative physical-audit expected size."
+    id = MBA_ProofId(path, bytes, digest)
+    If gArchiveAuditEntries.Exists(id) Then
+        prior = MBM_Unpack(CStr(gArchiveAuditEntries(id)), 8)
+        ' The physical bytes are equal; preserve the stronger committed origin.
+        If CStr(prior(6)) = "COMMITTED_INDEX" Then Exit Sub
+        If provenance <> "COMMITTED_INDEX" Then Exit Sub
+    End If
+    gArchiveAuditEntries(id) = MB_EncodeFields(Array(path, bytes, LCase$(digest), _
+        MBH_NormalizePath(boundRoot), IIf(isMsg, "1", "0"), reference, provenance, ""))
+End Sub
+
+Private Sub MBA_AddIndexReference(ByVal key As String, ByVal storeToken As String)
+    Dim f As Variant, metadata As Variant, path As String, root As String, isMsg As Boolean
+    Dim n As Long, detail As String
+    On Error GoTo Review
+    If Not gRecordMeta.Exists(key) Then Err.Raise MB_ERR + 753, , "Indexed reference has no account metadata."
+    metadata = MBX_Meta(key)
+    If CStr(metadata(0)) <> storeToken Then Exit Sub
+    f = MB_IndexFields(key)
+    path = MBX_IndexedPath(key, f)
+    root = MBM_ResolvedRoot(MBX_IndexedOriginal(key, f), CStr(f(2)), MBX_IndexedRoot(key))
+    isMsg = (Left$(key, 2) = "M|" Or Left$(key, 2) = "L|")
+    MBA_AddEntry path, CStr(f(1)), CStr(f(2)), root, isMsg, key, "COMMITTED_INDEX"
+    Exit Sub
+Review:
+    n = Err.Number: detail = Err.Description
+    gArchiveAuditReferenceReview = gArchiveAuditReferenceReview + 1
+    MB_LogEvent "WARNING", "ARCHIVE_REFERENCE_REVIEW", key, path, n, detail
+End Sub
+
+Private Sub MBA_AddRecoveryReference(ByVal key As String)
+    Dim f As Variant, path As String, root As String, n As Long, detail As String
+    On Error GoTo Review
+    f = MBM_Unpack(CStr(gRecoveryFiles(key)), 5)
+    root = MBM_ResolvedRoot(CStr(f(0)), CStr(f(2)), CStr(f(3)))
+    If StrComp(root, gArchiveAuditAccount, vbTextCompare) <> 0 Then Exit Sub
+    path = MBM_ResolvePath(CStr(f(0)), CStr(f(2)))
+    MBA_AddEntry path, CStr(f(1)), CStr(f(2)), root, True, "", CStr(f(4))
+    Exit Sub
+Review:
+    n = Err.Number: detail = Err.Description
+    gArchiveAuditReferenceReview = gArchiveAuditReferenceReview + 1
+    MB_LogEvent "WARNING", "RECOVERY_BASELINE_REVIEW", key, path, n, detail
+End Sub
+
+Private Sub MBA_AddStageReference(ByVal key As String)
+    Dim f As Variant, path As String, root As String, n As Long, detail As String
+    On Error GoTo Review
+    f = MBM_Unpack(CStr(gStageExpected(key)), 5)
+    If CStr(f(4)) <> "VERIFIED_PUBLICATION" Then Exit Sub
+    root = MBM_ResolvedRoot(CStr(f(0)), CStr(f(2)), CStr(f(3)))
+    If StrComp(root, gArchiveAuditAccount, vbTextCompare) <> 0 Then Exit Sub
+    path = MBM_ResolvePath(CStr(f(0)), CStr(f(2)))
+    MBA_AddEntry path, CStr(f(1)), CStr(f(2)), root, (LCase$(Right$(path, 4)) = ".msg"), "", "VERIFIED_PUBLICATION"
+    Exit Sub
+Review:
+    n = Err.Number: detail = Err.Description
+    gArchiveAuditReferenceReview = gArchiveAuditReferenceReview + 1
+    MB_LogEvent "WARNING", "PUBLICATION_PROOF_REVIEW", key, path, n, detail
+End Sub
+
+Private Sub MBA_ResolvePending()
+    Dim keys As Variant, key As Variant, f As Variant, root As String, path As String, id As String
+    Dim prior As Variant
+    If gArchiveAuditIssues.Count = 0 Then Exit Sub
+    keys = gArchiveAuditIssues.Keys
+    For Each key In keys
+        f = MBM_Unpack(CStr(gArchiveAuditIssues(key)), 8)
+        root = MBM_ResolvedRoot(CStr(f(0)), CStr(f(2)), CStr(f(3)))
+        path = MBM_ResolvePath(CStr(f(0)), CStr(f(2)))
+        path = MBY_CanonicalFilePath(path, root)
+        id = MBA_ProofId(path, CStr(f(1)), CStr(f(2)))
+        If id <> CStr(key) Then
+            f(0) = path: f(3) = root
+            If gArchiveAuditIssues.Exists(id) Then
+                prior = MBM_Unpack(CStr(gArchiveAuditIssues(id)), 8)
+                If CStr(prior(6)) = "COMMITTED_INDEX" Then f = prior
+            End If
+            ' Relocation changes no expected byte/hash proof and resolves no
+            ' issue by itself. The relocated file still has to pass its audit.
+            gArchiveAuditIssues(id) = MB_EncodeFields(f)
+            gArchiveAuditIssues.Remove CStr(key)
+        End If
+    Next key
+End Sub
+
+Private Sub MBA_BuildEntries()
+    Dim key As Variant, storeToken As String
+    storeToken = MBX_StoreToken(gArchiveAuditStore)
+    For Each key In gIndex.Keys
+        If Not MB_ContinueWork() Then Exit Sub
+        MBA_AddIndexReference CStr(key), storeToken
+    Next key
+    If Not gRecoveryFiles Is Nothing Then
+        For Each key In gRecoveryFiles.Keys
+            If Not MB_ContinueWork() Then Exit Sub
+            MBA_AddRecoveryReference CStr(key)
+        Next key
+    End If
+    If Not gStageExpected Is Nothing Then
+        For Each key In gStageExpected.Keys
+            If Not MB_ContinueWork() Then Exit Sub
+            MBA_AddStageReference CStr(key)
+        Next key
+    End If
+    ' A missing index/baseline reference does not erase an unresolved proof.
+    ' It remains in the audit set until the recorded bytes actually verify.
+    For Each key In gArchiveAuditIssues.Keys
+        If Not gArchiveAuditEntries.Exists(CStr(key)) Then
+            gArchiveAuditEntries(CStr(key)) = CStr(gArchiveAuditIssues(key))
+        End If
+    Next key
+    gArchiveAuditTotal = gArchiveAuditEntries.Count
+End Sub
+
+Private Function MBA_ReadStateRow(ByVal line As String, ByRef f As Variant) As Boolean
+    Dim stamp As Date, size As Double
+    On Error GoTo Invalid
+    f = MB_ReadCheckedLine(line, 17)
+    If CStr(f(0)) <> "MBARCHIVEAUDIT1" Then Exit Function
+    If StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), gArchiveAuditStore, vbBinaryCompare) <> 0 Or _
+       StrComp(CStr(f(3)), gArchiveAuditAccount, vbTextCompare) <> 0 Then Exit Function
+    stamp = MBC_ParseUtcStamp(CStr(f(15)))
+    If Not MBC_ValidDate(stamp) Or Len(CStr(f(16))) = 0 Then Exit Function
+    If CStr(f(4)) = "CURSOR" Then
+        If CStr(f(13)) <> "CURSOR" Then Exit Function
+        If Len(CStr(f(5))) > 0 Then
+            If Not MB_IsHexKey(CStr(f(5))) Then Exit Function
+        End If
+    ElseIf CStr(f(4)) = "RESULT" Then
+        If CStr(f(13)) <> "REVIEW" And CStr(f(13)) <> "OK" Then Exit Function
+        If Not MB_IsHexKey(CStr(f(5))) Or Not MB_IsHexKey(CStr(f(8))) Then Exit Function
+        If Len(CStr(f(6))) = 0 Or Len(CStr(f(9))) = 0 Then Exit Function
+        If CStr(f(10)) <> "0" And CStr(f(10)) <> "1" Then Exit Function
+        size = MB_ByteCount(CStr(f(7)))
+        If MBA_ProofId(CStr(f(6)), CStr(f(7)), CStr(f(8))) <> CStr(f(5)) Then Exit Function
+        If StrComp(MBH_NormalizePath(CStr(f(9))), gArchiveAuditAccount, vbTextCompare) <> 0 And _
+           StrComp(MBH_NormalizePath(CStr(f(9))), gRoot, vbTextCompare) <> 0 Then
+            ' A registered path can be in a separately selected root. The exact
+            ' root still has to be a current known owner before any file read.
+            If Not MBA_KnownRoot(CStr(f(9))) Then Exit Function
+        End If
+    Else
+        Exit Function
+    End If
+    MBA_ReadStateRow = True
+Invalid:
+End Function
+
+Private Function MBA_KnownRoot(ByVal root As String) As Boolean
+    Dim item As Variant
+    If gArchiveRoots Is Nothing Then Exit Function
+    For Each item In gArchiveRoots
+        If StrComp(MBH_NormalizePath(CStr(item)), MBH_NormalizePath(root), vbTextCompare) = 0 Then
+            MBA_KnownRoot = True
+            Exit Function
+        End If
+    Next item
+End Function
+
+Private Sub MBA_LoadState()
+    Dim stream As Object, line As String, f As Variant, n As Long, detail As String
+    Dim sawCursor As Boolean
+    On Error GoTo Failed
+    MBY_NoReparse gArchiveAuditStatePath, False
+    If Not gFSO.FileExists(gArchiveAuditStatePath) Then Exit Sub
+    Set stream = gFSO.OpenTextFile(gArchiveAuditStatePath, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        If Not MB_ContinueWork() Then stream.Close: Exit Sub
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            If sawCursor Then Err.Raise MB_ERR + 760, , "Unexpected data after archive-audit snapshot terminator."
+            If Not MBA_ReadStateRow(line, f) Then
+                gArchiveAuditStateIssues = gArchiveAuditStateIssues + 1
+                Err.Raise MB_ERR + 754, , "Physical audit state is damaged; recover its last complete snapshot before resuming."
+            End If
+            If CStr(f(4)) = "CURSOR" Then
+                gArchiveAuditCursor = CStr(f(5))
+                sawCursor = True
+            ElseIf CStr(f(13)) = "REVIEW" Then
+                gArchiveAuditIssues(CStr(f(5))) = MB_EncodeFields(Array(f(6), f(7), f(8), f(9), f(10), f(11), f(12), f(14)))
+            Else
+                If gArchiveAuditIssues.Exists(CStr(f(5))) Then gArchiveAuditIssues.Remove CStr(f(5))
+            End If
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    If Not sawCursor Then Err.Raise MB_ERR + 761, , "Incomplete archive-audit snapshot: terminal cursor is missing."
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBA_LoadState", detail
+End Sub
+
+#If VBA7 Then
+Private Function MBA_CheckProof(ByVal f As Variant, ByRef actualPath As String, ByRef reason As String, _
+                                ByRef guard As LongPtr) As Boolean
+#Else
+Private Function MBA_CheckProof(ByVal f As Variant, ByRef actualPath As String, ByRef reason As String, _
+                                ByRef guard As Long) As Boolean
+#End If
+    Dim root As String, cacheId As String, obj As Object, file As Object
+    Dim bytes As Double, beforeDate As Date, digest As String, n As Long
+    On Error GoTo Review
+    reason = ""
+    bytes = MB_ByteCount(CStr(f(1)))
+    root = MBM_ResolvedRoot(CStr(f(0)), CStr(f(2)), CStr(f(3)))
+    actualPath = MBM_ResolvePath(CStr(f(0)), CStr(f(2)))
+    actualPath = MBY_CanonicalFilePath(actualPath, root, True)
+    guard = MBH_GuardFile(actualPath)
+    Set file = gFSO.GetFile(actualPath)
+    If CDbl(file.Size) <> bytes Then Err.Raise MB_ERR + 755, , "Archived file size differs from its recorded baseline."
+    beforeDate = file.DateLastModified
+    cacheId = MBA_ProofId(actualPath, CStr(f(1)), CStr(f(2)))
+    ' No mtime/size shortcut: another writer could preserve both. The read
+    ' guard remains held until this item's result has been recorded by caller.
+    gArchiveAuditFilesRead = gArchiveAuditFilesRead + 1
+    digest = MBH_HashFile(actualPath)
+    If digest <> CStr(f(2)) Then Err.Raise MB_ERR + 756, , "Archived SHA-256 differs from its recorded baseline."
+    If CStr(f(4)) = "1" Then
+        Set obj = Application.Session.OpenSharedItem(actualPath)
+        If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 757, , "Archived MSG cannot reopen as a MailItem."
+        obj.Close olDiscard
+        Set obj = Nothing
+    End If
+    Set file = gFSO.GetFile(actualPath)
+    If CDbl(file.Size) <> bytes Or file.DateLastModified <> beforeDate Then _
+        Err.Raise MB_ERR + 758, , "Archived file changed during verification."
+    If MBH_HashFile(actualPath) <> CStr(f(2)) Then _
+        Err.Raise MB_ERR + 759, , "Archived file bytes changed while reopening."
+    gArchiveAuditCheckedPaths(cacheId) = True
+    MBA_CheckProof = True
+    Exit Function
+Review:
+    n = Err.Number: reason = "Error " & CStr(n) & ": " & Err.Description
+    On Error Resume Next
+    If Not obj Is Nothing Then obj.Close olDiscard
+    Set obj = Nothing
+    On Error GoTo 0
+End Function
+
+Private Function MBA_ResultFields(ByVal id As String, ByVal f As Variant, ByVal outcome As String, _
+                                  ByVal detail As String) As Variant
+    MBA_ResultFields = Array("MBARCHIVEAUDIT1", gRoot, gArchiveAuditStore, gArchiveAuditAccount, _
+        "RESULT", id, f(0), f(1), f(2), f(3), f(4), f(5), f(6), outcome, detail, MBC_UtcStamp(MBC_UtcNow()), gRunId)
+End Function
+
+Private Sub MBA_AuditOne(ByVal id As String, ByVal report As Object)
+    Dim f As Variant, actualPath As String, reason As String, ok As Boolean
+    Dim n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    If gArchiveAuditVisited.Exists(id) Then Exit Sub
+    f = MBM_Unpack(CStr(gArchiveAuditEntries(id)), 8)
+    ok = MBA_CheckProof(f, actualPath, reason, guard)
+    If ok Then
+        MB_WriteCheckedLine report, MB_EncodeFields(MBA_ResultFields(id, f, "OK", _
+            "Recorded bytes and readability verified at " & actualPath))
+        If gArchiveAuditIssues.Exists(id) Then gArchiveAuditIssues.Remove id
+        gArchiveAuditPassed = gArchiveAuditPassed + 1
+    Else
+        MB_WriteCheckedLine report, MB_EncodeFields(MBA_ResultFields(id, f, "REVIEW", reason))
+        f(7) = reason
+        gArchiveAuditIssues(id) = MB_EncodeFields(f)
+        gArchiveAuditFailed = gArchiveAuditFailed + 1
+        MB_LogEvent "WARNING", "ARCHIVE_FILE_REVIEW", CStr(f(5)), actualPath, 0, reason
+    End If
+    MBH_CloseGuard guard
+    gArchiveAuditVisited(id) = True
+    gArchiveAuditChecked = gArchiveAuditChecked + 1
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise n, "MBA_AuditOne", detail
+End Sub
+
+Private Sub MBA_Run()
+    Dim keys As Variant, pending As Variant, key As Variant, i As Long, first As Long, visited As Long
+    Dim count As Long, cursor As String, report As Object, reportPath As String
+    Dim snapshot As Collection, f As Variant, n As Long, detail As String, retries As Long
+    If gMode <> "AUTO" Or Len(gAutoAccount) = 0 Or Len(gWindowStore) = 0 Then Exit Sub
+    If gIndex Is Nothing Or gFSO Is Nothing Or gFatal Or gArchiveAuditCommitted Then Exit Sub
+    On Error GoTo Failed
+    MBA_Initialize
+    MBA_LoadState
+    MBA_ResolvePending
+    gArchiveAuditPending = gArchiveAuditIssues.Count
+    If gCancel Then Exit Sub
+    MBA_BuildEntries
+    If gCancel Then Exit Sub
+    reportPath = MBH_JoinPath(gRunDir, "archive_audit.tsv")
+    Set report = gFSO.CreateTextFile(reportPath, False, True)
+    ' Retry a bounded group promptly; the independent full rotation below
+    ' guarantees progress even when these old errors never disappear.
+    If gArchiveAuditIssues.Count > 0 Then
+        pending = gArchiveAuditIssues.Keys
+        MBW_SortKeys pending, LBound(pending), UBound(pending)
+        For Each key In pending
+            If retries >= MBA_RETRY_BUDGET Then Exit For
+            If Not MB_ContinueWork() Then Exit For
+            MBA_AuditOne CStr(key), report
+            retries = retries + 1
+        Next key
+    End If
+    cursor = gArchiveAuditCursor
+    count = gArchiveAuditEntries.Count
+    If count > 0 Then
+        keys = gArchiveAuditEntries.Keys
+        MBW_SortKeys keys, LBound(keys), UBound(keys)
+        first = LBound(keys)
+        If Len(cursor) > 0 Then
+            Do While first <= UBound(keys)
+                If StrComp(CStr(keys(first)), cursor, vbBinaryCompare) > 0 Then Exit Do
+                first = first + 1
+            Loop
+            If first > UBound(keys) Then first = LBound(keys)
+        End If
+        i = first
+        Do While visited < count And gArchiveAuditChecked < MBA_FILE_BUDGET
+            If Not MB_ContinueWork() Then Exit Do
+            MBA_AuditOne CStr(keys(i)), report
+            cursor = CStr(keys(i))
+            visited = visited + 1
+            i = i + 1
+            If i > UBound(keys) Then i = LBound(keys)
+        Loop
+    End If
+    report.Close: Set report = Nothing
+    MBM_FlushPath reportPath
+    Set snapshot = New Collection
+    For Each key In gArchiveAuditIssues.Keys
+        f = MBM_Unpack(CStr(gArchiveAuditIssues(key)), 8)
+        snapshot.Add MBW_CheckedText(MBA_ResultFields(CStr(key), f, "REVIEW", CStr(f(7))))
+    Next key
+    snapshot.Add MBW_CheckedText(Array("MBARCHIVEAUDIT1", gRoot, gArchiveAuditStore, gArchiveAuditAccount, _
+        "CURSOR", cursor, "", "", "", "", "", "", "", "CURSOR", "", MBC_UtcStamp(MBC_UtcNow()), gRunId))
+    ' Cursor and all unresolved proofs are published as one atomic snapshot,
+    ' only after the outcome report has been closed and flushed.
+    MBS_WriteAtomic gArchiveAuditStatePath, MBW_LinesText(snapshot)
+    gArchiveAuditCursor = cursor
+    gArchiveAuditPending = gArchiveAuditIssues.Count + gArchiveAuditReferenceReview + gArchiveAuditStateIssues
+    gArchiveAuditCommitted = True
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not report Is Nothing Then report.Close
+    On Error GoTo 0
+    Err.Raise n, "MBA_Run", detail
+End Sub
+
+Private Function MBA_PendingCount() As Long
+    If Not gArchiveAuditIssues Is Nothing Then MBA_PendingCount = gArchiveAuditIssues.Count
+    MBA_PendingCount = MBA_PendingCount + gArchiveAuditReferenceReview + gArchiveAuditStateIssues
+End Function
+
+Private Function MBA_HasReview() As Boolean
+    MBA_HasReview = (MBA_PendingCount() > 0)
+End Function
+
+Private Function MBA_Summary() As String
+    If Len(gArchiveAuditStore) = 0 Then Exit Function
+    MBA_Summary = vbCrLf & "Independent archived-file audit: checked=" & CStr(gArchiveAuditChecked) & _
+        "; passed=" & CStr(gArchiveAuditPassed) & "; failed=" & CStr(gArchiveAuditFailed) & _
+        "; physical file reads=" & CStr(gArchiveAuditFilesRead) & vbCrLf & _
+        "Known physical proofs=" & CStr(gArchiveAuditTotal) & "; per-run budget=" & CStr(MBA_FILE_BUDGET) & _
+        "; unresolved=" & CStr(MBA_PendingCount()) & "; state committed=" & CStr(gArchiveAuditCommitted) & vbCrLf & _
+        "Audit verifies recorded bytes/readability without requiring a live Outlook source. " & _
+        "MSG-only rebaselines establish current bytes, not lost historical integrity."
+End Function

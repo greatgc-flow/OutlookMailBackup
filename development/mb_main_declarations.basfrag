@@ -1,0 +1,267 @@
+' ============================================================================
+' Outlook Mail Backup 3.4.0 - one standard module, Windows classic Outlook
+' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
+'
+' START -- ONE VISIBLE MACRO
+' 1. Replace the previous OutlookMailBackup module, then Debug > Compile.
+' 2. Run MB_01_RunBackup. It is the ONLY public no-argument macro in this module.
+' 3. First use in each Outlook VBA session runs disposable native checks for
+'    hashing, locale/UTC, file moves, MSG comparison and metadata recovery.
+'    Synthetic UNSENT messages and owned temporary metadata are used. No real
+'    mailbox item is saved, sent, moved or deleted by the acceptance checks.
+' 4. Select a base/account directory only when no usable remembered path exists.
+'    Setup, safe recovery, year/month maintenance, legacy linking and adaptive
+'    backup are automatic. There is no separate sequence of public commands.
+' 5. The same macro while busy requests cancellation. STOP.txt in SafeV2 also
+'    cancels. Wait for cleanup; avoid VBA End/Reset while a run owns OS handles.
+'
+' DIRECTORIES -- KEEP THE ORIGINAL SafeV2 ABSOLUTE ROOT
+'   <selected base>\SafeV2\_MailBackup_Data\
+'       journal.tsv / moves.tsv / account-roots.tsv / stages.tsv
+'       coverage_*.tsv / source_audit_*.tsv / archive_audit_*.tsv
+'       baseline_*.tsv / setup_*.tsv / reconcile_*.tsv / runs\<run>\
+'   <selected account>\yyyy\mm\<message>.msg
+'   <selected account>\_MailBackup_Recovery\
+'       recovery-owner.tsv / snapshots\ / chunks\ / stage-intents.tsv
+'       restore-intents.tsv / reconcile_*.tsv / recovery-events.tsv / overlays\
+' _MailBackup_Data is the ACTIVE operating directory. Prior _state TSV files
+' migrate once, with verified copies; _state itself is retained as history.
+' Root-level owner.txt, operating-format.tsv and operating-store.tsv, plus the
+' account's _mb_account.tsv, retain ownership/binding outside the primary state.
+' One AUTO managed root belongs to one Outlook StoreID. Another store requires
+' another managed root. Foreign-store proof is rejected before archive work.
+'
+' PATH SETTINGS / DELETION
+' A checked per-store locator also remembers base, managed and account paths:
+'   %LOCALAPPDATA%\OutlookMailBackup\locations\base_<StoreID SHA256>.tsv
+' It complements HKCU/account maps; it never overrides a conflicting owner.
+' Previous locator bytes are preserved before a locked, checked replacement.
+' Exact account/recovery markers can rediscover custom-named sibling accounts.
+' With all exact references gone, select the existing base/account once. An
+' unrelated hardcoded default is never treated as a remembered selection.
+' Existing active state evidence prevents stale _state migration overwrites.
+'
+' OPERATING-STATE RECOVERY
+' After writers close, checked primary TSV files become an independent complete
+' recovery generation under the selected account. Metadata uses content-addressed
+' 1 MiB chunks; unchanged chunks are reused. MSG payloads are NOT copied there.
+' Missing/damaged primary state restores a fully checked generation. BEFORE
+' replacement, surviving primary TSVs and the independent stage mirror receive
+' exact immutable copies under overlays. A checked plan binds those raw hashes
+' and the original snapshot; durable START/DONE resumes that SAME plan. Newer
+' journal, baseline, move/publication proof and unresolved audit REVIEW records
+' are retained. A same-key expected-hash conflict stops recovery, never rebases
+' changed bytes. Move histories require an ordered-prefix relation. A checked
+' unknown schema or orphan semantic reference is retained for explicit review.
+' A legacy interrupted restore with unbound preserved histories also stops for
+' review. No automatic choice can prove which conflicting history is correct.
+' Snapshot order uses a monotonic generation, not only wall-clock time.
+' Missing recovery owner can be rebuilt only from a complete exactly bound
+' snapshot; folder names alone never authorize ownership or destructive actions.
+' If snapshots are unavailable, surviving checked proof is still retained. The
+' REAL index validator checks source/store bindings and prior R references. Raw
+' malformed framing remains preserved; losing a checksum is not proof of a
+' trustworthy historical hash. An odd-byte or divergent move history stops.
+' Unindexed readable MSGs receive MSG_ONLY_REBASELINED records. This proves their
+' observed bytes NOW; it cannot reconstruct lost old hashes/IDs or prove historical
+' equality. Indexed/published expected hashes always take precedence over a newly
+' observed baseline. Missing files remain recorded; changed bytes are not accepted
+' as replacements merely because Outlook can open them.
+' Recovery sets durable NEEDS reconciliation tokens in both metadata locations.
+' Cancellation/restart keeps this requirement. Both become DONE only after the
+' complete current-mail inventory succeeds and its coverage is durably recorded.
+' Deleting both metadata locations cannot reconstruct deleted MSGs. An additional
+' independent backup of the whole archive is still needed for disk/media loss.
+'
+' DATA PUBLICATION / RESTART
+' Unicode MSG is written to an exclusively owned same-directory stage. Reopen
+' comparison, SHA-256 and size precede publication. RESERVE and PREPARED intents
+' are flushed to two metadata locations before their dependent action.
+' Stage bytes are flushed; MoveFileExW uses WRITE_THROUGH without COPY_ALLOWED or
+' REPLACE_EXISTING. Final bytes are flushed and checked before index commitment.
+' A read guard denies new write/delete handles during final verification/linking.
+' A published verified old revision is indexed even if the live source changes
+' immediately afterward; the CURRENT source still becomes a retry outcome.
+' PREPARED orphan output can be recovered only against its prior hash/size.
+' Readable RESERVE-only MSG remains a candidate requiring content comparison.
+' Incomplete owned stages are preserved with a .held suffix, never silently
+' deleted or passed as successful mail. Unproven unrelated fragments need REVIEW.
+' Rename recovery/flushes do not claim immunity to hardware or total power loss.
+'
+' YEAR / MONTH AND FILENAMES
+' Existing and future messages use the SAME selected account\yyyy\mm folder.
+' Valid SentOn, then ReceivedTime, then CreationTime chooses the filing month.
+' Recognized original YYYYMMDD_HHNNSS names preserve their original filing date.
+' No filesystem modification time chooses the filing month. Partial year/month
+' organization is recursively inventoried and refreshed on subsequent runs.
+' A checked complete plan precedes moves. Expected bytes are verified; both
+' colliding files survive with a suffix. Empty old folders remain. Moves have
+' durable PREPARE/COMMIT records; redirects bind both old path AND expected hash.
+' Exact unique same-account bytes can relink a missing reference after a manual
+' relocation. An existing changed file is never hidden by this missing-path rule.
+' Existing names are retained, apart from necessary collision suffixes.
+' New names: yyyyMMdd_HHmmss_sender_subject.msg. Sender uses the historic first
+' 10 UTF-16 units, before "("; neither sender nor subject splits a surrogate pair.
+' Subjects use remaining space within the conservative 235 UTF-16 full-path
+' budget, reserving collision suffix room. Illegal Windows characters are cleaned.
+' No fixed 40-character subject cap or always-present 64-hex suffix is added.
+' Very long subjects can still be truncated; full Subject remains inside MSG.
+' Everything filename search cannot recover characters absent from the filename.
+' Separate attachment extraction defaults OFF; embedded attachments remain in MSG.
+'
+' LEGACY / RESTORED MAIL COMPATIBILITY
+' Existing verified MSGs are reused without MailItem.SaveAs. MBS2 and MBS3 index
+' records remain readable. Original file names and sent-time keys are CANDIDATE
+' hints only; matched sender/recipients/headers/body/HTML/RTF and supported ordinary
+' attachment bytes/inline metadata must pass the declared comparison policy.
+' A filename-tail fallback tolerates timezone-shifted old name prefixes. Locale
+' separator normalization never guesses an ambiguous calendar or date order.
+' L and R final selections are guarded through their committed reference. R aliases
+' require prior same-store expected bytes plus full bounded content comparison;
+' Message-ID alone never proves equality. Changed EntryID can therefore reuse
+' existing files, without pretending provider-rewritten dates/content are equal.
+' Missing/corrupt recorded outputs are not automatically re-exported. Unsupported
+' special attachments and uncertain old matches stay explicit REVIEW outcomes.
+' The conservative old-archive write-time guard can defer unmatched historical
+' messages. This guard is NOT proof that all old mail was previously backed up.
+' v3.4 adds exact Importance, Sensitivity and Unicode category-name membership
+' checks; it reads the multivalued Keywords property without locale separators.
+' Any UserProperties produce limited validation for a newly saved MSG, and
+' prevent an equal-content legacy/R alias. Flags, tasks, reminders, read status,
+' arbitrary MAPI properties and every special attachment are not certified.
+' V1/V2 legacy proof and V2 new/R proof remain readable. Old proof labels are
+' rechecked before V3 promotion; a changed policy forces full comparison on the
+' first upgraded successful coverage run. Existing MSGs are not bulk exported.
+' A proven same-source content change may create a separate new revision, even
+' when its mail date is older than the legacy cutoff. Equal content reuses an
+' existing file; ambiguous, missing or corrupt prior proof remains REVIEW.
+' This is forward reuse of old outputs. Old writers do not understand new state:
+' owner.txt is upgraded to reject known older SafeV2 writers. Do not alternate
+' macro versions; an arbitrary original script cannot be retroactively controlled.
+'
+' ADAPTIVE COVERAGE / INDEPENDENT AUDITS
+' AUTO reads lightweight metadata for all ordinary MailItems in the DEFAULT
+' mounted Outlook store each run. Other PST/shared/online stores are not implicit.
+' The last successful scan START is UTC. The next selective range begins 7 days
+' earlier; there is no 30/90-day absence cap. Initially use 30 days plus EVERY
+' unknown identity or changed modification stamp, at any historical mail date.
+' A new/imported old message is therefore eligible beyond the nominal range.
+' Backward clocks, changed timezone rules/policy and metadata recovery force full
+' current-mail reconciliation. New dates are ASCII Gregorian; VBA Calendar is
+' restored. AUTO uses typed Table dates rather than locale-formatted Jet filters.
+' Every run also rotates up to 500 historical source comparisons. Unresolved
+' source reviews have durable retry obligations outside the normal range/budget.
+' Source audit cursor advances only after visited results/retry obligations are
+' written. Unvisited/cancelled work does not falsely pass. Old review aggregates
+' are refreshed; a persistent issue does not freeze the rest of the audit.
+' Separately, up to 500 physical archived proofs are checked per run, including
+' originals no longer in Outlook. Up to 100 pending issues retry plus rotation.
+' Archive checks retain expected SHA/size, reopen MSG, and keep missing-file
+' tombstones/conflicting proofs. Source REVIEW does not stop physical rotation.
+' These budgets are not a promise that every possible issue is found instantly.
+' Current mail coverage, physical archive integrity, baseline provenance and
+' reporting are separate summary results. A broad PARTIAL label does not itself
+' mean that every current-mail coverage checkpoint was rejected.
+'
+' VALIDATION / PERFORMANCE LIMITS
+' Authoring checks are syntax/static linkage and adversarial state models.
+' Actual Windows Outlook was not available during authoring. Debug > Compile is
+' required on the target PC; native disposable checks then run automatically.
+' Acceptance logs explicitly retain NOT_RUN for real archive compatibility,
+' complete VBA project compilation, all special MAPI cases and 100k load tests.
+' Actual AUTO item times are measured without extra SaveAs. Separate NEW/REUSE
+' means and containing p50/p95 intervals include all timed observations. At
+' least 30 ordinary timed successes are required for an indicative 100k item
+' processing-cost forecast; recovery/inventory/moves/audits remain additional.
+' No observations means NOT_MEASURED. This is not a measured 100k load test.
+' Reuse avoids repeated SaveAs, not all I/O. Full metadata inventories, bounded
+' content audits and metadata snapshots still take time. First MSG-only recovery
+' hashes/reopens every unindexed MSG; it can be much slower than later increments.
+' All providers/attachments are not transactional. A provider can change content
+' without a useful revision stamp; rotating audits reduce, not eliminate, this risk.
+' Reparse/device paths and >235-unit paths are refused; account roots <=80 units.
+' Windows classic Outlook only; new Outlook, Mac and server automation unsupported.
+' Reports: _MailBackup_Data\runs\<run>\summary.txt and checked audit/recovery logs.
+' Helper/expert procedures are PRIVATE; none needs to be run by the user.
+' ============================================================================
+
+Private Const MB_VERSION As String = "3.4.0"
+Private Const MB_OWNER As String = "OutlookMailBackup.SafeV3.4"
+Private Const MB_OUTPUT_ROOT As String = "C:\0.GC\-.MailBackup"
+Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False
+Private Const MB_ATTACHMENT_EXTENSIONS As String = "*"
+' Alternative: "pdf;doc;docx;xls;xlsx;ppt;pptx;zip;txt;csv"
+Private Const MB_REOPEN_NEW_MSG As Boolean = True
+Private Const MB_NEW_CONTENT_VALIDATION As String = "REOPENED_CONTENT_SHA256_V3"
+Private Const MB_NEW_CONTENT_VALIDATION_V2 As String = "REOPENED_CONTENT_SHA256_V2"
+Private Const MB_NEW_BASIC_VALIDATION As String = "REOPENED_METADATA_SHA256_V3"
+Private Const MB_NEW_BASIC_VALIDATION_V2 As String = "REOPENED_METADATA_SHA256_V2"
+Private Const MB_VERIFY_EXISTING_HASH As Boolean = True
+Private Const MB_JOURNAL_FLUSH_EVERY As Long = 25
+Private Const MB_BENCHMARK_COUNT As Long = 300
+Private Const MB_ERR As Long = vbObjectError + 7600
+Private Const MB_CHANGE_KEY As String = "http://schemas.microsoft.com/mapi/proptag/0x65E20102"
+
+Private gBusy As Boolean
+Private gCancel As Boolean
+Private gFatal As Boolean
+Private gFatalText As String
+Private gRoot As String
+Private gRunId As String
+Private gRunDir As String
+Private gRunStart As Date
+Private gSince As Date
+Private gUntil As Date
+Private gClockStart As Double
+Private gLastPulse As Double
+Private gLastProgress As Double
+Private gPhase As String
+Private gMode As String
+Private gFSO As Object
+Private gIndex As Object
+Private gDirs As Object
+Private gEvents As Object
+Private gJournal As Object
+Private gJournalPath As String
+Private gJournalWrites As Long
+Private gJournalIssues As Long
+Private gFoldersScanned As Long
+Private gFolderFailures As Long
+Private gPolicySkipped As Long
+Private gCandidates As Long
+Private gScanChanged As Long
+Private gPlanned As Long
+Private gFullPlanned As Long
+Private gProcessed As Long
+Private gMailNew As Long
+Private gMailReused As Long
+Private gMailFailed As Long
+Private gMailChanged As Long
+Private gMailPolicy As Long
+Private gContentReview As Long
+Private gMailPending As Long
+Private gAttFound As Long
+Private gAttNew As Long
+Private gAttReused As Long
+Private gAttExcluded As Long
+Private gAttFailed As Long
+Private gAttPending As Long
+Private gBytesNew As Double
+Private gScanSeconds As Double
+Private gIndexSeconds As Double
+Private gExportSeconds As Double
+Private gSampleSeconds() As Double
+Private gSampleCount As Long
+Private gScope As String
+Private gCleanupIssue As String
+Private gModifiedWindow As Boolean
+
+' Currency is a signed 64-bit storage type scaled by 10,000. Both QPC values
+' use that same storage/scaling, which cancels in the division.
+#If VBA7 Then
+Private Declare PtrSafe Function MB_QueryPerformanceCounter Lib "kernel32" Alias "QueryPerformanceCounter" (ByRef value As Currency) As Long
+Private Declare PtrSafe Function MB_QueryPerformanceFrequency Lib "kernel32" Alias "QueryPerformanceFrequency" (ByRef value As Currency) As Long
+#Else
+Private Declare Function MB_QueryPerformanceCounter Lib "kernel32" Alias "QueryPerformanceCounter" (ByRef value As Currency) As Long
+Private Declare Function MB_QueryPerformanceFrequency Lib "kernel32" Alias "QueryPerformanceFrequency" (ByRef value As Currency) As Long
+#End If

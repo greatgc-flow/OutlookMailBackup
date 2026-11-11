@@ -1,0 +1,39 @@
+' Adaptive coverage: full lightweight inventory, selective content work.
+Private Const MBW_POLICY As String = "AUTO_INVENTORY_UTC_V2_FIDELITY_V3"
+Private Const MBW_OVERLAP_DAYS As Long = 7
+Private Const MBW_INITIAL_DAYS As Long = 30
+Private Const MBW_AUDIT_LIMIT As Long = 500
+Private gWindowStore As String
+Private gWindowKnown As Object
+Private gWindowAudit As Object
+Private gWindowStartUTC As Date
+Private gWindowPreviousUTC As Date
+Private gWindowContext As String
+Private gWindowPath As String
+Private gWindowCursor As String
+Private gWindowNextCursor As String
+Private gWindowFull As Boolean
+Private gWindowReady As Boolean
+Private gWindowInventoryComplete As Boolean
+Private gWindowCommitted As Boolean
+Private gWindowNote As String
+Private gWindowNew As Long
+Private gWindowChanged As Long
+Private gWindowPolicyQueued As Long
+Private gWindowRecent As Long
+Private gWindowAuditQueued As Long
+Private gWindowFullQueued As Long
+Private gWindowHistoricalSkipped As Long
+Private gWindowBadRows As Long
+
+Private gWindowAuditOrder As Collection
+Private gWindowAuditSeen As Object
+Private gWindowAuditResults As Object
+Private gWindowSourcePending As Object
+Private gWindowAuditPath As String
+Private gWindowAuditCommitted As Boolean
+Private gWindowAuditStateIssues As Long
+Private gWindowAuditResultsWritten As Long
+Private gWindowRetryQueued As Long
+Private gWindowAuditPass As Long
+Private gWindowAuditLoaded As Boolean

@@ -1,0 +1,23 @@
+' Year/month move engine: durable intent records, no replace, no copy/delete.
+Private mbmOps As Object
+Private mbmRedirects As Object
+Private mbmAccountLocks As Object
+Private mbmLoaded As Boolean
+Private gMovePlanned As Long
+Private gMoveKept As Long
+Private gMoveSkipped As Long
+Private gMoveApplied As Long
+Private gMoveAlready As Long
+Private gMoveRestored As Long
+Private gMoveRecovered As Long
+Private gMoveReview As Long
+Private gMovePlanReview As Long
+Private gMovePlanPath As String
+#If VBA7 Then
+Private Declare PtrSafe Function MBM_MoveFileExW Lib "kernel32" Alias "MoveFileExW" (ByVal source As LongPtr, ByVal target As LongPtr, ByVal flags As Long) As Long
+Private Declare PtrSafe Function MBM_FlushFileBuffers Lib "kernel32" Alias "FlushFileBuffers" (ByVal handle As LongPtr) As Long
+#Else
+Private Declare Function MBM_MoveFileExW Lib "kernel32" Alias "MoveFileExW" (ByVal source As Long, ByVal target As Long, ByVal flags As Long) As Long
+Private Declare Function MBM_FlushFileBuffers Lib "kernel32" Alias "FlushFileBuffers" (ByVal handle As Long) As Long
+#End If
+

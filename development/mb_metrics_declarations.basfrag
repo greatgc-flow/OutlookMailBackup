@@ -1,0 +1,15 @@
+' Actual AUTO-run observations. Fixed memory; no extra SaveAs or mailbox reads.
+' Counts are Double to avoid a 32-bit counter overflow in a long-running session.
+Private Const MBF_GROUP_COUNT As Long = 12
+Private Const MBF_BIN_COUNT As Long = 26
+Private Const MBF_MIN_FORECAST_COUNT As Long = 30
+Private Const MBF_FIRST_UPPER_SECONDS As Double = 0.001
+Private gMetricObserved(1 To MBF_GROUP_COUNT) As Double
+Private gMetricTimed(1 To MBF_GROUP_COUNT) As Double
+Private gMetricSeconds(1 To MBF_GROUP_COUNT) As Double
+Private gMetricMinimum(1 To MBF_GROUP_COUNT) As Double
+Private gMetricMaximum(1 To MBF_GROUP_COUNT) As Double
+Private gMetricZeros(1 To MBF_GROUP_COUNT) As Double
+Private gMetricHistogram(1 To MBF_GROUP_COUNT, 1 To MBF_BIN_COUNT) As Double
+Private gMetricFault As Boolean
+Private gMetricFaultText As String

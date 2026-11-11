@@ -1,0 +1,16 @@
+' Existing-export compatibility is conservative: an uncertain old export is
+' deferred for review, never silently labelled complete or automatically replaced.
+Private Const MB_LEGACY_VALIDATION As String = "LEGACY_COMPARE_SHA256_V3"
+Private Const MB_LEGACY_VALIDATION_V2 As String = "LEGACY_COMPARE_SHA256_V2"
+Private Const MB_LEGACY_VALIDATION_V1 As String = "LEGACY_COMPARE_SHA256_V1"
+Private gBaseRoot As String
+Private gSelectedBase As String
+Private gLegacyRoot As String
+Private gLegacyBindings As Object
+Private gLegacySources As Object
+Private gLegacyOwners As Object
+Private gMailLegacy As Long
+Private gMailReview As Long
+Private gLegacyUnmatched As Long
+Private gLegacySeconds As Double
+

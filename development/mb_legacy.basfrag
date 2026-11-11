@@ -1,0 +1,703 @@
+' ===================== Existing pre-SafeV2 MSG files ========================
+' Adoption reads the original MSG in place; it never saves, copies or renames it.
+' Filename, sent-second and bounded date-independent tail keys are candidates only.
+' Ordinary by-value attachments are compared by exported byte hashes in owned
+' temporary stages. Embedded, OLE and reference attachments require review.
+' Unknown/renamed MSG names are indexed by a read-only SentOn lookup when possible.
+' Unreadable or undated MSGs remain unknown and defer unmatched mail, rather than
+' assuming the absence of a name candidate proves that a message is new.
+
+Private Sub MBL_Reset()
+    Set mblByName = Nothing: Set mblByStamp = Nothing: Set mblVisited = Nothing
+    gLegacyFileCount = 0: gLegacyFolderCount = 0: gLegacyUnrecognizedNames = 0
+    gLegacyNewestFileTime = 0
+    gLegacyScanComplete = False
+End Sub
+
+Private Function MBL_UnderRoot(ByVal path As String, ByVal root As String) As Boolean
+    Dim prefix As String
+    If StrComp(path, root, vbTextCompare) = 0 Then
+        MBL_UnderRoot = True
+        Exit Function
+    End If
+    prefix = root
+    If Right$(prefix, 1) <> "\" Then prefix = prefix & "\"
+    MBL_UnderRoot = (StrComp(Left$(path, Len(prefix)), prefix, vbTextCompare) = 0)
+End Function
+
+Private Function MBL_IsFileSystemRoot(ByVal path As String) As Boolean
+    Dim parts As Variant
+    If Len(path) = 3 And Mid$(path, 2, 2) = ":\" Then
+        MBL_IsFileSystemRoot = True
+    ElseIf Left$(path, 2) = "\\" Then
+        parts = Split(Mid$(path, 3), "\")
+        MBL_IsFileSystemRoot = (UBound(parts) = 1)
+    End If
+End Function
+
+Private Function MBL_CanonicalLegacyPath(ByVal path As String, ByVal boundRoot As String, _
+                                       Optional ByVal requireExisting As Boolean = False) As String
+    Dim root As String, current As String, parent As String, f As Object
+    root = MBH_NormalizePath(boundRoot)
+    path = MBH_NormalizePath(path)
+    If Not MBL_UnderRoot(path, root) Or StrComp(path, root, vbTextCompare) = 0 Then
+        Err.Raise MB_ERR + 150, "MBL_CanonicalLegacyPath", "Legacy path is outside its recorded root."
+    End If
+    If LCase$(Right$(path, 4)) <> ".msg" Then
+        Err.Raise MB_ERR + 151, "MBL_CanonicalLegacyPath", "Legacy reference must be an MSG file."
+    End If
+    ' The default validates structure only, retaining missing-file tombstones.
+    If requireExisting Then
+        Set f = gFSO.GetFile(path)
+        If (CLng(f.Attributes) And MBL_REPARSE_POINT) <> 0 Then
+            Err.Raise MB_ERR + 152, "MBL_CanonicalLegacyPath", "Legacy MSG is a link/reparse point."
+        End If
+        current = gFSO.GetParentFolderName(path)
+        Do
+            Set f = gFSO.GetFolder(current)
+            If (CLng(f.Attributes) And MBL_REPARSE_POINT) <> 0 Then
+                Err.Raise MB_ERR + 153, "MBL_CanonicalLegacyPath", "Legacy path traverses a reparse point."
+            End If
+            If MBL_IsFileSystemRoot(current) Then Exit Do
+            parent = gFSO.GetParentFolderName(current)
+            If Len(parent) = 0 Or StrComp(parent, current, vbTextCompare) = 0 Then Exit Do
+            current = parent
+        Loop
+    End If
+    MBL_CanonicalLegacyPath = path
+End Function
+
+Private Function MBL_HasOwner(ByVal folderPath As String) As Boolean
+    Dim marker As String, stream As Object, value As String, n As Long, d As String
+    On Error GoTo Failed
+    If MBR_IsRecoveryDirectory(folderPath) Then
+        MBL_HasOwner = True
+        Exit Function
+    End If
+    marker = MBH_JoinPath(folderPath, "owner.txt")
+    If Not gFSO.FileExists(marker) Then Exit Function
+    Set stream = gFSO.OpenTextFile(marker, 1, False, -1)
+    value = stream.ReadAll
+    stream.Close
+    MBL_HasOwner = (value = MB_OWNER & vbCrLf Or value = MB_OWNER_LEGACY & vbCrLf Or _
+                   value = MB_OWNER_PREVIOUS & vbCrLf)
+    Exit Function
+Failed:
+    n = Err.Number: d = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBL_HasOwner", d
+End Function
+
+Private Sub MBL_AddLookup(ByVal lookup As Object, ByVal key As String, ByVal path As String)
+    Dim paths As Collection
+    If lookup.Exists(key) Then
+        Set paths = lookup(key)
+    Else
+        Set paths = New Collection
+        lookup.Add key, paths
+    End If
+    paths.Add path
+End Sub
+
+Private Function MBL_StampKey(ByVal fileName As String) As String
+    Dim key As String, value As Date, i As Long, ch As String
+    On Error GoTo NotRecognized
+    If Len(fileName) < 21 Then Exit Function
+    If Mid$(fileName, 9, 1) <> "_" Or Mid$(fileName, 16, 1) <> "_" Then Exit Function
+    key = Left$(fileName, 15)
+    For i = 1 To 15
+        If i <> 9 Then
+            ch = Mid$(key, i, 1)
+            If ch < "0" Or ch > "9" Then Exit Function
+        End If
+    Next i
+    value = MBC_ParseFileStamp(key)
+    If Not MB_ValidDate(value) Then Exit Function
+    MBL_StampKey = key
+NotRecognized:
+End Function
+
+Private Function MBL_TailKey(ByVal fileName As String) As String
+    ' Ignore only a syntactically valid old timestamp prefix. Calendar and
+    ' time-zone differences may change that prefix without changing the mail.
+    ' The retained sender/subject text is still just a candidate, never proof.
+    Dim i As Long, ch As String
+    If Len(fileName) < 21 Then Exit Function
+    If Mid$(fileName, 9, 1) <> "_" Or Mid$(fileName, 16, 1) <> "_" Then Exit Function
+    If LCase$(Right$(fileName, 4)) <> ".msg" Then Exit Function
+    For i = 1 To 15
+        If i <> 9 Then
+            ch = Mid$(fileName, i, 1)
+            If ch < "0" Or ch > "9" Then Exit Function
+        End If
+    Next i
+    MBL_TailKey = Mid$(fileName, 17)
+End Function
+
+Private Function MBL_TailBucket(ByVal fileName As String, ByVal accountRoot As String) As String
+    Dim tail As String
+    tail = MBL_TailKey(fileName)
+    If Len(tail) > 0 Then MBL_TailBucket = "TAIL|" & LCase$(accountRoot) & "|" & tail
+End Function
+
+Private Function MBL_CatalogSentStamp(ByVal path As String, ByVal fileName As String, _
+                                     ByRef reason As String) As String
+    Dim stamp As String
+    reason = ""
+    ' A recovery scan has already reopened stable bytes. Its hints were read in
+    ' THIS run; persisted local timestamps are never substituted across zones.
+    If Not gRecoverySentHints Is Nothing Then
+        If gRecoverySentHints.Exists(path) Then
+            MBL_CatalogSentStamp = CStr(gRecoverySentHints(path))
+            Exit Function
+        End If
+    End If
+    If Not gRecoveryForceFull Then stamp = MBL_StampKey(fileName)
+    If Len(stamp) = 0 Then stamp = MBL_ReadSentStamp(path, reason)
+    MBL_CatalogSentStamp = stamp
+End Function
+
+Private Function MBL_ReadSentStamp(ByVal path As String, ByRef reason As String) As String
+    Dim obj As Object, mail As Outlook.MailItem, stamp As Date, result As String
+    reason = ""
+    On Error GoTo Failed
+    MBY_NoReparse path, True
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then
+        reason = "Renamed MSG is not a MailItem."
+        GoTo CleanUp
+    End If
+    Set mail = obj
+    stamp = mail.SentOn
+    If MB_ValidDate(stamp) Then
+        result = MBC_FileStamp(stamp)
+    Else
+        reason = "Renamed MSG has no valid SentOn value for candidate lookup."
+    End If
+CleanUp:
+    On Error Resume Next
+    Err.Clear
+    If Not obj Is Nothing Then obj.Close olDiscard
+    If Err.Number <> 0 Then
+        result = ""
+        reason = reason & " MSG close failed: " & Err.Description
+    End If
+    Set mail = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    MBL_ReadSentStamp = result
+    Exit Function
+Failed:
+    result = ""
+    reason = "Cannot read renamed MSG SentOn: " & CStr(Err.Number) & ": " & Err.Description
+    Resume CleanUp
+End Function
+
+Private Sub MBL_BuildIndex(ByVal legacyRoot As String, ByVal managedRoot As String, _
+                           Optional ByVal appendCatalog As Boolean = False)
+    Dim pending As Collection, current As String, root As String, managed As String
+    Dim folder As Object, child As Object, f As Object, path As String, stamp As String, tailBucket As String
+    Dim n As Long, d As String, ancestor As String, parent As String, fileTime As Date, why As String
+    On Error GoTo Failed
+    If Not appendCatalog Then
+        MBL_Reset
+        Set mblByName = CreateObject("Scripting.Dictionary")
+        mblByName.CompareMode = vbTextCompare
+        Set mblByStamp = CreateObject("Scripting.Dictionary")
+        mblByStamp.CompareMode = vbBinaryCompare
+        Set mblVisited = CreateObject("Scripting.Dictionary")
+        mblVisited.CompareMode = vbTextCompare
+    End If
+    gLegacyScanComplete = False
+    If Len(legacyRoot) = 0 Then
+        gLegacyScanComplete = True
+        Exit Sub
+    End If
+    root = MBH_NormalizePath(legacyRoot)
+    managed = MBH_NormalizePath(managedRoot)
+    ancestor = root
+    Do
+        Set folder = gFSO.GetFolder(ancestor)
+        If (CLng(folder.Attributes) And MBL_REPARSE_POINT) <> 0 Then
+            Err.Raise MB_ERR + 153, "MBL_BuildIndex", "Legacy root traverses a reparse point."
+        End If
+        If MBL_IsFileSystemRoot(ancestor) Then Exit Do
+        parent = gFSO.GetParentFolderName(ancestor)
+        If Len(parent) = 0 Or StrComp(parent, ancestor, vbTextCompare) = 0 Then Exit Do
+        ancestor = parent
+    Loop
+    Set pending = New Collection
+    pending.Add root
+    Do While pending.Count > 0
+        If Not MB_ContinueWork() Then Exit Sub
+        current = CStr(pending(pending.Count))
+        pending.Remove pending.Count
+        If Not MBL_UnderRoot(current, managed) Then
+            If Not mblVisited.Exists(current) Then
+                mblVisited.Add current, True
+                Set folder = gFSO.GetFolder(current)
+                If (CLng(folder.Attributes) And MBL_REPARSE_POINT) <> 0 Then
+                    Err.Raise MB_ERR + 154, "MBL_BuildIndex", _
+                              "Legacy scan cannot safely traverse link/reparse folder: " & current
+                End If
+                If Not MBL_HasOwner(current) Then
+                    gLegacyFolderCount = gLegacyFolderCount + 1
+                    For Each f In folder.Files
+                        If Not MB_ContinueWork() Then Exit Sub
+                        If LCase$(gFSO.GetExtensionName(CStr(f.Name))) = "msg" And _
+                           Not MBX_IsManagedPath(CStr(f.Path)) Then
+                            path = MBL_CanonicalLegacyPath(CStr(f.Path), root)
+                            If (CLng(f.Attributes) And MBL_REPARSE_POINT) <> 0 Then
+                                Err.Raise MB_ERR + 152, "MBL_BuildIndex", "Legacy MSG is a link/reparse point."
+                            End If
+                            MBL_AddLookup mblByName, CStr(f.Name), path
+                            tailBucket = MBL_TailBucket(CStr(f.Name), root)
+                            If Len(tailBucket) > 0 Then MBL_AddLookup mblByName, tailBucket, path
+                            ' Existing ordinary catalogs stay metadata-only for
+                            ' recognized names. MSG-only recovery uses fresh
+                            ' SentOn hints for every file, including newer names.
+                            stamp = MBL_CatalogSentStamp(path, CStr(f.Name), why)
+                            If Len(stamp) > 0 Then
+                                MBL_AddLookup mblByStamp, stamp, path
+                            Else
+                                gLegacyUnrecognizedNames = gLegacyUnrecognizedNames + 1
+                                MB_LogEvent "WARNING", "LEGACY_LOOKUP_UNRESOLVED", "", path, 0, why
+                            End If
+                            gLegacyFileCount = gLegacyFileCount + 1
+                            fileTime = CDate(f.DateLastModified)
+                            If fileTime > gLegacyNewestFileTime Then gLegacyNewestFileTime = fileTime
+                        End If
+                    Next f
+                    For Each child In folder.SubFolders
+                        pending.Add MBH_NormalizePath(CStr(child.Path))
+                    Next child
+                End If
+            End If
+        End If
+    Loop
+    gLegacyScanComplete = True
+    Exit Sub
+Failed:
+    n = Err.Number: d = Err.Description
+    gLegacyScanComplete = False
+    Err.Raise n, "MBL_BuildIndex", "Incomplete legacy scan; new exports are blocked. " & d
+End Sub
+
+Private Function MBL_OldSanitize(ByVal value As String) As String
+    Dim bad As Variant, ch As Variant
+    value = Trim$(value)
+    bad = Array("/", "\", ":", "*", "?", "'", Chr$(34), "<", ">", "|")
+    For Each ch In bad
+        value = Replace(value, CStr(ch), "_")
+    Next ch
+    MBL_OldSanitize = value
+End Function
+
+Private Function MBL_OldLeaf(ByVal mail As Outlook.MailItem, ByVal senderLabel As String) As String
+    MBL_OldLeaf = MBL_OldSanitize(MBC_FileStamp(mail.SentOn) & "_" & _
+                  Left$(Split(senderLabel, "(")(0), 10) & "_" & Left$(mail.Subject, 40)) & ".msg"
+End Function
+
+Private Function MBL_AddressBookName(ByVal mail As Outlook.MailItem) As String
+    Dim entry As Outlook.AddressEntry
+    On Error GoTo Missing
+    Set entry = mail.Sender
+    If Not entry Is Nothing Then MBL_AddressBookName = entry.Name
+Missing:
+End Function
+
+Private Sub MBL_AddCandidates(ByVal lookup As Object, ByVal key As String, ByVal candidates As Object, _
+                              ByVal accountRoot As String)
+    Dim paths As Collection, value As Variant
+    If Not lookup.Exists(key) Then Exit Sub
+    Set paths = lookup(key)
+    ' A very large collision bucket is unresolved, never evidence of absence.
+    ' Bound both memory and repeated content work; do not truncate to success.
+    If paths.Count > 512 Then Err.Raise MB_ERR + 183, "MBL_AddCandidates", _
+        "Legacy candidate bucket exceeds 512 files; all are preserved for review."
+    For Each value In paths
+        If MB_PathWithin(CStr(value), accountRoot) Then
+            If Not candidates.Exists(CStr(value)) Then
+                If candidates.Count >= 512 Then Err.Raise MB_ERR + 183, "MBL_AddCandidates", _
+                    "Legacy candidate budget exceeded; unvisited files remain."
+                candidates.Add CStr(value), True
+            End If
+        End If
+    Next value
+End Sub
+
+Private Function MBL_InternetId(ByVal mail As Outlook.MailItem, ByRef present As Boolean) As String
+    Dim values As Variant, first As Long
+    present = False
+    values = MBL_ReadProperties(mail, Array(MBL_ID_UNICODE, MBL_ID_ANSI), 2)
+    first = LBound(values)
+    MBL_InternetId = MBL_OptionalText(values(first), values(first + 1), "Internet Message-ID")
+    present = (Len(MBL_InternetId) > 0)
+End Function
+
+Private Function MBL_ReadProperties(ByVal item As Object, ByVal names As Variant, _
+                                    ByVal expectedCount As Long) As Variant
+    Dim values As Variant
+    ' GetProperties exposes each property's Error variant separately. A failed
+    ' COM call or malformed result is an error, never proof that a property is absent.
+    values = item.PropertyAccessor.GetProperties(names)
+    If Not IsArray(values) Then Err.Raise MB_ERR + 177, , "MAPI property result is not an array."
+    If UBound(values) - LBound(values) + 1 <> expectedCount Then _
+        Err.Raise MB_ERR + 177, , "MAPI property result has the wrong number of values."
+    MBL_ReadProperties = values
+End Function
+
+Private Function MBL_MissingProperty(ByVal value As Variant, ByVal label As String) As Boolean
+    If Not IsError(value) Then Exit Function
+    ' CStr(Error) preserves the error number; compare two Error variants after
+    ' conversion so neither a localized description nor a Boolean Error is used.
+    If CStr(value) = CStr(CVErr(MBL_MAPI_NOT_FOUND)) Then
+        MBL_MissingProperty = True
+    Else
+        Err.Raise MB_ERR + 178, "MBL_MissingProperty", _
+                  "Cannot verify " & label & ": " & CStr(value)
+    End If
+End Function
+
+Private Function MBL_OptionalText(ByVal unicodeValue As Variant, ByVal ansiValue As Variant, _
+                                  ByVal label As String) As String
+    Dim value As Variant
+    value = unicodeValue
+    If MBL_MissingProperty(value, label) Then value = ansiValue
+    If MBL_MissingProperty(value, label) Then Exit Function
+    If VarType(value) <> vbString Then
+        Err.Raise MB_ERR + 179, "MBL_OptionalText", "Unexpected type for " & label & "."
+    End If
+    MBL_OptionalText = CStr(value)
+End Function
+
+Private Function MBL_AttachmentProperties(ByVal attachment As Outlook.Attachment) As String
+    Dim values As Variant, first As Long, contentId As String, location As String
+    Dim mime As String, hidden As Boolean
+    values = MBL_ReadProperties(attachment, Array(MBL_CID_UNICODE, MBL_CID_ANSI, _
+                               MBL_LOCATION_UNICODE, MBL_LOCATION_ANSI, _
+                               MBL_MIME_UNICODE, MBL_MIME_ANSI, MBL_HIDDEN), 7)
+    first = LBound(values)
+    contentId = MBL_OptionalText(values(first), values(first + 1), "attachment Content-ID")
+    location = MBL_OptionalText(values(first + 2), values(first + 3), "attachment Content-Location")
+    mime = MBL_OptionalText(values(first + 4), values(first + 5), "attachment MIME type")
+    If Not MBL_MissingProperty(values(first + 6), "attachment hidden flag") Then
+        If VarType(values(first + 6)) <> vbBoolean Then
+            Err.Raise MB_ERR + 180, , "Unexpected type for attachment hidden flag."
+        End If
+        hidden = CBool(values(first + 6))
+    End If
+    ' Missing/empty text both mean no identifier; a missing hidden flag is False.
+    ' These semantic defaults do not treat access failure as an absent property.
+    MBL_AttachmentProperties = MB_EncodeFields(Array(contentId, location, mime, CStr(hidden)))
+End Function
+
+Private Sub MBL_CompareAttachmentProperties(ByVal source As Outlook.Attachment, _
+                                            ByVal copy As Outlook.Attachment)
+    If StrComp(source.DisplayName, copy.DisplayName, vbBinaryCompare) <> 0 Then _
+        Err.Raise MB_ERR + 181, , "Attachment display name mismatch."
+    If MBL_AttachmentProperties(source) <> MBL_AttachmentProperties(copy) Then _
+        Err.Raise MB_ERR + 182, , "Attachment inline reference, MIME type or hidden flag mismatch."
+End Sub
+
+Private Function MBL_PropertySelfTest() As Boolean
+    Dim absent As Variant, denied As Variant
+    absent = CVErr(MBL_MAPI_NOT_FOUND)
+    denied = CVErr(&H80070005)
+    If Not MBL_MissingProperty(absent, "test") Then Exit Function
+    If MBL_MissingProperty("", "test") Then Exit Function
+    If MBL_OptionalText("unicode", "ansi", "test") <> "unicode" Then Exit Function
+    If MBL_OptionalText(absent, "ansi", "test") <> "ansi" Then Exit Function
+    If MBL_OptionalText(absent, absent, "test") <> "" Then Exit Function
+    If MBL_OptionalText("", absent, "test") <> "" Then Exit Function
+    If Not MBL_TestRejectProperty(denied, "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(absent, denied) Then Exit Function
+    If Not MBL_TestRejectProperty(Null, "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(Empty, "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(0, "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(absent, False) Then Exit Function
+    MBL_PropertySelfTest = True
+End Function
+
+Private Function MBL_TestRejectProperty(ByVal unicodeValue As Variant, ByVal ansiValue As Variant) As Boolean
+    Dim ignored As String
+    On Error GoTo Rejected
+    ignored = MBL_OptionalText(unicodeValue, ansiValue, "test")
+    Exit Function
+Rejected:
+    MBL_TestRejectProperty = True
+End Function
+
+Private Function MBL_AttachmentHash(ByVal attachment As Outlook.Attachment) As String
+    Dim parent As String, temporary As String, n As Long, d As String, cleanupText As String
+    On Error GoTo Failed
+    If attachment.Type <> olByValue Then
+        Err.Raise MB_ERR + 155, "MBL_AttachmentHash", _
+                  "Embedded/OLE/reference attachment requires manual legacy review."
+    End If
+    If Not MB_ContinueWork() Then Err.Raise MB_ERR + 156, , "Legacy comparison cancelled."
+    parent = MBH_JoinPath(gRunDir, "legacy_compare")
+    MB_EnsureDir parent
+    temporary = MBH_NewStagePath(MBH_JoinPath(parent, "attachment.bin"))
+    attachment.SaveAsFile temporary
+    MBL_AttachmentHash = MBH_HashFile(temporary)
+    MBH_DeleteStage temporary
+    temporary = ""
+    Exit Function
+Failed:
+    n = Err.Number: d = Err.Description
+    On Error Resume Next
+    If Len(temporary) > 0 Then
+        Err.Clear
+        MBH_DeleteStage temporary
+        If Err.Number <> 0 Then cleanupText = " Temporary cleanup: " & Err.Description
+    End If
+    On Error GoTo 0
+    If Len(cleanupText) > 0 Then gCleanupIssue = gCleanupIssue & cleanupText
+    Err.Raise n, "MBL_AttachmentHash", d & cleanupText
+End Function
+
+Private Function MBL_ByteArraysEqual(ByVal first As Variant, ByVal second As Variant) As Boolean
+    Dim firstLow As Long, secondLow As Long, last As Long, i As Long
+    If VarType(first) <> (vbArray Or vbByte) Or VarType(second) <> (vbArray Or vbByte) Then
+        Err.Raise MB_ERR + 175, "MBL_ByteArraysEqual", "RTF body is not a Byte array."
+    End If
+    firstLow = LBound(first): secondLow = LBound(second): last = UBound(first)
+    If last - firstLow <> UBound(second) - secondLow Then Exit Function
+    For i = firstLow To last
+        If CByte(first(i)) <> CByte(second(secondLow + i - firstLow)) Then Exit Function
+        If (i - firstLow) Mod 16384 = 0 Then
+            If Not MB_ContinueWork() Then Exit Function
+        End If
+    Next i
+    MBL_ByteArraysEqual = True
+End Function
+
+Private Sub MBL_CompareExisting(ByVal source As Outlook.MailItem, ByVal path As String)
+    Dim obj As Object, copy As Outlook.MailItem, a As Outlook.Attachment, b As Outlook.Attachment
+    Dim ra As Outlook.Recipient, rb As Outlook.Recipient, i As Long
+    Dim idSource As String, idCopy As String, hasSource As Boolean, hasCopy As Boolean
+    Dim n As Long, d As String, digest As String
+    On Error GoTo Failed
+    Set obj = Application.Session.OpenSharedItem(path)
+    If Not TypeOf obj Is Outlook.MailItem Then Err.Raise MB_ERR + 157, , "Legacy file is not MailItem."
+    Set copy = obj
+    If StrComp(source.MessageClass, copy.MessageClass, vbBinaryCompare) <> 0 Then _
+        Err.Raise MB_ERR + 158, , "Legacy message class mismatch."
+    If StrComp(source.Subject, copy.Subject, vbBinaryCompare) <> 0 Then _
+        Err.Raise MB_ERR + 159, , "Legacy subject mismatch."
+    If source.Sent <> copy.Sent Then Err.Raise MB_ERR + 160, , "Legacy sent-state mismatch."
+    If MB_Stamp(source.SentOn) <> MB_Stamp(copy.SentOn) Or _
+       MB_Stamp(source.ReceivedTime) <> MB_Stamp(copy.ReceivedTime) Then _
+        Err.Raise MB_ERR + 161, , "Legacy sent/received timestamp mismatch."
+    If StrComp(source.SenderEmailType, copy.SenderEmailType, vbTextCompare) <> 0 Or _
+       StrComp(source.SenderEmailAddress, copy.SenderEmailAddress, vbTextCompare) <> 0 Or _
+       StrComp(source.SenderName, copy.SenderName, vbBinaryCompare) <> 0 Then _
+        Err.Raise MB_ERR + 162, , "Legacy sender mismatch."
+    idSource = MBL_InternetId(source, hasSource)
+    idCopy = MBL_InternetId(copy, hasCopy)
+    If hasSource <> hasCopy Then Err.Raise MB_ERR + 163, , "Legacy Internet Message-ID presence mismatch."
+    If hasSource Then
+        If StrComp(idSource, idCopy, vbBinaryCompare) <> 0 Then _
+            Err.Raise MB_ERR + 164, , "Legacy Internet Message-ID mismatch."
+    End If
+    If source.BodyFormat <> copy.BodyFormat Then Err.Raise MB_ERR + 165, , "Legacy body format mismatch."
+    If StrComp(source.Body, copy.Body, vbBinaryCompare) <> 0 Then _
+        Err.Raise MB_ERR + 166, , "Legacy body mismatch."
+    If source.BodyFormat = olFormatHTML Then
+        If StrComp(source.HTMLBody, copy.HTMLBody, vbBinaryCompare) <> 0 Then _
+            Err.Raise MB_ERR + 167, , "Legacy HTML mismatch."
+    ElseIf source.BodyFormat = olFormatRichText Then
+        If Not MBL_ByteArraysEqual(source.RTFBody, copy.RTFBody) Then _
+            Err.Raise MB_ERR + 176, , "Legacy RTF bytes mismatch."
+    End If
+    If source.Recipients.Count <> copy.Recipients.Count Then _
+        Err.Raise MB_ERR + 168, , "Legacy recipient count mismatch."
+    For i = 1 To source.Recipients.Count
+        Set ra = source.Recipients.Item(i): Set rb = copy.Recipients.Item(i)
+        If ra.Type <> rb.Type Or StrComp(ra.Address, rb.Address, vbBinaryCompare) <> 0 Then _
+            Err.Raise MB_ERR + 169, , "Legacy recipient mismatch at index " & CStr(i)
+    Next i
+    Set ra = Nothing: Set rb = Nothing
+    If source.Attachments.Count <> copy.Attachments.Count Then _
+        Err.Raise MB_ERR + 170, , "Legacy attachment count mismatch."
+    For i = 1 To source.Attachments.Count
+        Set a = source.Attachments.Item(i): Set b = copy.Attachments.Item(i)
+        If a.Type <> b.Type Or a.Size <> b.Size Or _
+           StrComp(a.FileName, b.FileName, vbBinaryCompare) <> 0 Then _
+            Err.Raise MB_ERR + 171, , "Legacy attachment metadata mismatch at index " & CStr(i)
+        MBL_CompareAttachmentProperties a, b
+        digest = MBL_AttachmentHash(a)
+        If digest <> MBL_AttachmentHash(b) Then _
+            Err.Raise MB_ERR + 172, , "Legacy attachment bytes mismatch at index " & CStr(i)
+    Next i
+    Set a = Nothing: Set b = Nothing
+    MBE_RequireMetadataComplete source, copy
+    copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    Exit Sub
+Failed:
+    n = Err.Number: d = Err.Description
+    On Error Resume Next
+    Set a = Nothing: Set b = Nothing: Set ra = Nothing: Set rb = Nothing
+    If Not copy Is Nothing Then copy.Close olDiscard
+    Set copy = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    Err.Raise n, "MBL_CompareExisting", d
+End Sub
+
+Private Function MBL_VerifyCandidate(ByVal mail As Outlook.MailItem, ByVal candidate As String, _
+                                    ByVal boundRoot As String, ByRef digest As String, _
+                                    ByRef bytes As Double, ByRef reason As String) As Boolean
+    Dim beforeHash As String, beforeBytes As Double, beforeDate As Date, f As Object, path As String
+    Dim baseline As Variant
+    On Error GoTo Rejected
+    digest = "": bytes = 0: reason = ""
+    path = MBL_CanonicalLegacyPath(candidate, boundRoot, True)
+    Set f = gFSO.GetFile(path)
+    beforeBytes = CDbl(f.Size): beforeDate = f.DateLastModified
+    If beforeBytes = 0 Then Err.Raise MB_ERR + 173, , "Legacy MSG is empty."
+    beforeHash = MBH_HashFile(path)
+    ' A previously recovered file already has an expected hash. Adoption must
+    ' not silently replace that baseline merely because a live mail matches.
+    If Not gRecoveryFiles Is Nothing Then
+        If gRecoveryFiles.Exists(path) Then
+            baseline = MBM_Unpack(CStr(gRecoveryFiles(path)), 5)
+            If StrComp(CStr(baseline(0)), path, vbTextCompare) <> 0 Or _
+               MB_ByteCount(CStr(baseline(1))) <> beforeBytes Or CStr(baseline(2)) <> beforeHash Then
+                Err.Raise MB_ERR + 184, , "Recovered MSG differs from its recorded baseline."
+            End If
+        End If
+    End If
+    MBL_CompareExisting mail, path
+    digest = MBH_HashFile(path)
+    Set f = gFSO.GetFile(path)
+    bytes = CDbl(f.Size)
+    If bytes <> beforeBytes Or f.DateLastModified <> beforeDate Or digest <> beforeHash Then _
+        Err.Raise MB_ERR + 174, , "Legacy file changed during verification."
+    MBL_VerifyCandidate = True
+    Exit Function
+Rejected:
+    reason = "Error " & CStr(Err.Number) & ": " & Err.Description
+    digest = "": bytes = 0
+End Function
+
+Private Function MBL_TryMatch(ByVal mail As Outlook.MailItem, ByRef path As String, _
+                             ByRef digest As String, ByRef bytes As Double, _
+                             ByRef reason As String, ByVal accountRoot As String) As Long
+    Dim candidates As Object, attempted As Object, name As String, stamp As String, candidate As Variant
+    Dim candidateHash As String, candidateBytes As Double, why As String, matchCount As Long
+    Dim differentBytes As Boolean, failureCount As Long, pass As Long
+    On Error GoTo Failed
+    path = "": digest = "": bytes = 0: reason = ""
+    If Not MB_ContinueWork() Then
+        MBL_TryMatch = 3
+        Exit Function
+    End If
+    If Not gLegacyScanComplete Or mblByName Is Nothing Then
+        reason = "Legacy scan is incomplete; no new export is permitted."
+        MBL_TryMatch = 2
+        Exit Function
+    End If
+    If gLegacyFileCount = 0 Then Exit Function
+    Set candidates = CreateObject("Scripting.Dictionary")
+    candidates.CompareMode = vbTextCompare
+    Set attempted = CreateObject("Scripting.Dictionary")
+    attempted.CompareMode = vbTextCompare
+    name = MBL_AddressBookName(mail)
+    If Len(name) > 0 Then MBL_AddCandidates mblByName, MBL_OldLeaf(mail, name), candidates, accountRoot
+    MBL_AddCandidates mblByName, MBL_OldLeaf(mail, mail.SenderName), candidates, accountRoot
+    stamp = MBC_FileStamp(mail.SentOn)
+    For pass = 1 To 3
+        If pass = 2 Then
+            ' A complete exact-name match avoids opening unrelated mails sent
+            ' in the same second. Every colliding exact-name path was checked.
+            If matchCount > 0 Then Exit For
+            MBL_AddCandidates mblByStamp, stamp, candidates, accountRoot
+        ElseIf pass = 3 Then
+            If matchCount > 0 Then Exit For
+            ' A timezone/calendar change before first registration may shift
+            ' every timestamp lookup. Sender+subject tails provide bounded
+            ' candidates; full MSG/content/hash checks remain mandatory.
+            If Len(name) > 0 Then MBL_AddCandidates mblByName, _
+                MBL_TailBucket(MBL_OldLeaf(mail, name), accountRoot), candidates, accountRoot
+            MBL_AddCandidates mblByName, MBL_TailBucket(MBL_OldLeaf(mail, mail.SenderName), accountRoot), _
+                              candidates, accountRoot
+        End If
+        For Each candidate In candidates.Keys
+            If Not attempted.Exists(CStr(candidate)) Then
+                If Not MB_ContinueWork() Then
+                    path = "": digest = "": bytes = 0
+                    MBL_TryMatch = 3
+                    Exit Function
+                End If
+                attempted.Add CStr(candidate), True
+                why = ""
+                If MBL_VerifyCandidate(mail, CStr(candidate), accountRoot, _
+                                       candidateHash, candidateBytes, why) Then
+                    matchCount = matchCount + 1
+                    If Len(path) = 0 Then
+                        path = CStr(candidate): digest = candidateHash: bytes = candidateBytes
+                    ElseIf candidateHash <> digest Then
+                        differentBytes = True
+                    ElseIf StrComp(CStr(candidate), path, vbTextCompare) < 0 Then
+                        path = CStr(candidate)
+                    End If
+                Else
+                    failureCount = failureCount + 1
+                    If Len(reason) < 1200 Then reason = reason & CStr(candidate) & " => " & why & " | "
+                End If
+            End If
+        Next candidate
+    Next pass
+    If attempted.Count = 0 Then Exit Function
+    If Not MB_ContinueWork() Then
+        path = "": digest = "": bytes = 0
+        MBL_TryMatch = 3
+        Exit Function
+    End If
+    If matchCount = 0 Or differentBytes Then
+        If differentBytes Then reason = "Multiple matching legacy files have different bytes. " & reason
+        If matchCount = 0 Then reason = "Filename/sent-second/tail candidates could not be verified. " & reason
+        path = "": digest = "": bytes = 0
+        MBL_TryMatch = 2
+    Else
+        reason = "Verified in place; matching files=" & CStr(matchCount) & _
+                 "; rejected name/sent-second/tail candidates=" & CStr(failureCount)
+        MBL_TryMatch = 1
+    End If
+    Exit Function
+Failed:
+    reason = "Cannot establish legacy correspondence: " & CStr(Err.Number) & ": " & Err.Description
+    path = "": digest = "": bytes = 0
+    If gCancel Then
+        MBL_TryMatch = 3
+    Else
+        MBL_TryMatch = 2
+    End If
+End Function
+
+Private Sub MBL_BuildAccountIndexes(ByVal roots As Collection, ByVal managedRoot As String)
+    Dim value As Variant, first As Boolean, totalFiles As Long, totalFolders As Long
+    Dim totalUnknown As Long, newest As Date
+    first = True
+    gLegacyAccountStats.RemoveAll
+    For Each value In roots
+        If Not MB_ContinueWork() Then Exit Sub
+        gLegacyFileCount = 0: gLegacyFolderCount = 0: gLegacyUnrecognizedNames = 0
+        gLegacyNewestFileTime = 0
+        MBL_BuildIndex CStr(value), managedRoot, Not first
+        first = False
+        If Not gLegacyScanComplete Then Exit Sub
+        gLegacyAccountStats(CStr(value)) = Array(gLegacyFileCount, gLegacyUnrecognizedNames, gLegacyNewestFileTime)
+        totalFiles = totalFiles + gLegacyFileCount
+        totalFolders = totalFolders + gLegacyFolderCount
+        totalUnknown = totalUnknown + gLegacyUnrecognizedNames
+        If gLegacyNewestFileTime > newest Then newest = gLegacyNewestFileTime
+    Next value
+    If first Then MBL_BuildIndex "", managedRoot
+    gLegacyFileCount = totalFiles: gLegacyFolderCount = totalFolders
+    gLegacyUnrecognizedNames = totalUnknown: gLegacyNewestFileTime = newest
+    gLegacyScanComplete = True
+End Sub

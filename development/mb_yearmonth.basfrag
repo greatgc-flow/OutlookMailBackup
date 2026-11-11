@@ -1,0 +1,564 @@
+' ===================== Account / year / month layout ========================
+' The folder date is SentOn, then ReceivedTime, then CreationTime. Recent-mail
+' filtering separately retains its ReceivedTime-first policy. Old original
+' YYYYMMDD_HHNNSS prefixes preserve their original SentOn grouping.
+' Account selection is remembered in checksummed state; new message files and
+' old files organized by the move engine share the actual selected account root.
+
+Public Sub MB_ChooseAccountFolder()
+    MB_Run "CHOOSE_ACCOUNT", False, False, False
+End Sub
+
+Private Sub MBY_Reset()
+    Set mbyRoots = Nothing
+    Set mbyValidated = Nothing
+    mbyLoadedState = ""
+End Sub
+
+Private Function MBY_StateRoot() As String
+    If Len(gBaseRoot) = 0 Then Err.Raise MB_ERR + 300, , "Managed state root is not initialized."
+    MBY_StateRoot = MBH_NormalizePath(gBaseRoot)
+End Function
+
+Private Function MBY_MapPath() As String
+    MBY_MapPath = MB_StatePath(MBY_MAP_FILE)
+End Function
+
+Private Sub MBY_LoadRoots()
+    Dim state As String, path As String, stream As Object, line As String, f As Variant
+    Dim key As Variant, other As Variant, n As Long, detail As String
+    On Error GoTo Failed
+    state = MBY_StateRoot()
+    If Not mbyRoots Is Nothing Then
+        If StrComp(state, mbyLoadedState, vbTextCompare) = 0 Then Exit Sub
+    End If
+    Set mbyRoots = CreateObject("Scripting.Dictionary")
+    mbyRoots.CompareMode = vbTextCompare
+    Set mbyValidated = CreateObject("Scripting.Dictionary")
+    mbyValidated.CompareMode = vbTextCompare
+    mbyLoadedState = ""
+    path = MBY_MapPath()
+    If gFSO.FileExists(path) Then
+        If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then
+            Err.Raise MB_ERR + 301, , "Account mapping has an incomplete UTF-16 byte."
+        End If
+        Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+        Do Until stream.AtEndOfStream
+            line = stream.ReadLine
+            If Len(line) > 0 Then
+                f = MB_ReadCheckedLine(line, 4)
+                If f(0) <> "MBAC3" Or Len(CStr(f(1))) = 0 Then
+                    Err.Raise MB_ERR + 302, , "Invalid account mapping schema/StoreID."
+                End If
+                If StrComp(MBH_NormalizePath(CStr(f(3))), state, vbTextCompare) <> 0 Then
+                    Err.Raise MB_ERR + 303, , "Account mapping belongs to a different managed state root."
+                End If
+                mbyRoots(LCase$(CStr(f(1)))) = MBH_NormalizePath(CStr(f(2)))
+            End If
+        Loop
+        stream.Close
+        Set stream = Nothing
+    End If
+    For Each key In mbyRoots.Keys
+        For Each other In mbyRoots.Keys
+            If StrComp(CStr(key), CStr(other), vbTextCompare) <> 0 Then
+                If MB_PathWithin(CStr(mbyRoots(key)), CStr(mbyRoots(other))) Or _
+                   MB_PathWithin(CStr(mbyRoots(other)), CStr(mbyRoots(key))) Then
+                    Err.Raise MB_ERR + 304, , "Different account roots overlap in the saved mapping."
+                End If
+            End If
+        Next other
+    Next key
+    mbyLoadedState = state
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    MBY_Reset
+    On Error GoTo 0
+    Err.Raise n, "MBY_LoadRoots", detail
+End Sub
+
+Private Sub MBY_CheckMarker(ByVal root As String, ByVal storeId As String, ByVal requireMarker As Boolean)
+    Dim path As String, stream As Object, line As String, f As Variant, n As Long, detail As String
+    On Error GoTo Failed
+    path = MBH_JoinPath(root, MBY_ACCOUNT_MARKER)
+    If Not gFSO.FileExists(path) Then
+        If requireMarker Then Err.Raise MB_ERR + 305, , "Account folder marker is missing: " & path
+        Exit Sub
+    End If
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then
+        Err.Raise MB_ERR + 306, , "Account folder marker is truncated."
+    End If
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 307, , "Account folder marker is empty."
+    line = stream.ReadLine
+    f = MB_ReadCheckedLine(line, 4)
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 308, , "Unexpected extra account marker data."
+    stream.Close
+    Set stream = Nothing
+    If f(0) <> "MBAC3" Then Err.Raise MB_ERR + 309, , "Unknown account folder marker."
+    If StrComp(CStr(f(1)), storeId, vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 310, , "This folder is already bound to a different Outlook store."
+    End If
+    If StrComp(MBH_NormalizePath(CStr(f(2))), root, vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 311, , "This account folder was moved; its binding needs review."
+    End If
+    If StrComp(MBH_NormalizePath(CStr(f(3))), MBY_StateRoot(), vbTextCompare) <> 0 Then
+        Err.Raise MB_ERR + 312, , "This folder belongs to a different managed backup state."
+    End If
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBY_CheckMarker", detail
+End Sub
+
+Private Sub MBY_NoReparse(ByVal path As String, Optional ByVal requireExists As Boolean = False)
+    Dim current As String, parent As String, f As Object, exists As Boolean
+    path = MBH_NormalizePath(path)
+    current = path
+    Do
+        exists = False
+        If gFSO.FileExists(current) Then
+            Set f = gFSO.GetFile(current): exists = True
+        ElseIf gFSO.FolderExists(current) Then
+            Set f = gFSO.GetFolder(current): exists = True
+        ElseIf requireExists And StrComp(current, path, vbTextCompare) = 0 Then
+            Err.Raise MB_ERR + 313, , "Required account path is unavailable: " & path
+        End If
+        If exists Then
+            If (CLng(f.Attributes) And 1024) <> 0 Then
+                Err.Raise MB_ERR + 314, , "Account path traverses a link/reparse point: " & current
+            End If
+        End If
+        If MBL_IsFileSystemRoot(current) Then Exit Do
+        parent = gFSO.GetParentFolderName(current)
+        If Len(parent) = 0 Or StrComp(parent, current, vbTextCompare) = 0 Then Exit Do
+        current = parent
+    Loop
+End Sub
+
+Private Sub MBY_CheckNestedMarkers(ByVal root As String)
+    Dim pending As Collection, folder As Object, child As Object, current As String, parent As String
+    ' Ancestor markers would make this account a child of another account.
+    current = gFSO.GetParentFolderName(root)
+    Do While Len(current) > 0
+        If gFSO.FileExists(MBH_JoinPath(current, MBY_ACCOUNT_MARKER)) Then
+            Err.Raise MB_ERR + 315, , "An account root cannot be nested below another account root."
+        End If
+        If MBL_IsFileSystemRoot(current) Then Exit Do
+        parent = gFSO.GetParentFolderName(current)
+        If StrComp(parent, current, vbTextCompare) = 0 Then Exit Do
+        current = parent
+    Loop
+    Set pending = New Collection
+    pending.Add root
+    Do While pending.Count > 0
+        If Not MB_ContinueWork() Then Exit Sub
+        current = CStr(pending(pending.Count)): pending.Remove pending.Count
+        Set folder = gFSO.GetFolder(current)
+        For Each child In folder.SubFolders
+            current = MBH_NormalizePath(CStr(child.Path))
+            If Not MB_PathWithin(current, MBY_StateRoot()) Then
+                If (CLng(child.Attributes) And 1024) <> 0 Then
+                    Err.Raise MB_ERR + 316, , "Account tree contains a link/reparse folder: " & current
+                End If
+                If gFSO.FileExists(MBH_JoinPath(current, MBY_ACCOUNT_MARKER)) Then
+                    Err.Raise MB_ERR + 317, , "Selected account folder contains another account root: " & current
+                End If
+                pending.Add current
+            End If
+        Next child
+    Loop
+End Sub
+
+Private Function MBY_ValidateAccountRoot(ByVal path As String, ByVal storeId As String, _
+                                        ByVal createMarker As Boolean) As String
+    Dim key As Variant, marker As String, stage As String, stream As Object
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    MBY_LoadRoots
+    path = MBH_NormalizePath(path)
+    If Len(storeId) = 0 Then Err.Raise MB_ERR + 318, , "An Outlook StoreID is required."
+    If Len(path) > 80 Then Err.Raise MB_ERR + 319, , "Account root must be at most 80 UTF-16 characters."
+    If Not gFSO.FolderExists(path) Then Err.Raise MB_ERR + 320, , "The account folder is unavailable."
+    If MBL_IsFileSystemRoot(path) Then Err.Raise MB_ERR + 321, , "Select an account folder, not a drive/share root."
+    If MB_PathWithin(path, MBY_StateRoot()) Then
+        Err.Raise MB_ERR + 322, , "Account folders must be outside the managed SafeV2 state tree."
+    End If
+    MBY_NoReparse path, True
+    For Each key In mbyRoots.Keys
+        If StrComp(CStr(key), storeId, vbTextCompare) <> 0 Then
+            If MB_PathWithin(path, CStr(mbyRoots(key))) Or MB_PathWithin(CStr(mbyRoots(key)), path) Then
+                Err.Raise MB_ERR + 323, , "This folder overlaps another Outlook account's folder."
+            End If
+        End If
+    Next key
+    MBY_CheckMarker path, storeId, Not createMarker
+    MBY_CheckRecoveryAccountBinding path, storeId
+    If createMarker Then
+        MBY_CheckNestedMarkers path
+        If gCancel Or gFatal Then Exit Function
+        MBP_ProbeWritable path, gFSO
+        marker = MBH_JoinPath(path, MBY_ACCOUNT_MARKER)
+        If Not gFSO.FileExists(marker) Then
+            stage = MBH_NewStagePath(marker)
+            Set stream = gFSO.CreateTextFile(stage, True, True)
+            MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBAC3", LCase$(storeId), path, MBY_StateRoot()))
+            stream.Close
+            Set stream = Nothing
+            MBH_CommitStage stage, marker
+            stage = ""
+            MBM_FlushPath marker
+        End If
+    End If
+    MBY_ValidateAccountRoot = path
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    On Error GoTo 0
+    Err.Raise n, "MBY_ValidateAccountRoot", detail
+End Function
+
+Private Sub MBY_SaveRoot(ByVal storeId As String, ByVal path As String)
+    Dim stream As Object, stateDir As String, n As Long, detail As String
+    On Error GoTo Failed
+    MBY_LoadRoots
+    If mbyRoots.Exists(storeId) Then
+        If StrComp(CStr(mbyRoots(storeId)), path, vbTextCompare) = 0 Then Exit Sub
+    End If
+    stateDir = MB_StatePath()
+    MBH_EnsureDirectory stateDir
+    Set stream = gFSO.OpenTextFile(MBY_MapPath(), 8, True, -1)
+    stream.WriteLine ""
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBAC3", LCase$(storeId), path, MBY_StateRoot()))
+    stream.Close
+    Set stream = Nothing
+    MBM_FlushPath MBY_MapPath()
+    mbyRoots(LCase$(storeId)) = path
+    MBS_RememberAccount storeId, path
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise n, "MBY_SaveRoot", "Cannot remember the account folder: " & detail
+End Sub
+
+Private Sub MBY_CheckRecoveryAccountBinding(ByVal account As String, ByVal storeId As String)
+    Dim path As String, row As Variant
+    path = MBH_JoinPath(MBH_JoinPath(account, MBR_FOLDER), MBR_OWNER_FILE)
+    If Not gFSO.FileExists(path) Then Exit Sub
+    row = MB_ReadCheckedLine(MBP_ReadOneLine(path, gFSO), 5)
+    If CStr(row(0)) <> "MBRECOVERY1" Or CStr(row(4)) <> "1" Then _
+        Err.Raise MB_ERR + 313, , "Unknown account recovery owner."
+    If StrComp(MBH_NormalizePath(CStr(row(1))), MBY_StateRoot(), vbTextCompare) <> 0 Or _
+       StrComp(MBH_NormalizePath(CStr(row(2))), account, vbTextCompare) <> 0 Or _
+       StrComp(CStr(row(3)), storeId, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 313, , "This account recovery folder is bound to a different root, account, or Outlook store."
+End Sub
+
+Private Function MBY_AccountBindingUsable(ByVal path As String, ByVal storeId As String, _
+                                          ByRef exactBinding As Boolean) As Boolean
+    Dim recoveryOwner As String
+    On Error GoTo Unusable
+    exactBinding = False
+    path = MBH_NormalizePath(path)
+    If Not gFSO.FolderExists(path) Then Exit Function
+    If Len(path) > 80 Or MBL_IsFileSystemRoot(path) Or MB_PathWithin(path, MBY_StateRoot()) Then Exit Function
+    MBY_NoReparse path, True
+    MBY_CheckMarker path, storeId, False
+    MBY_CheckRecoveryAccountBinding path, storeId
+    recoveryOwner = MBH_JoinPath(MBH_JoinPath(path, MBR_FOLDER), MBR_OWNER_FILE)
+    exactBinding = gFSO.FileExists(MBH_JoinPath(path, MBY_ACCOUNT_MARKER)) Or gFSO.FileExists(recoveryOwner)
+    MBY_AccountBindingUsable = True
+Unusable:
+End Function
+
+Private Sub MBY_AddBoundAccount(ByVal path As String, ByVal storeId As String, ByVal candidates As Object)
+    Dim exactBinding As Boolean
+    If MBY_AccountBindingUsable(path, storeId, exactBinding) Then
+        If exactBinding Then candidates(MBH_NormalizePath(path)) = True
+    End If
+End Sub
+
+Private Sub MBY_DiscoverBoundAccounts(ByVal storeId As String, ByVal candidates As Object)
+    Dim bases As Object, value As Variant, base As String, folder As Object
+    Set bases = CreateObject("Scripting.Dictionary")
+    bases.CompareMode = vbTextCompare
+    ' Deliberately bounded discovery: known bases and their direct account
+    ' children. Exact StoreID/root markers, never folder names, authorize reuse.
+    For Each value In Array(gLegacyRoot, gSelectedBase, CStr(gFSO.GetParentFolderName(gBaseRoot)))
+        If Len(CStr(value)) > 0 Then bases(MBH_NormalizePath(CStr(value))) = True
+    Next value
+    For Each value In bases.Keys
+        base = CStr(value)
+        If gFSO.FolderExists(base) Then
+            MBY_NoReparse base, True
+            MBY_AddBoundAccount base, storeId, candidates
+            For Each folder In gFSO.GetFolder(base).SubFolders
+                If Not MB_ContinueWork() Then Exit Sub
+                If (CLng(folder.Attributes) And 1024) = 0 Then MBY_AddBoundAccount CStr(folder.Path), storeId, candidates
+            Next folder
+        End If
+    Next value
+End Sub
+
+Private Function MBY_InferAccountRoot(ByVal storeId As String) As String
+    Dim st As Outlook.Store, top As Outlook.Folder, names As Variant, leaf As Variant
+    Dim candidates As Object, base As String, candidate As String, value As Variant, folderName As String
+    Dim exactBinding As Boolean
+    Set candidates = CreateObject("Scripting.Dictionary")
+    candidates.CompareMode = vbTextCompare
+    MBY_DiscoverBoundAccounts storeId, candidates
+    If gCancel Or gFatal Then Exit Function
+    If candidates.Count > 1 Then Exit Function
+    If candidates.Count = 1 Then GoTo UniqueCandidate
+    Set st = Application.Session.GetStoreFromID(storeId)
+    Set top = st.GetRootFolder
+    folderName = MBL_OldSanitize(top.Name)
+    names = Array(folderName & "_RAW", folderName & "_byFolder", folderName & "_byTopic", folderName)
+    If Len(gLegacyRoot) = 0 Then Exit Function
+    base = MBH_NormalizePath(gLegacyRoot)
+    For Each leaf In names
+        If StrComp(CStr(gFSO.GetFileName(base)), CStr(leaf), vbTextCompare) = 0 Then
+            If MBY_AccountBindingUsable(base, storeId, exactBinding) Then candidates(base) = True
+        End If
+        candidate = MBY_OptionalChild(base, CStr(leaf))
+        If Len(candidate) > 0 Then
+            If MBY_AccountBindingUsable(candidate, storeId, exactBinding) Then candidates(candidate) = True
+        End If
+    Next leaf
+UniqueCandidate:
+    If candidates.Count = 1 Then
+        For Each value In candidates.Keys
+            MBY_InferAccountRoot = CStr(value)
+        Next value
+    End If
+End Function
+
+Private Function MBY_OptionalChild(ByVal base As String, ByVal leaf As String) As String
+    ' An unusable derived account display name must lead to the folder picker.
+    ' The chosen real path still receives full validation before it is saved.
+    On Error GoTo UnusableName
+    MBY_OptionalChild = MBH_JoinPath(base, leaf)
+UnusableName:
+End Function
+
+Private Function MBY_ResolveAccountRoot(ByVal storeId As String, ByVal forcePicker As Boolean) As String
+    Dim candidate As String, reason As String, valid As String, st As Outlook.Store
+    Dim n As Long, detail As String
+    On Error GoTo Failed
+    MBY_LoadRoots
+    If Not forcePicker Then
+        If mbyRoots.Exists(storeId) And mbyValidated.Exists(storeId) Then
+            MBY_ResolveAccountRoot = CStr(mbyRoots(storeId))
+            Exit Function
+        End If
+    End If
+    Set st = Application.Session.GetStoreFromID(storeId)
+    If Not forcePicker Then
+        If mbyRoots.Exists(storeId) Then
+            candidate = CStr(mbyRoots(storeId))
+            If mbyValidated.Exists(storeId) Then
+                MBY_ResolveAccountRoot = candidate
+                Exit Function
+            End If
+            On Error Resume Next
+            valid = MBY_ValidateAccountRoot(candidate, storeId, False)
+            n = Err.Number: reason = Err.Description
+            Err.Clear
+            On Error GoTo Failed
+            If n = 0 Then
+                MBM_AcquireAccountLock valid
+                mbyValidated(storeId) = True
+                MBY_ResolveAccountRoot = valid
+                Exit Function
+            End If
+            MsgBox "The remembered account folder cannot be used." & vbCrLf & candidate & _
+                   vbCrLf & reason, vbExclamation, "Account folder"
+        Else
+            candidate = MBY_InferAccountRoot(storeId)
+            If Len(candidate) > 0 Then
+                On Error Resume Next
+                Err.Clear
+                valid = MBY_ValidateAccountRoot(candidate, storeId, True)
+                n = Err.Number: reason = Err.Description
+                Err.Clear
+                On Error GoTo Failed
+                If gCancel Or gFatal Then Exit Function
+                If n = 0 Then
+                    MBM_AcquireAccountLock valid
+                    MBY_SaveRoot storeId, valid
+                    mbyValidated(storeId) = True
+                    MBY_ResolveAccountRoot = valid
+                    Exit Function
+                End If
+                ' An inferred display-name match is only a candidate. Invalid
+                ' markers, path length or nested roots must still allow selection.
+                MsgBox "The automatically detected account folder cannot be used." & vbCrLf & _
+                       candidate & vbCrLf & reason, vbExclamation, "Account folder"
+            End If
+        End If
+    ElseIf mbyRoots.Exists(storeId) Then
+        candidate = CStr(mbyRoots(storeId))
+    End If
+    Do
+        candidate = MBP_PickExistingFolder("Choose the EXISTING account folder for: " & st.DisplayName & _
+                    vbCrLf & "New exports use yyyy\mm inside this folder.", candidate)
+        If Len(candidate) = 0 Then
+            gCancel = True
+            Exit Function
+        End If
+        On Error Resume Next
+        Err.Clear
+        valid = MBY_ValidateAccountRoot(candidate, storeId, True)
+        n = Err.Number: reason = Err.Description
+        On Error GoTo Failed
+        If gCancel Or gFatal Then Exit Function
+        If n = 0 Then
+            MBM_AcquireAccountLock valid
+            MBY_SaveRoot storeId, valid
+            mbyValidated(storeId) = True
+            MBY_ResolveAccountRoot = valid
+            Exit Function
+        End If
+        MsgBox reason & vbCrLf & "Select another account folder or Cancel.", vbExclamation
+    Loop
+Failed:
+    n = Err.Number: detail = Err.Description
+    gFatal = True
+    gFatalText = "Account folder setup failed: " & detail
+    Err.Raise n, "MBY_ResolveAccountRoot", gFatalText
+End Function
+
+Private Function MBY_AccountRoot(ByVal storeId As String) As String
+    MBY_AccountRoot = MBY_ResolveAccountRoot(storeId, False)
+End Function
+
+Private Function MBY_ChooseAccountRoot(ByVal storeId As String) As String
+    MBY_ChooseAccountRoot = MBY_ResolveAccountRoot(storeId, True)
+End Function
+
+Private Function MBY_GetMappedRoot(ByVal storeId As String) As String
+    ' No folder picker or filesystem mutation. Missing mappings return empty.
+    MBY_LoadRoots
+    If mbyRoots.Exists(storeId) Then MBY_GetMappedRoot = CStr(mbyRoots(storeId))
+End Function
+
+Private Function MBY_GetKnownRootsAsCollection() As Collection
+    Dim roots As Collection, key As Variant
+    MBY_LoadRoots
+    Set roots = New Collection
+    For Each key In mbyRoots.Keys
+        roots.Add CStr(mbyRoots(key))
+    Next key
+    Set MBY_GetKnownRootsAsCollection = roots
+End Function
+
+Private Function MBY_CanonicalFilePath(ByVal path As String, ByVal boundRoot As String, _
+                                       Optional ByVal requireExisting As Boolean = False) As String
+    path = MBH_NormalizePath(path): boundRoot = MBH_NormalizePath(boundRoot)
+    If StrComp(path, boundRoot, vbTextCompare) = 0 Or Not MB_PathWithin(path, boundRoot) Then
+        Err.Raise MB_ERR + 326, , "File path is outside its recorded account root."
+    End If
+    If requireExisting Then
+        If Not gFSO.FileExists(path) Then Err.Raise MB_ERR + 327, , "Referenced file is unavailable: " & path
+        MBY_NoReparse path, True
+    End If
+    MBY_CanonicalFilePath = path
+End Function
+
+Private Function MBY_MessageDate(ByVal mail As Outlook.MailItem) As Date
+    Dim value As Date
+    value = mail.SentOn
+    If MB_ValidDate(value) Then MBY_MessageDate = value: Exit Function
+    value = mail.ReceivedTime
+    If MB_ValidDate(value) Then MBY_MessageDate = value: Exit Function
+    value = mail.CreationTime
+    If MB_ValidDate(value) Then MBY_MessageDate = value: Exit Function
+    Err.Raise MB_ERR + 324, , "The mail has no usable date for year/month filing."
+End Function
+
+Private Function MBY_MonthDirectory(ByVal accountRoot As String, ByVal stamp As Date) As String
+    Dim result As String, yearMonth As String
+    If Not MB_ValidDate(stamp) Then Err.Raise MB_ERR + 325, , "Invalid year/month filing date."
+    yearMonth = MBC_YearMonth(stamp)
+    result = MBH_JoinPath(MBH_JoinPath(accountRoot, Left$(yearMonth, 4)), Right$(yearMonth, 2))
+    MBY_NoReparse result
+    MBY_MonthDirectory = result
+End Function
+
+Private Function MBY_FileMonth(ByVal path As String, ByRef stamp As Date, ByRef reason As String) As Boolean
+    Dim leaf As String, ext As String, key As String, remaining As String, separator As Long
+    Dim obj As Object, mail As Outlook.MailItem, n As Long, detail As String
+    On Error GoTo Failed
+    stamp = 0: reason = ""
+    leaf = gFSO.GetFileName(path)
+    ext = LCase$(gFSO.GetExtensionName(path))
+    key = MBL_StampKey(leaf)
+    If Len(key) > 0 Then
+        stamp = MBC_ParseFileStamp(key)
+        If Not MB_ValidDate(stamp) Then stamp = 0
+    End If
+    If ext = "msg" Then
+        If stamp <> 0 Then
+            reason = "Original SentOn filename prefix"
+            MBY_FileMonth = True
+            Exit Function
+        End If
+        MBY_NoReparse path, True
+        Set obj = Application.Session.OpenSharedItem(path)
+        If Not TypeOf obj Is Outlook.MailItem Then
+            reason = "MSG is not an Outlook MailItem."
+            GoTo CleanUp
+        End If
+        Set mail = obj
+        stamp = MBY_MessageDate(mail)
+        reason = "MSG SentOn/ReceivedTime/CreationTime"
+        MBY_FileMonth = True
+    ElseIf Len(key) > 0 And stamp <> 0 And Len(ext) > 0 Then
+        If InStr(1, MBY_ATTACHMENT_EXTENSIONS, ";" & ext & ";", vbBinaryCompare) > 0 Then
+            remaining = Mid$(leaf, 17)
+            separator = InStr(remaining, "_")
+            If separator >= 1 And separator <= 11 And Len(Mid$(remaining, separator + 1)) > Len(ext) + 1 Then
+                reason = "Original extracted-attachment filename pattern"
+                MBY_FileMonth = True
+            End If
+        End If
+    End If
+CleanUp:
+    If Not mail Is Nothing Then
+        mail.Close olDiscard
+    ElseIf Not obj Is Nothing Then
+        obj.Close olDiscard
+    End If
+    Set mail = Nothing: Set obj = Nothing
+    If Not MBY_FileMonth Then
+        stamp = 0
+        If Len(reason) = 0 Then reason = "Unrecognized/non-mail file; left unchanged."
+    End If
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not mail Is Nothing Then
+        mail.Close olDiscard
+    ElseIf Not obj Is Nothing Then
+        obj.Close olDiscard
+    End If
+    Set mail = Nothing: Set obj = Nothing
+    On Error GoTo 0
+    stamp = 0: reason = "Cannot determine a filing date: " & CStr(n) & ": " & detail
+    MBY_FileMonth = False
+End Function
+

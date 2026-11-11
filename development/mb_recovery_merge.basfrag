@@ -1,0 +1,463 @@
+' A restore plan owns immutable, exactly hashed copies of the still-available
+' primary metadata BEFORE the old snapshot is installed. Its durable pointer
+' survives interruption. Valid later proof is merged before DONE; a conflict
+' never authorizes a new digest, a new baseline or a new MSG export.
+Private Function MBR_CaptureOverlay(ByVal recoveryRoot As String, ByVal accountRoot As String, _
+                                    ByVal storeId As String, ByVal baseReference As String) As String
+    Dim dir As String, primary As String, manifest As String, stage As String, copyPath As String
+    Dim source As String, leaf As String, nonce As String, baseDigest As String, digest As String
+    Dim bytes As Double, manifestBytes As Double, count As Long, item As Object, stream As Object
+    Dim paths As New Collection, key As Variant, fields As Variant, n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    dir = MBH_JoinPath(recoveryRoot, "overlays")
+    MBY_NoReparse dir, False: MBH_EnsureDirectory dir
+    nonce = Left$(MBH_HashText(gRunId & "|" & gFSO.GetTempName & "|" & CStr(Timer)), 24)
+    manifest = MBH_JoinPath(dir, "plan_" & nonce & ".tsv")
+    If baseReference = "MSG_ONLY" Then
+        baseDigest = ""
+    ElseIf Left$(baseReference, 8) = "SALVAGE|" Then
+        fields = Split(baseReference, "|")
+        If UBound(fields) <> 4 Then Err.Raise MB_ERR + 1140, , "Malformed prior salvage intent."
+        baseDigest = CStr(fields(3))
+        If Not MB_IsHexKey(baseDigest) Then Err.Raise MB_ERR + 1140, , "Invalid prior salvage digest."
+    Else
+        If Not MB_PathWithin(baseReference, MBH_JoinPath(recoveryRoot, "snapshots")) Then _
+            Err.Raise MB_ERR + 1141, , "Restore base escapes its snapshots directory."
+        MBY_NoReparse baseReference, True
+        baseDigest = MBH_HashFile(baseReference)
+    End If
+    stage = MBH_NewStagePath(manifest)
+    Set stream = gFSO.CreateTextFile(stage, True, True)
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBOVERLAY1", "HEADER", gRoot, accountRoot, _
+        storeId, baseReference, baseDigest, MBC_UtcStamp(MBC_UtcNow())))
+    primary = MB_StatePath()
+    If gFSO.FolderExists(primary) Then
+        For Each item In gFSO.GetFolder(primary).Files
+            If MBR_IsStateLeaf(CStr(item.Name)) Then
+                If LCase$(CStr(item.Name)) = MBR_MIRROR_LEAF Then _
+                    Err.Raise MB_ERR + 1155, , "Reserved recovery-overlay leaf exists in primary state."
+                paths.Add Array(CStr(item.Path), CStr(item.Name))
+            End If
+        Next item
+    End If
+    source = MBH_JoinPath(recoveryRoot, "stage-intents.tsv")
+    If gFSO.FileExists(source) Then paths.Add Array(source, MBR_MIRROR_LEAF)
+    For Each key In paths
+        If Not MB_ContinueWork() Then Err.Raise MB_ERR + 1158, , "Restore capture cancelled before state replacement."
+        source = CStr(key(0)): leaf = CStr(key(1))
+        MBY_NoReparse source, True
+        guard = MBH_GuardFile(source)
+        bytes = CDbl(gFSO.GetFile(source).Size): digest = MBH_HashFile(source)
+        count = count + 1
+        copyPath = MBH_JoinPath(dir, nonce & "_" & Format$(count, "00000") & ".tsv")
+        gFSO.CopyFile source, copyPath, False
+        MBM_FlushPath copyPath
+        If CDbl(gFSO.GetFile(copyPath).Size) <> bytes Or MBH_HashFile(copyPath) <> digest Then _
+            Err.Raise MB_ERR + 1142, , "Pre-restore metadata copy failed exact-byte verification."
+        MBH_CloseGuard guard
+        MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBOVERLAY1", "FILE", leaf, _
+            CStr(gFSO.GetFileName(copyPath)), Format$(bytes, "0"), digest, "", ""))
+    Next key
+    MB_WriteCheckedLine stream, MB_EncodeFields(Array("MBOVERLAY1", "END", CStr(count), "", "", "", "", ""))
+    stream.Close: Set stream = Nothing
+    MBM_FlushPath stage
+    digest = MBH_HashFile(stage): manifestBytes = CDbl(gFSO.GetFile(stage).Size)
+    MBH_CommitStage stage, manifest, digest, manifestBytes: stage = ""
+    MBR_CaptureOverlay = "MERGE|" & CStr(gFSO.GetFileName(manifest)) & "|" & _
+        Format$(manifestBytes, "0") & "|" & digest
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    If Not stream Is Nothing Then stream.Close
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    ' Completed immutable copies remain available even if a plan could not be
+    ' published. No primary state has been replaced at this point.
+    On Error GoTo 0
+    Err.Raise n, "MBR_CaptureOverlay", detail
+End Function
+
+Private Sub MBR_ReadOverlay(ByVal recoveryRoot As String, ByVal accountRoot As String, ByVal storeId As String, _
+                            ByVal pointer As String, ByRef files As Object, ByRef baseReference As String, _
+                            ByRef baseDigest As String)
+    Dim parts As Variant, f As Variant, path As String, line As String, stream As Object
+    Dim header As Boolean, footer As Boolean, n As Long, detail As String, leaf As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    parts = Split(pointer, "|")
+    If UBound(parts) <> 3 Then Err.Raise MB_ERR + 1143, , "Invalid restore-overlay pointer."
+    If CStr(parts(0)) <> "MERGE" Or Not MBR_IsStateLeaf(CStr(parts(1))) Or _
+       Not MB_IsHexKey(CStr(parts(3))) Then Err.Raise MB_ERR + 1143, , "Unsafe restore-overlay pointer."
+    path = MBH_JoinPath(MBH_JoinPath(recoveryRoot, "overlays"), CStr(parts(1)))
+    MBY_NoReparse path, True
+    guard = MBH_GuardFile(path)
+    If CDbl(gFSO.GetFile(path).Size) <> MB_ByteCount(CStr(parts(2))) Or _
+       MBH_HashFile(path) <> CStr(parts(3)) Then Err.Raise MB_ERR + 1144, , "The original restore plan changed or is missing."
+    Set files = CreateObject("Scripting.Dictionary"): files.CompareMode = vbTextCompare
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    Do Until stream.AtEndOfStream
+        line = stream.ReadLine
+        If Len(line) > 0 Then
+            If footer Then Err.Raise MB_ERR + 1145, , "Restore-overlay data follows its footer."
+            f = MB_ReadCheckedLine(line, 8)
+            If CStr(f(0)) <> "MBOVERLAY1" Then Err.Raise MB_ERR + 1145, , "Unknown restore-overlay schema."
+            Select Case CStr(f(1))
+                Case "HEADER"
+                    If header Or files.Count > 0 Then Err.Raise MB_ERR + 1145, , "Duplicate/late overlay header."
+                    If StrComp(CStr(f(2)), gRoot, vbTextCompare) <> 0 Or _
+                       StrComp(CStr(f(3)), accountRoot, vbTextCompare) <> 0 Or _
+                       StrComp(CStr(f(4)), storeId, vbTextCompare) <> 0 Then _
+                        Err.Raise MB_ERR + 1146, , "Restore-overlay belongs to another root/account/store."
+                    If Not MBC_ValidDate(MBC_ParseUtcStamp(CStr(f(7)))) Then _
+                        Err.Raise MB_ERR + 1145, , "Restore-overlay timestamp is invalid."
+                    baseReference = CStr(f(5)): baseDigest = CStr(f(6)): header = True
+                Case "FILE"
+                    leaf = CStr(f(2))
+                    If Not header Or Not MBR_IsStateLeaf(leaf) Or Not MBR_IsStateLeaf(CStr(f(3))) Or _
+                       Not MB_IsHexKey(CStr(f(5))) Then Err.Raise MB_ERR + 1147, , "Unsafe overlay metadata entry."
+                    If files.Exists(leaf) Then Err.Raise MB_ERR + 1147, , "Duplicate overlay metadata filename."
+                    If MB_ByteCount(CStr(f(4))) < 0 Then Err.Raise MB_ERR + 1147, , "Invalid overlay metadata size."
+                    files.Add leaf, MB_EncodeFields(Array(f(3), f(4), f(5)))
+                Case "END"
+                    If Not header Or MB_ByteCount(CStr(f(2))) <> files.Count Then _
+                        Err.Raise MB_ERR + 1148, , "Incomplete restore-overlay footer."
+                    footer = True
+                Case Else
+                    Err.Raise MB_ERR + 1145, , "Unknown restore-overlay record."
+            End Select
+        End If
+    Loop
+    stream.Close: Set stream = Nothing
+    MBH_CloseGuard guard
+    If Not header Or Not footer Then Err.Raise MB_ERR + 1148, , "Incomplete restore-overlay manifest."
+    If baseReference = "MSG_ONLY" Then
+        If Len(baseDigest) <> 0 Then Err.Raise MB_ERR + 1149, , "Unexpected MSG-only base digest."
+    ElseIf Left$(baseReference, 8) = "SALVAGE|" Then
+        parts = Split(baseReference, "|")
+        If UBound(parts) <> 4 Then Err.Raise MB_ERR + 1149, , "Invalid overlay salvage base."
+        If Not MB_IsHexKey(baseDigest) Or CStr(parts(3)) <> baseDigest Then _
+            Err.Raise MB_ERR + 1149, , "Overlay salvage digest does not match its prior intent."
+    Else
+        If Not MB_IsHexKey(baseDigest) Or _
+           Not MB_PathWithin(baseReference, MBH_JoinPath(recoveryRoot, "snapshots")) Then _
+            Err.Raise MB_ERR + 1149, , "Unsafe overlay snapshot base."
+        MBY_NoReparse baseReference, True
+        If MBH_HashFile(baseReference) <> baseDigest Then _
+            Err.Raise MB_ERR + 1149, , "The original restore snapshot no longer has its captured digest."
+    End If
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise n, "MBR_ReadOverlay", detail
+End Sub
+
+Private Sub MBR_PublishOverlayStage(ByRef stage As String, ByVal finalPath As String)
+    Dim digest As String, bytes As Double, n As Long, detail As String
+    On Error GoTo Failed
+    MBM_FlushPath stage
+    digest = MBH_HashFile(stage): bytes = CDbl(gFSO.GetFile(stage).Size)
+    If gFSO.FileExists(finalPath) Then
+        If CDbl(gFSO.GetFile(finalPath).Size) = bytes Then
+            If MBH_HashFile(finalPath) = digest Then
+                MBH_DeleteStage stage: stage = "": Exit Sub
+            End If
+        End If
+        MBR_PreserveFile finalPath, MB_StatePath("preserved")
+    End If
+    MBH_CommitStage stage, finalPath, digest, bytes
+    stage = ""
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    Err.Raise n, "MBR_PublishOverlayStage", detail
+End Sub
+
+Private Function MBR_ParseIndexFields(ByVal line As String) As Variant
+    Dim f As Variant, raw As Variant, count As Long
+    raw = Split(line, vbTab): count = UBound(raw) - 1
+    If count < 1 Then Err.Raise MB_ERR + 15, , "Index row has no checked payload framing."
+    ' Establish whether the framing IS checked before interpreting a schema.
+    ' An unknown but valid future schema is not a disposable truncated row.
+    f = MB_ReadCheckedLine(line, count)
+    If CStr(f(0)) = "MBS3" And count = 17 Then
+        If CStr(f(1)) <> "N" And CStr(f(1)) <> "T" And CStr(f(1)) <> "R" Then _
+            Err.Raise MB_ERR + 1154, , "Unknown checked MBS3 record kind requires review."
+    ElseIf CStr(f(0)) = "MBS2" And count = 16 Then
+        If CStr(f(1)) <> "M" And CStr(f(1)) <> "A" And CStr(f(1)) <> "L" Then _
+            Err.Raise MB_ERR + 1154, , "Unknown checked MBS2 record kind requires review."
+    Else
+        Err.Raise MB_ERR + 1154, , "Unsupported checked journal schema/field count requires review."
+    End If
+    MBR_ParseIndexFields = f
+End Function
+
+Private Sub MBR_RejectIndexConflict(ByVal f As Variant)
+    Dim key As String, prior As Variant, meta As Variant
+    key = MBX_IndexKey(CStr(f(1)), CStr(f(2)))
+    If Not gIndex.Exists(key) Then Exit Sub
+    prior = MB_IndexFields(key): meta = MBX_Meta(key)
+    If CStr(prior(2)) <> CStr(f(5)) Or MB_ByteCount(CStr(prior(1))) <> MB_ByteCount(CStr(f(4))) Or _
+       CStr(meta(2)) <> CStr(f(6)) Or CStr(meta(0)) <> MBX_StoreToken(CStr(f(7))) Then _
+        Err.Raise MB_ERR + 1150, , "Conflicting historical expected bytes/source for one immutable index key: " & key
+End Sub
+
+Private Function MBR_TryMergeIndexRow(ByVal line As String, ByVal storeId As String, ByRef reason As String) As Boolean
+    Dim f As Variant, n As Long
+    On Error GoTo Rejected
+    f = MBR_ParseIndexFields(line)
+    If Len(storeId) = 0 Then Err.Raise MB_ERR + 1156, , "Journal merge lacks an expected store binding."
+    MBS_RequireStore CStr(f(7)), storeId, "immutable restore overlay"
+    ' Compare before the real validator can replace an existing cache entry.
+    MBR_RejectIndexConflict f
+    If Not MBR_TryIndexRow(line, reason) Then _
+        Err.Raise MB_ERR + 1154, , "Checked historical proof has unresolved semantics; preserved for review: " & reason
+    MBR_TryMergeIndexRow = True
+    Exit Function
+Rejected:
+    n = Err.Number: reason = Err.Description
+    If n >= MB_ERR + 15 And n <= MB_ERR + 17 Then Exit Function
+    ' A well-framed conflicting expected hash is not disposable corrupt input.
+    ' Leave START and both immutable proof sources available for explicit review.
+    Err.Raise n, "MBR_TryMergeIndexRow", reason
+End Function
+
+Private Sub MBR_MergeJournal(ByVal priorRaw As String, ByVal storeId As String)
+    Dim oldIndex As Object, oldExternal As Object, oldMeta As Object, oldStores As Object
+    Dim oldBindings As Object, oldSources As Object, oldOwners As Object
+    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object
+    Dim inputStream As Object, outputStream As Object, baseRows As New Collection, paths(0 To 1) As String
+    Dim source As String, finalPath As String, stage As String, line As String, reason As String, rowHash As String
+    Dim pass As Long, added As Long, rejected As Long, cached As Boolean, n As Long, detail As String
+    Dim position As Long, matchingPrefix As Boolean, skipPrefixRow As Boolean, visited As Long
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    finalPath = MB_StatePath("journal.tsv")
+    paths(0) = finalPath: paths(1) = priorRaw
+    Set oldIndex = gIndex: Set oldExternal = gExternalRoots: Set oldMeta = gRecordMeta: Set oldStores = gStoreTokens
+    Set oldBindings = gLegacyBindings: Set oldSources = gLegacySources: Set oldOwners = gLegacyOwners
+    Set oldBuckets = gIdentityBuckets: Set oldSeen = gIdentitySeen: Set oldKnown = gWindowKnown
+    Set oldHeads = gRevisionHeads: cached = True
+    Set gIndex = CreateObject("Scripting.Dictionary")
+    Set gExternalRoots = CreateObject("Scripting.Dictionary")
+    Set gRecordMeta = CreateObject("Scripting.Dictionary")
+    Set gStoreTokens = CreateObject("Scripting.Dictionary"): gStoreTokens.CompareMode = vbTextCompare
+    Set gLegacyBindings = CreateObject("Scripting.Dictionary")
+    Set gLegacySources = CreateObject("Scripting.Dictionary")
+    Set gLegacyOwners = CreateObject("Scripting.Dictionary"): gLegacyOwners.CompareMode = vbTextCompare
+    Set gIdentityBuckets = Nothing: Set gIdentitySeen = Nothing: Set gRevisionHeads = Nothing
+    Set gWindowKnown = CreateObject("Scripting.Dictionary")
+    matchingPrefix = True
+    stage = MBH_NewStagePath(finalPath)
+    Set outputStream = gFSO.CreateTextFile(stage, True, True)
+    For pass = 0 To 1
+        source = paths(pass)
+        If gFSO.FileExists(source) Then
+            MBY_NoReparse source, True
+            guard = MBH_GuardFile(source)
+            If CDbl(gFSO.GetFile(source).Size) Mod 2 <> 0 Then _
+                Err.Raise MB_ERR + 1151, , "An odd-byte journal requires review; its immutable original is preserved."
+            Set inputStream = gFSO.OpenTextFile(source, 1, False, -1)
+            Do Until inputStream.AtEndOfStream
+                line = inputStream.ReadLine
+                visited = visited + 1
+                If visited Mod 256 = 0 Then
+                    If Not MB_ContinueWork() Then Err.Raise MB_ERR + 1158, , "Journal merge cancelled; original restore plan retained."
+                End If
+                If Len(line) > 0 Then
+                    rowHash = MBH_HashText(line)
+                    skipPrefixRow = False
+                    If pass = 1 Then
+                        position = position + 1
+                        If matchingPrefix Then
+                            If position <= baseRows.Count Then
+                                If rowHash = CStr(baseRows(position)) Then skipPrefixRow = True
+                            End If
+                            If Not skipPrefixRow Then matchingPrefix = False
+                        End If
+                    End If
+                    If Not skipPrefixRow Then
+                        If MBR_TryMergeIndexRow(line, storeId, reason) Then
+                            outputStream.WriteLine line
+                            If pass = 0 Then baseRows.Add rowHash Else added = added + 1
+                        ElseIf pass = 0 Then
+                            Err.Raise MB_ERR + 1152, , "The restored journal is not a valid semantic base: " & reason
+                        Else
+                            rejected = rejected + 1
+                            MBR_Log "WARNING", "RECOVERY_OVERLAY_ROW_UNPROVEN", CStr(rejected), priorRaw, 0, reason
+                        End If
+                    End If
+                End If
+            Loop
+            inputStream.Close: Set inputStream = Nothing
+            MBH_CloseGuard guard
+        End If
+    Next pass
+    outputStream.Close: Set outputStream = Nothing
+    MBR_PublishOverlayStage stage, finalPath
+    gRecoveryMergedRows = gRecoveryMergedRows + added
+    gRecoveryOverlayRejected = gRecoveryOverlayRejected + rejected
+    If rejected > 0 Then gRecoveryRebased = True
+    GoTo Cleanup
+Failed:
+    n = Err.Number: detail = Err.Description
+Cleanup:
+    On Error Resume Next
+    If Not inputStream Is Nothing Then inputStream.Close
+    If Not outputStream Is Nothing Then outputStream.Close
+    MBH_CloseGuard guard
+    If Len(stage) > 0 Then MBH_DeleteStage stage
+    If cached Then
+        Set gIndex = oldIndex: Set gExternalRoots = oldExternal: Set gRecordMeta = oldMeta: Set gStoreTokens = oldStores
+        Set gLegacyBindings = oldBindings: Set gLegacySources = oldSources: Set gLegacyOwners = oldOwners
+        Set gIdentityBuckets = oldBuckets: Set gIdentitySeen = oldSeen: Set gWindowKnown = oldKnown
+        Set gRevisionHeads = oldHeads
+    End If
+    On Error GoTo 0
+    If n <> 0 Then Err.Raise n, "MBR_MergeJournal", detail
+End Sub
+
+Private Sub MBR_ApplyOverlayOne(ByVal recoveryRoot As String, ByVal leaf As String, ByVal meta As Variant, _
+                               ByVal accountRoot As String, ByVal storeId As String, _
+                               Optional ByVal stageMirrorRaw As String = "")
+    Dim path As String, n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    path = MBH_JoinPath(MBH_JoinPath(recoveryRoot, "overlays"), CStr(meta(0)))
+    MBY_NoReparse path, True
+    guard = MBH_GuardFile(path)
+    If CDbl(gFSO.GetFile(path).Size) <> MB_ByteCount(CStr(meta(1))) Or MBH_HashFile(path) <> CStr(meta(2)) Then _
+        Err.Raise MB_ERR + 1153, , "Captured pre-restore proof changed or is missing: " & path
+    If LCase$(leaf) = "journal.tsv" Then
+        MBR_MergeJournal path, storeId
+    Else
+        MBR_MergeProofFile leaf, path, accountRoot, storeId, stageMirrorRaw
+    End If
+    MBH_CloseGuard guard
+    gRecoveryOverlayFiles = gRecoveryOverlayFiles + 1
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise n, "MBR_ApplyOverlayOne", detail
+End Sub
+
+Private Sub MBR_ApplyOverlay(ByVal recoveryRoot As String, ByVal files As Object, _
+                            ByVal accountRoot As String, ByVal storeId As String)
+    Dim key As Variant, meta As Variant, leaf As String, mirror As String, n As Long, detail As String
+#If VBA7 Then
+    Dim mirrorGuard As LongPtr
+#Else
+    Dim mirrorGuard As Long
+#End If
+    On Error GoTo Failed
+    If files.Exists(MBR_MIRROR_LEAF) Then
+        meta = MBM_Unpack(CStr(files(MBR_MIRROR_LEAF)), 3)
+        mirror = MBH_JoinPath(MBH_JoinPath(recoveryRoot, "overlays"), CStr(meta(0)))
+        MBY_NoReparse mirror, True: mirrorGuard = MBH_GuardFile(mirror)
+        If CDbl(gFSO.GetFile(mirror).Size) <> MB_ByteCount(CStr(meta(1))) Or _
+           MBH_HashFile(mirror) <> CStr(meta(2)) Then _
+            Err.Raise MB_ERR + 1153, , "Captured independent stage proof changed or is missing."
+    End If
+    ' Ordered move history precedes proof consumers. These helpers only rebuild
+    ' metadata; publication recovery and actual file moves happen after reload.
+    If files.Exists("moves.tsv") Then
+        meta = MBM_Unpack(CStr(files("moves.tsv")), 3)
+        MBR_ApplyOverlayOne recoveryRoot, "moves.tsv", meta, accountRoot, storeId
+    End If
+    If files.Exists("journal.tsv") Then
+        meta = MBM_Unpack(CStr(files("journal.tsv")), 3)
+        MBR_ApplyOverlayOne recoveryRoot, "journal.tsv", meta, accountRoot, storeId
+    End If
+    For Each key In files.Keys
+        leaf = LCase$(CStr(key))
+        If leaf <> "moves.tsv" And leaf <> "journal.tsv" And leaf <> MBR_MIRROR_LEAF Then
+            meta = MBM_Unpack(CStr(files(key)), 3)
+            If leaf = "stages.tsv" Then
+                MBR_ApplyOverlayOne recoveryRoot, CStr(key), meta, accountRoot, storeId, mirror
+            Else
+                MBR_ApplyOverlayOne recoveryRoot, CStr(key), meta, accountRoot, storeId
+            End If
+        End If
+    Next key
+    If Len(mirror) > 0 And Not files.Exists("stages.tsv") Then
+        MBR_MergeProofFile "stages.tsv", mirror, accountRoot, storeId
+    End If
+    MBH_CloseGuard mirrorGuard
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard mirrorGuard
+    On Error GoTo 0
+    Err.Raise n, "MBR_ApplyOverlay", detail
+End Sub
+
+Private Function MBR_HasPreservedState() As Boolean
+    Dim dir As Variant, item As Object, dirs As New Collection
+    dirs.Add MB_StatePath("preserved")
+    dirs.Add MBH_JoinPath(MBH_JoinPath(gRoot, "_state"), "preserved")
+    If Len(mbrActiveRecoveryRoot) > 0 Then dirs.Add MBH_JoinPath(mbrActiveRecoveryRoot, "preserved")
+    For Each dir In dirs
+        If gFSO.FolderExists(CStr(dir)) Then
+            MBY_NoReparse CStr(dir), True
+            For Each item In gFSO.GetFolder(CStr(dir)).Files
+                If LCase$(Right$(CStr(item.Name), 4)) = ".tsv" Then
+                    MBR_HasPreservedState = True
+                    Exit Function
+                End If
+            Next item
+        End If
+    Next dir
+End Function
+
+Private Sub MBR_LoadOverlayBase(ByVal recoveryRoot As String, ByVal accountRoot As String, ByVal storeId As String, _
+                                ByVal manifest As String, ByVal expectedDigest As String, _
+                                ByRef files As Object, ByRef chunks As Object)
+    Dim reason As String, n As Long, detail As String
+#If VBA7 Then
+    Dim guard As LongPtr
+#Else
+    Dim guard As Long
+#End If
+    On Error GoTo Failed
+    MBY_NoReparse manifest, True
+    guard = MBH_GuardFile(manifest)
+    If MBH_HashFile(manifest) <> expectedDigest Then _
+        Err.Raise MB_ERR + 1149, , "Captured restore snapshot changed before its guarded read."
+    If Not MBR_ReadSnapshot(manifest, accountRoot, storeId, files, chunks, reason) Then _
+        Err.Raise MB_ERR + 854, , "Incomplete recovery needs its original snapshot: " & reason
+    If Not MBR_BlocksValid(recoveryRoot, files, chunks, reason) Then _
+        Err.Raise MB_ERR + 855, , "Incomplete recovery snapshot is damaged: " & reason
+    MBH_CloseGuard guard
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_CloseGuard guard
+    On Error GoTo 0
+    Err.Raise n, "MBR_LoadOverlayBase", detail
+End Sub

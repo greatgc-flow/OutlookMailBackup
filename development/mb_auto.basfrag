@@ -1,0 +1,214 @@
+' ====================== Single-command user workflow ========================
+Public Sub MB_01_RunBackup()
+    Static nativeTestsPassed As Boolean
+    Static nativeReport As String
+    Dim detail As String, n As Long
+    If gBusy Then
+        gCancel = True
+        Debug.Print "Cancellation requested. The current safe unit will finish first."
+        Exit Sub
+    End If
+    On Error GoTo Failed
+    If Not nativeTestsPassed Then
+        If Not MBT_RunAcceptanceReport(nativeReport, detail) Then
+            MsgBox "Environment check did not pass. No archive workflow was started." & _
+                   vbCrLf & detail & vbCrLf & "Report: " & nativeReport, vbExclamation, "Mail Backup"
+            Exit Sub
+        End If
+        nativeTestsPassed = True
+    End If
+    gAutoTestReport = nativeReport
+    MB_Run "AUTO", False, True, False
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    MBH_ReleaseCrypto
+    On Error GoTo 0
+    MsgBox "The backup command stopped: " & CStr(n) & " - " & detail, vbExclamation, "Mail Backup"
+End Sub
+
+Private Sub MBU_Reset()
+    gAutoNeedsRegistration = False
+    gAutoStoreId = "": gAutoAccount = "": gAutoKey = ""
+    gAutoSetupPhase = "": gAutoSetupNote = "": gAutoRegistrationSummary = ""
+    gAutoReviewCount = 0: gAutoFailureCount = 0: gAutoFileReview = 0: gAutoLegacyReview = 0: gAutoSetupSeconds = 0
+End Sub
+
+Private Function MBU_ValidationPolicy() As String
+    MBU_ValidationPolicy = MB_LEGACY_VALIDATION & "|" & MB_NEW_CONTENT_VALIDATION & "|MAINTENANCE_3.3"
+End Function
+
+Private Sub MBU_SaveSetup(ByVal phase As String, ByVal planPath As String, ByVal note As String)
+    Dim payload As String
+    If gCancel Or gFatal Then Exit Sub
+    payload = MB_EncodeFields(Array("MBAUTO1", gRoot, gAutoStoreId, gAutoAccount, phase, planPath, note, _
+                                   CStr(gAutoFileReview), CStr(gAutoLegacyReview), MBU_ValidationPolicy()))
+    MBS_WriteAtomic MBU_SetupPath(), payload & vbTab & MBH_HashText(payload) & vbTab & "END" & vbCrLf
+    MBP_SaveSettingText gAutoKey, payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+    gAutoSetupPhase = phase: gAutoSetupNote = note
+End Sub
+
+Private Function MBU_SetupPath() As String
+    MBU_SetupPath = MB_StatePath("setup_" & Left$(MBH_HashText(LCase$(gAutoStoreId)), 24) & ".tsv")
+End Function
+
+Private Function MBU_PrepareAccount() As Boolean
+    Dim saved As String, fields As Variant, extra As Collection, count As Long
+    Dim stream As Object, needRegistration As Boolean, n As Long, reason As String
+    gAutoStoreId = Application.Session.DefaultStore.StoreID
+    gAutoAccount = MBY_AccountRoot(gAutoStoreId)
+    If Len(gAutoAccount) = 0 Or gCancel Then Exit Function
+    If gJournalIssues > 0 Then Err.Raise MB_ERR + 650, , "Invalid backup index rows require recovery before setup."
+    gAutoKey = "AutomaticSetup_" & MBH_HashText(MB_EncodeFields(Array(LCase$(gRoot), gAutoStoreId, LCase$(gAutoAccount))))
+    If gFSO.FileExists(MBU_SetupPath()) Then
+        Set stream = gFSO.OpenTextFile(MBU_SetupPath(), 1, False, -1)
+        If Not stream.AtEndOfStream Then saved = stream.ReadLine
+        stream.Close: Set stream = Nothing
+    Else
+        saved = MBP_GetSettingText(gAutoKey, "")
+    End If
+    needRegistration = (Len(saved) = 0 Or gRecoveryForceFull Or gStateWasMissing)
+    If Len(saved) > 0 Then
+        On Error Resume Next
+        Err.Clear
+        fields = MB_ReadCheckedLine(saved, 10)
+        n = Err.Number: reason = Err.Description
+        On Error GoTo 0
+        If n <> 0 Then
+            needRegistration = True
+            MB_LogEvent "WARNING", "SETUP_STATE_REBUILT", "", MBU_SetupPath(), n, reason
+        Else
+            If fields(0) <> "MBAUTO1" Or StrComp(CStr(fields(1)), gRoot, vbTextCompare) <> 0 Or _
+               StrComp(CStr(fields(2)), gAutoStoreId, vbBinaryCompare) <> 0 Or _
+               StrComp(CStr(fields(3)), gAutoAccount, vbTextCompare) <> 0 Then
+                Err.Raise MB_ERR + 651, , "Automatic setup state belongs to a different archive/account."
+            End If
+            gAutoSetupPhase = CStr(fields(4)): gFilePlan = CStr(fields(5)): gAutoSetupNote = CStr(fields(6))
+            If gAutoSetupPhase <> "APPLY" And gAutoSetupPhase <> "REGISTER" And gAutoSetupPhase <> "READY" Then _
+                Err.Raise MB_ERR + 652, , "Unknown setup phase."
+            If gAutoSetupPhase <> "READY" Or CStr(fields(9)) <> MBU_ValidationPolicy() Then needRegistration = True
+            ' An old aggregate review is seeded into the new per-source ledger
+            ' once; after that its issue is retried without rescanning all mail.
+            If MB_ByteCount(CStr(fields(8))) > 0 Then needRegistration = True
+        End If
+    End If
+    gFileAccount = gAutoAccount
+    gAutoFileReview = 0: gAutoLegacyReview = 0: gAutoReviewCount = 0
+    If gAutoSetupPhase = "APPLY" Then
+        If Not gFSO.FileExists(gFilePlan) Or gRecoveryForceFull Then gAutoSetupPhase = ""
+    End If
+    If gAutoSetupPhase <> "APPLY" Then
+        gAutoMaintenance = (Not needRegistration)
+        gPhase = "Checking existing files for incremental year/month organization"
+        gFileExtraReview = 0
+        Set extra = MBX_ManagedFiles(gAutoStoreId, gAutoAccount)
+        If gCancel Then Exit Function
+        gFilePlan = MB_UnusedFinal(MBH_JoinPath(gRunDir, "organize_plan.tsv"))
+        count = MBM_BuildPlan(gAutoAccount, gFilePlan, extra)
+        If gCancel Then Exit Function
+        gAutoFileReview = gFileExtraReview
+        MBP_SaveSettingText MBX_PlanKey(gAutoStoreId), gFilePlan
+        MBU_SaveSetup "APPLY", gFilePlan, "Checked current filesystem; recurring maintenance plan."
+    End If
+    gPhase = "Applying/resuming verified year/month moves"
+    MBM_RequirePlanAccount gFilePlan, gAutoAccount
+    If gCancel Then Exit Function
+    MBP_SaveSettingText MBX_PlanKey(gAutoStoreId, True), gFilePlan
+    MBM_ApplyPlan gFilePlan
+    If gCancel Then Exit Function
+    gAutoFileReview = gAutoFileReview + gMovePlanReview + gMoveReview
+    gAutoReviewCount = gAutoFileReview
+    gAutoSetupNote = "Current organization review items=" & CStr(gAutoFileReview) & "; plan=" & gFilePlan
+    MBU_WriteText MB_UnusedFinal(MBH_JoinPath(gRunDir, "organization_summary.txt")), gAutoSetupNote & vbCrLf & MBM_Summary()
+    MBX_BuildManagedPaths
+    If gCancel Then Exit Function
+    gAutoNeedsRegistration = needRegistration
+    If needRegistration Then
+        MBU_SaveSetup "REGISTER", gFilePlan, gAutoSetupNote
+    Else
+        MBU_SaveSetup "READY", gFilePlan, gAutoSetupNote
+    End If
+    MBU_PrepareAccount = True
+End Function
+
+Private Function MBU_RegisterExisting(ByVal roots As Collection) As Boolean
+    Dim queuePath As String, started As Double, savedMode As String
+    Dim savedSince As Date, summary As String, note As String, n As Long, detail As String
+    Dim completeScan As Boolean, priorSummaryAt As Long
+    On Error GoTo Failed
+    savedMode = gMode: savedSince = gSince
+    If gLegacyFileCount = 0 Then
+        MBU_SaveSetup "READY", gFilePlan, gAutoSetupNote & "; no legacy MSG files to link."
+        MBU_RegisterExisting = True
+        Exit Function
+    End If
+    gMode = "REGISTER_LEGACY": gSince = 0
+    gPhase = "Initial setup: linking existing MSG files; no mail SaveAs"
+    queuePath = MBH_JoinPath(gRunDir, "initial_registration_queue.tsv")
+    started = MB_Clock()
+    gPlanned = MBP_BuildQueue(roots, 0, gUntil, True, queuePath)
+    gFullPlanned = gPlanned
+    gScanSeconds = gScanSeconds + MB_Clock() - started
+    If Not gCancel Then
+        MB_OpenJournal
+        started = MB_Clock()
+        MB_ProcessQueue queuePath
+        gExportSeconds = gExportSeconds + MB_Clock() - started
+    End If
+    gMailPending = gPlanned - gProcessed
+    If gProcessed <> gMailReused + gMailFailed + gMailChanged + gMailPolicy + gMailReview + gLegacyUnmatched Or _
+       gMailNew <> 0 Or gMailPending < 0 Then
+        Err.Raise MB_ERR + 653, , "Initial no-export registration outcomes do not reconcile."
+    End If
+    MB_FlushJournal
+    If gFSO.FileExists(gJournalPath) Then MBM_FlushPath gJournalPath
+    MBW_FinishAudit
+    summary = MB_Summary()
+    MBU_WriteText MBH_JoinPath(gRunDir, "initial_registration_summary.txt"), summary
+    gAutoRegistrationSummary = "Initial linking: planned=" & CStr(gPlanned) & "; linked/reused=" & CStr(gMailReused) & _
+        "; unmatched=" & CStr(gLegacyUnmatched) & "; review=" & CStr(gMailReview) & "; failed=" & CStr(gMailFailed) & _
+        "; changed=" & CStr(gMailChanged) & "; pending=" & CStr(gMailPending)
+    gAutoLegacyReview = gMailReview + gContentReview
+    gAutoReviewCount = gAutoFileReview + gAutoLegacyReview
+    gAutoFailureCount = gMailFailed + gMailChanged + gFolderFailures + gScanChanged + gMailPending
+    completeScan = (Not gCancel And Not gFatal And gAutoFailureCount = 0 And gJournalIssues = 0)
+    If gCancel Then Exit Function
+    gMode = savedMode: gSince = savedSince
+    note = gAutoSetupNote
+    priorSummaryAt = InStr(1, note, "; Initial linking:", vbBinaryCompare)
+    If priorSummaryAt > 0 Then note = Left$(note, priorSummaryAt - 1)
+    note = note & "; " & gAutoRegistrationSummary
+    If completeScan Then
+        ' READY means the initial pass completed, not proof of a full historical backup.
+        ' Unmatched/review items remain explicitly counted and are never force-exported.
+        MBU_SaveSetup "READY", gFilePlan, note
+    Else
+        MBU_SaveSetup "REGISTER", gFilePlan, note
+    End If
+    ' Save the initial phase separately; the normal summary counts the adaptive pass.
+    gFoldersScanned = 0: gFolderFailures = 0: gPolicySkipped = 0: gCandidates = 0: gScanChanged = 0
+    gPlanned = 0: gFullPlanned = 0: gProcessed = 0: gMailPending = 0
+    gMailNew = 0: gMailReused = 0: gMailFailed = 0: gMailChanged = 0
+    gMailPolicy = 0: gMailReview = 0: gMailLegacy = 0: gLegacyUnmatched = 0: gContentReview = 0
+    MBU_RegisterExisting = True
+    Exit Function
+Failed:
+    n = Err.Number: detail = Err.Description
+    Err.Raise n, "MBU_RegisterExisting", detail
+End Function
+
+Private Sub MBU_WriteText(ByVal path As String, ByVal contents As String)
+    Dim output As Object, n As Long, detail As String
+    On Error GoTo Failed
+    Set output = gFSO.CreateTextFile(path, False, True)
+    output.Write contents & vbCrLf
+    output.Close
+    Exit Sub
+Failed:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not output Is Nothing Then output.Close
+    On Error GoTo 0
+    Err.Raise n, "MBU_WriteText", detail
+End Sub

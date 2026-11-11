@@ -1,0 +1,20 @@
+' Legacy catalog uses filename keys, with read-only SentOn fallback for renamed MSGs.
+Private mblByName As Object
+Private mblByStamp As Object
+Private mblVisited As Object
+Private gLegacyFileCount As Long
+Private gLegacyFolderCount As Long
+Private gLegacyUnrecognizedNames As Long
+Private gLegacyNewestFileTime As Date
+Private gLegacyScanComplete As Boolean
+Private Const MBL_REPARSE_POINT As Long = 1024
+Private Const MBL_ID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
+Private Const MBL_ID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
+Private Const MBL_MAPI_NOT_FOUND As Long = &H8004010F
+Private Const MBL_CID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+Private Const MBL_CID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
+Private Const MBL_LOCATION_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3713001F"
+Private Const MBL_LOCATION_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x3713001E"
+Private Const MBL_MIME_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x370E001F"
+Private Const MBL_MIME_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x370E001E"
+Private Const MBL_HIDDEN As String = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
