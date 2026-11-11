@@ -1,4 +1,4 @@
-# 폴더와 경로 설계 — v3.5
+# 폴더와 경로 설계 — v3.5.1
 
 새 설치는 **MailBackup / State / _Recovery**라는 역할 이름을 사용합니다. 사용자 PC의 드라이브 이름이나 출력 폴더를 코드에 고정하지 않습니다. 실행할 매크로는 계속 `MB_01_RunBackup` 하나입니다.
 
@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 선택한 기준 폴더 | `MailBackup\` | 관리 루트, 소유권·저장소 연결, 실행 잠금 |
 | 관리 루트 | `State\` | 인덱스, 해시 증거, 이동·복구 기록, 검사 상태 |
-| 관리 루트 | `State\runs\<실행 ID>\` | 해당 실행의 요약·로그·고정 작업 목록 |
+| 관리 루트 | `State\runs\<실행 ID>\` | 해당 실행의 요약·로그·검토 안내·고정 작업 목록 |
 | 선택한 계정 폴더 | `yyyy\mm\` | 실제 MSG 파일 |
 | 선택한 계정 폴더 | `_Recovery\` | 운영 기록의 독립 스냅샷·청크·복구 계획 |
 | Windows 사용자 로컬 데이터 폴더 | `OutlookMailBackup\locations\` | StoreID별 저장 위치 기억 |
@@ -52,15 +52,28 @@ N은 신규 MSG, T는 선택적으로 추출한 첨부파일, R은 검증된 기
 | 새 `MailBackup` | `State` | `_Recovery` |
 | 기존 `SafeV2` 또는 이전에 소유권이 확인된 사용자 지정 루트 | `_MailBackup_Data` | `_MailBackup_Recovery` |
 
-전체 조합은 관리 루트의 이름으로 결정합니다. 설정·운영 폴더·복구 폴더가 삭제됐다는 이유로 다른 조합으로 바뀌지 않습니다. 이 이름 선택을 위한 새 설정 파일은 추가하지 않았습니다.
+v3.5.1은 전체 조합을 **증명된 구조 선택**으로 결정합니다. 기존 `owner.txt`에 `OutlookMailBackup.Schema4.Modern` 또는 `OutlookMailBackup.Schema4.Legacy`를 기록하고, HKCU의 `OperatingLayout_<root hash>`에 정확한 루트·선택·체크섬을 가진 `MBLAYOUT1` 복사본을 저장합니다. 별도 디스크 설정 파일을 추가하지 않습니다. 이전 owner 원본은 기존 `owner-previous-<hash>.txt` 절차로 보존합니다.
+
+| 남은 근거 | 구조 선택 |
+| --- | --- |
+| 새로운 빈 `MailBackup` 루트 | Modern |
+| V2 / V3.3 / V3.4 소유권 표식 | Legacy; 루트 이름이 `MailBackup`이어도 유지 |
+| 명시적인 `.Modern` / `.Legacy` 표식 또는 일치하는 체크된 설정 | 해당 선택 유지; 다른 근거와 충돌하면 중단 |
+| 이전 일반 Schema4 표식과 활성 상태 또는 정확히 연결된 복구 표식 | 남은 근거로 구조 확인 |
+| 이전 일반 Schema4 `MailBackup`에서 모든 구조 단서 소실 | 오류 1233으로 중단; 이름만으로 추정하지 않음 |
+| 설정만 남고 소유권 근거는 없음 | 설정은 이름 선택에만 사용; 비어 있지 않은 무소유 루트 채택을 허용하지 않음 |
+
+업그레이드 후 owner 또는 체크된 설정이 남으면 운영·복구 폴더가 삭제돼도 같은 구조를 재구성합니다. 한 실행 중에는 확인한 선택을 유지하고, 다음 실행은 영속 근거를 다시 검증합니다. 모든 소유권·구조 근거가 사라진 경우 과거 구조를 복원했다고 주장하지 않습니다.
 
 새 이름과 옛 이름에 각각 기록이 있거나, 선택한 계정에 두 복구 폴더가 함께 있으면 임의로 합치지 않습니다. 실제 선택한 계정의 기록을 검토해야 합니다. 관계없는 다른 계정의 폴더 이름만으로 현재 계정을 연결하지 않습니다.
 
-새 MBS4 기록을 쓰기 전에 소유권 표식은 `OutlookMailBackup.Schema4`로 전환됩니다. 이전 작성기와 교대로 실행하지 않습니다. 기존 MSG를 재사용할 수 있다는 것과 이전 작성기가 새 운영 형식을 쓸 수 있다는 것은 별개입니다.
+새 MBS4 기록을 쓰기 전에 소유권 표식은 명시적인 `Schema4.Modern` 또는 `Schema4.Legacy`로 전환됩니다. 이전 일반 Schema4 표식은 계속 읽습니다. 이전 작성기와 교대로 실행하지 않습니다. 기존 MSG를 재사용할 수 있다는 것과 이전 작성기가 새 운영 형식을 쓸 수 있다는 것은 별개입니다.
+
+보조 선별 캐시는 선택된 운영 폴더(`State` 또는 기존 `_MailBackup_Data`)의 `selection_<store/account hash>.cache`에 저장합니다. 기존 상태 형식의 일부가 아닌 재생성 가능한 최적화 파일이므로 복구 스냅샷에 넣지 않습니다. 삭제되면 기존 성공 범위로 돌아가며, 복구나 REVIEW 의무를 해제하지 않습니다.
 
 ## 근거
 
 - `development/mb_relative.basfrag`: 상대 경로 인코딩·확장, 원문 불변, 첫 실행 자체 검사
-- `development/mb_paths.basfrag`, `mb_operating.basfrag`, `mb_recovery.basfrag`: 이름 선택·경로 검증·복구 위치
-- `development/v35_relative_models.py`, `v35_layout_models.py`, `v341_path_models.py`: 경계·삭제·재실행·혼합 형식 검증
+- `development/mb_layout_binding.basfrag`, `mb_paths.basfrag`, `mb_operating.basfrag`, `mb_recovery.basfrag`: 구조 선택·경로 검증·복구 위치
+- `development/v351_layout_binding_models.py`, `v35_relative_models.py`, `v35_layout_models.py`, `v341_path_models.py`: 경계·삭제·재실행·혼합 형식 검증
 - [현재 검증 결과](VALIDATION.md)

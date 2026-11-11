@@ -1,11 +1,11 @@
 {
-  "scope": "v3.5.0 exact artifact. Python models, structural checks and validator mutations are not Outlook VBA compilation/runtime.",
+  "scope": "v3.5.1 exact artifact. Python models, structural checks and validator mutations are not Outlook VBA compilation/runtime.",
   "artifact": {
     "name": "OutlookMailBackup.bas",
-    "version": "3.5.0",
-    "sha256": "040b82feac03fedaeed05de305d865d200e77065d11292e35d5ea660a2984122",
-    "bytes": 688887,
-    "lines": 13672,
+    "version": "3.5.1",
+    "sha256": "d58d92fa35541d8ccbcacb6e91aef14317973d3cbaa93e1819b15a87b4a39349",
+    "bytes": 732134,
+    "lines": 14406,
     "public_macros": [
       "MB_01_RunBackup"
     ]
@@ -24,7 +24,7 @@
   },
   "model_results": {
     "check": "Python models/source contracts, not VBA execution",
-    "sha256": "040b82feac03fedaeed05de305d865d200e77065d11292e35d5ea660a2984122",
+    "sha256": "d58d92fa35541d8ccbcacb6e91aef14317973d3cbaa93e1819b15a87b4a39349",
     "suites": [
       {
         "suite": "v34_settings_models.py",
@@ -102,10 +102,38 @@
         "expected": 48,
         "passed": true,
         "exit_code": 0
+      },
+      {
+        "suite": "v351_recovery_continuity_models.py",
+        "tests": 39,
+        "expected": 39,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_layout_binding_models.py",
+        "tests": 57,
+        "expected": 57,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_review_guidance_models.py",
+        "tests": 46,
+        "expected": 46,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_selection_models.py",
+        "tests": 36,
+        "expected": 36,
+        "passed": true,
+        "exit_code": 0
       }
     ],
-    "passed": 380,
-    "expected": 380,
+    "passed": 558,
+    "expected": 558,
     "failed_suites": 0,
     "outlook_runtime": "NOT_RUN",
     "real_100000_benchmark": "NOT_RUN"
@@ -117,57 +145,57 @@
     "result": "PASS",
     "command": "python -B -m unittest discover -s development -p test_validation_tools.py"
   },
-  "total_executed_tests": 427,
+  "total_executed_tests": 605,
   "structural_results": {
     "check": "Project structural checks; NOT Outlook VBA compilation or runtime",
-    "sha256": "040b82feac03fedaeed05de305d865d200e77065d11292e35d5ea660a2984122",
-    "bytes": 688887,
+    "sha256": "d58d92fa35541d8ccbcacb6e91aef14317973d3cbaa93e1819b15a87b4a39349",
+    "bytes": 732134,
     "errors": [],
     "platforms": {
       "vba7_32": {
         "errors": [],
         "warnings": [],
-        "procedures": 493,
+        "procedures": 521,
         "public_entries": [
           "MB_01_RunBackup"
         ],
         "max_line_continuations": 18,
         "largest_procedure": {
-          "name": "MB_Run",
-          "source_bytes": 15523,
-          "physical_lines": 355
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 18835,
+          "physical_lines": 290
         }
       },
       "vba7_64": {
         "errors": [],
         "warnings": [],
-        "procedures": 493,
+        "procedures": 521,
         "public_entries": [
           "MB_01_RunBackup"
         ],
         "max_line_continuations": 18,
         "largest_procedure": {
-          "name": "MB_Run",
-          "source_bytes": 15523,
-          "physical_lines": 355
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 18835,
+          "physical_lines": 290
         }
       },
       "legacy32": {
         "errors": [],
         "warnings": [],
-        "procedures": 493,
+        "procedures": 521,
         "public_entries": [
           "MB_01_RunBackup"
         ],
         "max_line_continuations": 18,
         "largest_procedure": {
-          "name": "MB_Run",
-          "source_bytes": 15523,
-          "physical_lines": 355
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 18835,
+          "physical_lines": 290
         }
       }
     },
-    "physical_lines": 13672,
+    "physical_lines": 14406,
     "max_physical_line": 326
   },
   "ci_configuration": {
@@ -205,8 +233,9 @@
       "managed root/locator",
       "historical move and recovery proof"
     ],
-    "owner": "OutlookMailBackup.Schema4",
-    "older_writers": "Unsupported after upgrade"
+    "owner": "OutlookMailBackup.Schema4.Modern or OutlookMailBackup.Schema4.Legacy",
+    "older_writers": "Unsupported after upgrade",
+    "previous_owner_readable": "OutlookMailBackup.Schema4"
   },
   "layout": {
     "new": {
@@ -219,13 +248,22 @@
       "state": "_MailBackup_Data",
       "recovery": "_MailBackup_Recovery"
     },
-    "msg": "account/yyyy/mm/*.msg"
+    "msg": "account/yyyy/mm/*.msg",
+    "selection": "Explicit owner layout with checked HKCU copy and exact surviving state/recovery evidence; name is only the fresh-root default."
   },
-  "historical_report": "docs/history/validation-v3.4.0.json",
+  "historical_reports": [
+    "docs/history/validation-v3.4.0.json",
+    "docs/history/validation-v3.5.0.json"
+  ],
+  "independent_review": {
+    "snapshot_continuity": "reviewed-no-blockers; native NOT_RUN",
+    "selection_cache": "reviewed-no-blockers; native NOT_RUN",
+    "review_guidance_public_AUTO_path": "reviewed-no-blockers; native NOT_RUN"
+  },
   "grammar_results": {
-    "check": "ANTLR grammar over each declaration/procedure unit; separate project structural checks cover module packaging/linkage.",
-    "sha256": "040b82feac03fedaeed05de305d865d200e77065d11292e35d5ea660a2984122",
-    "bytes": 688887,
+    "check": "ANTLR grammar over every declaration/procedure unit, plus full-module packaging/linkage.",
+    "sha256": "d58d92fa35541d8ccbcacb6e91aef14317973d3cbaa93e1819b15a87b4a39349",
+    "bytes": 732134,
     "results": [
       {
         "platform": {
@@ -234,10 +272,10 @@
           "win32": true,
           "mac": false
         },
-        "units": 494,
-        "ll_fallbacks": 286,
+        "units": 522,
+        "ll_fallbacks": 297,
         "errors": [],
-        "seconds": 133.343
+        "seconds": 134.016
       },
       {
         "platform": {
@@ -246,10 +284,10 @@
           "win32": true,
           "mac": false
         },
-        "units": 494,
-        "ll_fallbacks": 286,
+        "units": 522,
+        "ll_fallbacks": 297,
         "errors": [],
-        "seconds": 64.076
+        "seconds": 67.936
       },
       {
         "platform": {
@@ -258,10 +296,10 @@
           "win32": true,
           "mac": false
         },
-        "units": 494,
-        "ll_fallbacks": 286,
+        "units": 522,
+        "ll_fallbacks": 297,
         "errors": [],
-        "seconds": 63.075
+        "seconds": 66.675
       }
     ],
     "office_compile": "NOT_RUN",

@@ -47,6 +47,7 @@ Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
     Dim startTick As Double, errNo As Long, errText As String, rootIndex As Long
     Dim lockHeld As Boolean, attached As String, autoReady As Boolean
     Dim savedCalendar As Long, calendarEntered As Boolean
+    Dim guideDetail As String
     If gBusy Then
         MsgBox "A backup/verification is already running. Use MB_CancelBackup.", vbInformation
         Exit Sub
@@ -308,6 +309,9 @@ CleanUp:
     If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Calendar restore: " & Err.Description
     On Error GoTo 0
     MB_CloseResources
+    If Len(gRunDir) > 0 Then
+        If Not MBG_CreateReviewReport(guideDetail) Then gCleanupIssue = gCleanupIssue & " Review guidance: " & guideDetail
+    End If
     ' Coverage advances under the same locks, only after the durable message
     ' journal and both streams closed successfully. Interrupted work replays.
     On Error Resume Next
@@ -319,6 +323,7 @@ CleanUp:
         gFatalText = gFatalText & " UTC checkpoint: " & Err.Description
     End If
     On Error GoTo 0
+    If mode = "AUTO" Then MBW_SaveSelectionCache
     If mode = "AUTO" And Len(gRunDir) > 0 Then summary = MB_Summary()
     If mode = "AUTO" And gMaintenanceReady And gJournalIssues = 0 Then
         On Error Resume Next
@@ -403,6 +408,7 @@ Private Sub MB_Reset()
     gReuseBlocked = False: gReuseReason = ""
     MBP_Reset
     MBF_Reset
+    MBG_Reset
     MBU_Reset
     MBS_Reset
     MBR_Reset
@@ -432,10 +438,14 @@ End Sub
 
 Private Sub MB_CheckOwnership(ByVal rootPath As String)
     Dim p As String, ts As Object, value As String, f As Object, subFolder As Object
+    Dim expectedOwner As String
+    MBS_ValidateLayout rootPath, gFSO
+    expectedOwner = MBS_LayoutOwner(rootPath)
     p = MBH_JoinPath(rootPath, "owner.txt")
     If Not gFSO.FileExists(p) Then
         If MBS_CanRecoverOwner(rootPath, gFSO) Then
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
+            MBS_RememberLayout rootPath
             Exit Sub
         End If
     End If
@@ -444,17 +454,19 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
         value = ts.ReadAll
         ts.Close
         If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
-           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf Then
+           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf And _
+           value <> MB_OWNER_LAYOUT_MODERN & vbCrLf And value <> MB_OWNER_LAYOUT_LEGACY & vbCrLf Then
             Err.Raise MB_ERR + 10, "MB_CheckOwnership", "Output owner marker is invalid: " & p
         End If
-        If value <> MB_OWNER & vbCrLf Then
+        If value <> expectedOwner & vbCrLf Then
             ' Preserve the old marker, then reject unsupported downgrade writers.
             If Not gFSO.FileExists(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt")) Then
                 Set ts = gFSO.CreateTextFile(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt"), False, True)
                 ts.Write value: ts.Close
             End If
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
         End If
+        MBS_RememberLayout rootPath
         Exit Sub
     End If
     For Each f In gFSO.GetFolder(rootPath).Files
@@ -468,8 +480,9 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
                   "Unowned output folder contains directories. Choose a new empty managed backup folder."
     Next subFolder
     Set ts = gFSO.CreateTextFile(p, False, True)
-    ts.WriteLine MB_OWNER
+    ts.WriteLine expectedOwner
     ts.Close
+    MBS_RememberLayout rootPath
 End Sub
 
 ' ======================= Journal / metadata utilities =======================
@@ -885,7 +898,11 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
     If MB_ExistingValid("M|" & revision, relativePath) Then
         stage = "UPGRADE_EXISTING_VALIDATION_NO_SAVEAS"
         validation = MB_UpgradeMsgValidation(mail, q, revision)
-        If validation = MB_NEW_BASIC_VALIDATION Then gContentReview = gContentReview + 1
+        If validation = MB_NEW_BASIC_VALIDATION Then
+            gContentReview = gContentReview + 1
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), q(3), 0, _
+                "Existing MSG retained; special attachment or custom metadata equivalence is not fully proven.", subject
+        End If
         wasNew = False
     Else
         If gReuseBlocked Then
@@ -995,8 +1012,8 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
         gBytesNew = gBytesNew + bytes
         If validation = MB_NEW_BASIC_VALIDATION Then
             gContentReview = gContentReview + 1
-            MB_LogEvent "WARNING", "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
-                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven."
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
+                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven.", subject
         End If
         wasNew = True
     End If
@@ -1037,7 +1054,7 @@ MessageReady:
     End If
     Exit Function
 LegacyReview:
-    MB_LogEvent "WARNING", "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason
+    MBG_LogReview "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason, subject
     MB_ProcessOne = 7
     Exit Function
 Changed:
@@ -1612,7 +1629,7 @@ Private Function MB_Summary() As String
     s = s & vbCrLf & "Content-verified restored/moved identity aliases (no SaveAs): " & CStr(gIdentityAliases)
     s = s & vbCrLf & "Verified identity-header reads/cache hits: " & CStr(gIdentityHeaderReads) & "/" & CStr(gIdentityHeaderHits)
     s = s & MBV_Summary() & MBF_Summary(gMode)
-    s = s & MBW_Summary()
+    s = s & MBW_Summary() & MBW_SelectionSummary() & MBG_Summary()
     s = s & MBA_Summary() & MBR_Summary() & MBS_Summary()
     If Len(gAutoSetupPhase) > 0 Then
         s = s & vbCrLf & "Automatic setup phase: " & gAutoSetupPhase & vbCrLf & _

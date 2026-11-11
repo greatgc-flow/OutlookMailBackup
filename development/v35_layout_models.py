@@ -1,8 +1,10 @@
-"""Fixed directory namespaces: new names, unchanged legacy absolute bindings.
+"""Default directory namespaces and unchanged legacy absolute bindings.
 
 These independent path/choice models and source contracts do not execute VBA,
 Outlook, or a Windows filesystem. Their scope is namespace selection, deletion
 stability, conflict refusal, and preserving historical path strings in place.
+Explicit owner/hint precedence and ambiguous historical MailBackup roots are
+covered by v351_layout_binding_models.py.
 """
 
 import ntpath
@@ -214,12 +216,15 @@ class LayoutSourceContracts(unittest.TestCase):
     def test_state_path_uses_namespace_resolver(self):
         self.assertIn("MBH_JoinPath(gRoot, MBS_DataLeaf(gRoot))", procedure("mb_operating.basfrag", "MB_StatePath"))
 
-    def test_namespace_is_derived_from_root_not_deletable_settings(self):
+    def test_namespace_uses_persistent_evidence_and_cached_choice(self):
         body = procedure("mb_operating.basfrag", "MBS_IsModernLayout")
-        body += procedure("mb_operating.basfrag", "MBS_DataLeaf")
-        self.assertIn("MBP_MANAGED_LEAF", body)
-        for unstable in ("FolderExists", "FileExists", "GetSetting", "gStateWasMissing"):
-            self.assertNotIn(unstable, body)
+        self.assertIn("MBS_LayoutKind(managedRoot)", body)
+        resolve = procedure("mb_layout_binding.basfrag", "MBS_ResolveLayout")
+        self.assertIn("MBS_LayoutOwnerKind(value)", resolve)
+        self.assertIn("MBS_LayoutSettingValue(saved, rootPath)", resolve)
+        self.assertIn("MBS_LayoutRecoveryEvidence rootPath, fso, selected", resolve)
+        self.assertIn("gLayoutRoots(rootPath) = selected", resolve)
+        self.assertIn("If owned And defaultModern Then Err.Raise", resolve)
 
     def test_mixed_primary_layout_is_checked_before_writes(self):
         preflight = procedure("mb_paths.basfrag", "MBP_TryBackupBase")

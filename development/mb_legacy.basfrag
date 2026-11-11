@@ -80,7 +80,8 @@ Private Function MBL_HasOwner(ByVal folderPath As String) As Boolean
     value = stream.ReadAll
     stream.Close
     MBL_HasOwner = (value = MB_OWNER & vbCrLf Or value = MB_OWNER_LEGACY & vbCrLf Or _
-                   value = MB_OWNER_PREVIOUS & vbCrLf Or value = MB_OWNER_V34 & vbCrLf)
+                   value = MB_OWNER_PREVIOUS & vbCrLf Or value = MB_OWNER_V34 & vbCrLf Or _
+                   value = MB_OWNER_LAYOUT_MODERN & vbCrLf Or value = MB_OWNER_LAYOUT_LEGACY & vbCrLf)
     Exit Function
 Failed:
     n = Err.Number: d = Err.Description

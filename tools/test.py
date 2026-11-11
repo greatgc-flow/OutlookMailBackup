@@ -34,6 +34,10 @@ SUITES = (
     ("v341_index_alias_models.py", (), 41),
     ("v35_layout_models.py", (), 32),
     ("v35_relative_models.py", (), 48),
+    ("v351_recovery_continuity_models.py", (), 39),
+    ("v351_layout_binding_models.py", (), 57),
+    ("v351_review_guidance_models.py", ("--integration",), 46),
+    ("v351_selection_models.py", (), 36),
 )
 
 

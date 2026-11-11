@@ -287,8 +287,14 @@ class PolicySourceContracts(unittest.TestCase):
 
     def test_limited_content_stops_coverage_commit(self):
         self.assertIn("gContentReview <> 0", proc(src("mb_window.basfrag"), "MBW_CanCommit"))
-        self.assertIn("If validation = MB_NEW_BASIC_VALIDATION Then gContentReview = gContentReview + 1",
-                      proc(src("mb_main.basfrag"), "MB_ProcessOne"))
+        limited_branches = re.findall(
+            r"If validation = MB_NEW_BASIC_VALIDATION Then\s+"
+            r"gContentReview = gContentReview \+ 1\s+"
+            r'MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW"',
+            proc(src("mb_main.basfrag"), "MB_ProcessOne"))
+        # Both reused BASIC proof and a newly saved limited MSG must block
+        # successful coverage and explain their unresolved fidelity limit.
+        self.assertEqual(len(limited_branches), 2)
 
 
 if __name__ == "__main__":

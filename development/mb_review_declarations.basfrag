@@ -1,0 +1,6 @@
+' Per-run user guidance, derived from events; never a recovery proof.
+Private gReviewGuidePath As String
+Private gReviewGuideState As String
+Private gReviewGuideDetail As String
+Private gReviewGuideRows As Long
+Private gReviewGuideCounts As Object

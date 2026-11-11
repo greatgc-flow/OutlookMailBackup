@@ -462,6 +462,62 @@ Private Function MBR_FindSnapshot(ByVal recoveryRoot As String, ByVal accountRoo
     Set files = Nothing: Set chunks = Nothing
 End Function
 
+Private Function MBR_HashPrefix(ByVal path As String, ByVal byteCount As Double) As String
+    ' The snapshot digest authenticates exactly its original raw byte prefix.
+    ' Hash only that prefix: later append-only records are allowed, but deleting,
+    ' replacing or reordering valid older rows cannot hide behind a larger size.
+    ' Sequential bounded reads avoid Long offsets and preserve UTF-16/BOM bytes.
+    Dim context As MBH_HashContext, buffer(0 To 65535) As Byte
+    Dim remaining As Double, request As Long, count As Long, rc As Long, winError As Long
+    Dim n As Long, source As String, detail As String
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = -1
+    On Error GoTo Failed
+    If byteCount < 0 Or byteCount <> Fix(byteCount) Or byteCount > 9007199254740991# Then _
+        Err.Raise MB_ERR + 1190, , "Invalid exact recovery-prefix byte count."
+    path = MBH_NormalizePath(path)
+    MBY_NoReparse path, True
+    ' Deny write/delete while checking the full historical prefix.
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL Or MBH_FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        Err.Raise MB_ERR + 1191, , "Cannot protect recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+    End If
+    MBH_HashOpen context
+    remaining = byteCount
+    Do While remaining > 0
+        request = 65536
+        If remaining < CDbl(request) Then request = CLng(remaining)
+        If MBH_ReadFile(handle, buffer(0), request, count, 0) = 0 Then
+            winError = Err.LastDllError
+            Err.Raise MB_ERR + 1192, , "Cannot read recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+        End If
+        If count <= 0 Or count > request Then Err.Raise MB_ERR + 1193, , _
+            "Recovery prefix ended before the recorded snapshot boundary: " & path
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), count, 0), "RecoveryPrefixHash"
+        remaining = remaining - CDbl(count)
+    Loop
+    MBR_HashPrefix = MBH_HashFinish(context)
+    rc = MBH_CloseHandle(handle)
+    winError = Err.LastDllError
+    If rc = 0 Then Err.Raise MB_ERR + 1194, , "Cannot close recovery-prefix reader; Win32=" & CStr(winError)
+    handle = -1
+    MBH_HashClose context
+    Exit Function
+Failed:
+    n = Err.Number: source = Err.Source: detail = Err.Description
+    On Error Resume Next
+    If handle <> -1 Then rc = MBH_CloseHandle(handle)
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise n, source, detail
+End Function
+
 Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As String) As Boolean
     Dim dir As String, item As Object, key As Variant, meta As Variant, path As String
     reason = ""
@@ -485,6 +541,9 @@ Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As
                 meta = MBM_Unpack(CStr(snapshotFiles(key)), 3)
                 If CDbl(gFSO.GetFile(path).Size) < MB_ByteCount(CStr(meta(0))) Then
                     reason = "Append-only state is shorter than its recovery snapshot: " & CStr(key): Exit Function
+                End If
+                If MBR_HashPrefix(path, MB_ByteCount(CStr(meta(0)))) <> CStr(meta(1)) Then
+                    reason = "Append-only history differs from its recovery snapshot: " & CStr(key): Exit Function
                 End If
             End If
         Next key
@@ -890,9 +949,16 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
                 "Legacy interrupted recovery has preserved history outside a bound overlay. Review those originals before resuming; no proof may be discarded."
             baseReference = pending
         Else
-            manifest = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, files, chunks, True)
             baseReference = "MSG_ONLY"
-            If Len(manifest) > 0 Then baseReference = manifest
+            If Len(manifest) > 0 Then
+                ' Pin the newest readable history that StateHealthy compared.
+                ' An older valid snapshot may omit the very proof lost from the
+                ' live prefix. Missing/corrupt blocks must not downgrade history
+                ' to an older generation or a fresh MSG-only baseline.
+                If Not MBR_BlocksValid(recoveryRoot, files, chunks, reason) Then _
+                    Err.Raise MB_ERR + 1195, , "Newest readable recovery history is unavailable; preserve state and repair its blocks before retrying. " & reason
+                baseReference = manifest
+            End If
         End If
         intent = MBR_CaptureOverlay(recoveryRoot, accountRoot, storeId, baseReference)
     End If
@@ -924,6 +990,12 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
         gRecoveryRebased = True
     End If
     MBR_ApplyOverlay recoveryRoot, overlayFiles, accountRoot, storeId
+    ' A successful semantic merge may normalize harmless blank lines or older
+    ' serialization. Checkpoint those verified bytes before DONE so a restart
+    ' does not compare them repeatedly with an obsolete physical prefix. The
+    ' original snapshot and overlay stay immutable; a failed checkpoint keeps
+    ' START and its exact original plan available for retry.
+    MBR_SaveSnapshot accountRoot, storeId
     ' No DONE is emitted if valid historical proofs conflict or any owned
     ' merge could not be published. Both original byte sets remain available.
     MBR_WriteIntent recoveryRoot, accountRoot, storeId, intent, "DONE"

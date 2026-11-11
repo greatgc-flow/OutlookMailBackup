@@ -1,5 +1,5 @@
 ' ============================================================================
-' Outlook Mail Backup 3.5.0 - one standard module, Windows classic Outlook
+' Outlook Mail Backup 3.5.1 - one standard module, Windows classic Outlook
 ' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
 '
 ' START -- ONE VISIBLE MACRO
@@ -26,6 +26,8 @@
 '       restore-intents.tsv / reconcile_*.tsv / recovery-events.tsv / overlays\
 ' State is the active operating directory; _Recovery holds independent metadata.
 ' Existing SafeV2/_MailBackup_Data/_MailBackup_Recovery bindings are read in place.
+' The owner marker records Modern/Legacy explicitly, with a checked HKCU copy.
+' A legacy custom root named MailBackup keeps its proven legacy namespace.
 ' Prior _state TSVs migrate by verified copy; their original history is retained.
 ' No user-specific drive or absolute output directory is embedded in this module.
 ' New MBS4 journal rows use account-relative file paths. At the I/O boundary,
@@ -63,6 +65,10 @@
 ' A legacy interrupted restore with unbound preserved histories also stops for
 ' review. No automatic choice can prove which conflicting history is correct.
 ' Snapshot order uses a monotonic generation, not only wall-clock time.
+' Live journal/move/baseline bytes must retain each snapshot's exact hashed
+' prefix. A same-length or longer file cannot hide missing historical proof.
+' The latest readable manifest stays pinned; damaged blocks require review.
+' Successful semantic recovery checkpoints its result before recording DONE.
 ' Missing recovery owner can be rebuilt only from a complete exactly bound
 ' snapshot; folder names alone never authorize ownership or destructive actions.
 ' If snapshots are unavailable, surviving checked proof is still retained. The
@@ -143,9 +149,9 @@
 ' when its mail date is older than the legacy cutoff. Equal content reuses an
 ' existing file; ambiguous, missing or corrupt prior proof remains REVIEW.
 ' This is forward reuse of old outputs. Old writers do not understand new state:
-' owner.txt is upgraded to Schema4 before relative rows; older writers reject it.
-' Do not alternate
-' macro versions; an arbitrary original script cannot be retroactively controlled.
+' owner.txt records Schema4.Modern or Schema4.Legacy before relative rows;
+' older writers reject it. Do not alternate macro versions; an arbitrary
+' original script cannot be retroactively controlled.
 '
 ' ADAPTIVE COVERAGE / INDEPENDENT AUDITS
 ' AUTO reads lightweight metadata for all ordinary MailItems in the DEFAULT
@@ -159,6 +165,11 @@
 ' restored. AUTO uses typed Table dates rather than locale-formatted Jet filters.
 ' Every run also rotates up to 500 historical source comparisons. Unresolved
 ' source reviews have durable retry obligations outside the normal range/budget.
+' An established healthy archive may reuse a fully visited partial scan START
+' only when every remaining review is durably keyed and the exact successful
+' coverage, journal, audit, root, store, UTC context and policy still match.
+' This disposable selection cache never advances successful coverage. Missing
+' or changed proof falls back to the successful range; recovery stays full.
 ' Source audit cursor advances only after visited results/retry obligations are
 ' written. Unvisited/cancelled work does not falsely pass. Old review aggregates
 ' are refreshed; a persistent issue does not freeze the rest of the audit.
@@ -170,6 +181,9 @@
 ' Current mail coverage, physical archive integrity, baseline provenance and
 ' reporting are separate summary results. A broad PARTIAL label does not itself
 ' mean that every current-mail coverage checkpoint was rejected.
+' Each run derives review.tsv from its closed event log, with stable reason
+' codes, available subjects/paths and next actions. Event rows are not unique
+' unresolved mail counts. This report never authorizes export or changes proof.
 '
 ' VALIDATION / PERFORMANCE LIMITS
 ' Authoring checks are syntax/static linkage and adversarial state models.
@@ -193,7 +207,7 @@
 ' Helper/expert procedures are PRIVATE; none needs to be run by the user.
 ' ============================================================================
 
-Private Const MB_VERSION As String = "3.5.0"
+Private Const MB_VERSION As String = "3.5.1"
 Private Const MB_OWNER As String = "OutlookMailBackup.Schema4"
 Private Const MB_OWNER_V34 As String = "OutlookMailBackup.SafeV3.4"
 Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False

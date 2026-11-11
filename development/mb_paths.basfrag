@@ -340,7 +340,8 @@ Private Function MBP_ExactOwner(ByVal rootPath As String, ByVal fso As Object) A
     stream.Close
     Set stream = Nothing
     If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_V34 & vbCrLf And _
-       value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf Then
+       value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
+       value <> MB_OWNER_LAYOUT_MODERN & vbCrLf And value <> MB_OWNER_LAYOUT_LEGACY & vbCrLf Then
         Err.Raise MB_ERR + 205, "MBP_ExactOwner", _
                   "An invalid owner marker already exists: " & marker
     End If

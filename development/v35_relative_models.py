@@ -514,7 +514,9 @@ class SourceContracts(unittest.TestCase):
         for marker in ("MB_OWNER_V34", "MB_OWNER_PREVIOUS", "MB_OWNER_LEGACY"):
             self.assertIn(marker, owner)
         self.assertIn('"owner-previous-"', owner)
-        self.assertIn("MBS_WriteAtomic p, MB_OWNER", owner)
+        self.assertIn("expectedOwner = MBS_LayoutOwner(rootPath)", owner)
+        self.assertIn("MBS_WriteAtomic p, expectedOwner", owner)
+        self.assertIn("MBS_RememberLayout rootPath", owner)
 
     def test_native_codec_check_is_guarded_and_required_for_acceptance(self):
         body = procedure(self.source("mb_acceptance.basfrag"), "MBT_RunAcceptanceReport")

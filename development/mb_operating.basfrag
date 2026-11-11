@@ -1,5 +1,7 @@
 ' ================= Operating metadata / restart recovery ===================
 Private Sub MBS_Reset()
+    Set gLayoutRoots = CreateObject("Scripting.Dictionary")
+    gLayoutRoots.CompareMode = vbTextCompare
     gStateRoot = "": gStateWasMissing = False: gStateMigrated = False
     gStageEnabled = False: Set gStageRecords = Nothing
     Set gStageExpected = CreateObject("Scripting.Dictionary")
@@ -22,14 +24,12 @@ Private Function MB_StatePath(Optional ByVal relative As String = "") As String
 End Function
 
 Private Function MBS_IsModernLayout(ByVal managedRoot As String) As Boolean
-    managedRoot = MBH_NormalizePath(managedRoot)
-    MBS_IsModernLayout = (StrComp(Mid$(managedRoot, InStrRev(managedRoot, "\") + 1), _
-                                 MBP_MANAGED_LEAF, vbTextCompare) = 0)
+    MBS_IsModernLayout = (MBS_LayoutKind(managedRoot) = MBS_LAYOUT_MODERN)
 End Function
 
 Private Function MBS_DataLeaf(ByVal managedRoot As String) As String
-    ' The immutable managed-root name selects its whole directory namespace.
-    ' Deleting State/Recovery/settings cannot silently select a different path.
+    ' A proven layout binding selects the whole namespace. The root name is
+    ' only the fresh-root default, never an override of prior layout evidence.
     If MBS_IsModernLayout(managedRoot) Then
         MBS_DataLeaf = MBS_DATA_LEAF
     Else
@@ -39,7 +39,8 @@ Private Function MBS_DataLeaf(ByVal managedRoot As String) As String
 End Function
 
 Private Sub MBS_ValidateLayout(ByVal managedRoot As String, ByVal fso As Object)
-    Dim other As String, expected As String, folder As Object
+    Dim other As String, expected As String, folder As Object, selected As String
+    selected = MBS_ResolveLayout(managedRoot, fso, True)
     expected = MBS_DataLeaf(managedRoot)
     If expected = MBS_DATA_LEAF Then other = MBS_DATA_LEAF_LEGACY Else other = MBS_DATA_LEAF
     other = MBH_JoinPath(managedRoot, other)

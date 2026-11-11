@@ -8,6 +8,7 @@
 ' in a deterministic rotating audit. This is a per-run budget, not a deadline or
 ' proof against providers changing content without changing any metadata.
 Private Sub MBW_Reset()
+    MBW_ResetSelection
     Set gWindowKnown = Nothing: Set gWindowAudit = Nothing
     Set gWindowAuditOrder = Nothing: Set gWindowAuditSeen = Nothing
     Set gWindowAuditResults = Nothing: Set gWindowSourcePending = Nothing
@@ -112,6 +113,7 @@ Private Sub MBW_Prepare()
     If gWindowFull Then gSince = 0
     gUntil = MBC_UtcToLocal(gWindowStartUTC)
     MBW_LoadAuditState
+    MBW_ApplySelectionCache
     MBW_BuildAudit
     MB_LogEvent "INFO", "ADAPTIVE_RANGE", "", gWindowPath, 0, gWindowNote & _
         " UTC start=" & MBC_UtcStamp(gWindowStartUTC) & "; local since=" & MB_Stamp(gSince) & _
@@ -397,6 +399,7 @@ Private Sub MBW_RecordAuditResult(ByVal sourceKey As String, ByVal outcome As Lo
     If outcome = 5 Then Exit Sub
     If gMode = "REGISTER_LEGACY" And outcome = 8 Then Exit Sub
     If Not MB_IsHexKey(sourceKey) Then Err.Raise MB_ERR + 743, , "Invalid source-audit identity."
+    MBW_TrackSelectionReview sourceKey, outcome, contentLimited
     isSuccess = ((outcome = 1 Or outcome = 2) And Not contentLimited)
     relevant = Not isSuccess
     If gWindowAudit.Exists(sourceKey) Or gWindowSourcePending.Exists(sourceKey) Then relevant = True

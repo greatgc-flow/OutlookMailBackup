@@ -10,6 +10,8 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     Dim sentinelPath As String, sentinelHash As String, text As String, recovery As String
     Dim manifest As String, reason As String, cleanup As String, errorText As String
     Dim newerJournalHash As String, overlayIntent As String, syntheticRow As Variant, stamp As String
+    Dim originalPayload As String, laterPayload As String, replacementPayload As String, recoveredText As String
+    Dim snapshotJournalBytes As Double
     Dim owned As Boolean, initialized As Boolean, rootLocked As Boolean, accountLocked As Boolean
     Dim passed As Boolean, cleaned As Boolean, n As Long, savedBefore As Long, gateError As Long
     detail = ""
@@ -175,6 +177,64 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     MBR_RestoreState account, TEST_STORE
     If gRecoveryRestoredCount <> 0 Or MBH_HashFile(gJournalPath) <> newerJournalHash Then _
         Err.Raise MB_ERR + 970, , "Merged healthy repeat rewrote prior expected proof."
+
+    ' Native prefix continuity uses the real bounded Win32 reader, including a
+    ' greater-than-1-MiB Unicode file. This is still disposable metadata only.
+    If MBR_HashPrefix(probePath, CDbl(fso.GetFile(probePath).Size)) <> probeHash Then _
+        Err.Raise MB_ERR + 970, , "Native prefix continuity failed across the chunk boundary."
+    originalPayload = MB_EncodeFields(syntheticRow)
+    ' Blank lines are valid older append history. A successful recovery may
+    ' normalize them, but its new checkpoint must prevent repeated restoration.
+    Set stream = fso.OpenTextFile(gJournalPath, 8, True, -1)
+    stream.WriteLine "": stream.Close: Set stream = Nothing
+    MBM_FlushPath gJournalPath
+    snapshotJournalBytes = CDbl(fso.GetFile(gJournalPath).Size)
+    MBR_SaveSnapshot account, TEST_STORE
+    manifest = MBR_FindSnapshot(recovery, account, TEST_STORE, files, chunks, True)
+    If Len(manifest) = 0 Then Err.Raise MB_ERR + 970, , "Native continuity snapshot is unavailable."
+    syntheticRow(2) = MBH_HashText("native later revision")
+    syntheticRow(3) = MBH_JoinPath(account, "synthetic-later-metadata-only.msg")
+    syntheticRow(6) = MB_SourceKey(TEST_STORE, "native later entry")
+    syntheticRow(8) = "native later entry"
+    laterPayload = MB_EncodeFields(syntheticRow)
+    Set stream = fso.OpenTextFile(gJournalPath, 8, True, -1)
+    MB_WriteCheckedLine stream, laterPayload
+    stream.Close: Set stream = Nothing: MBM_FlushPath gJournalPath
+    If Not MBR_StateHealthy(files, reason) Then _
+        Err.Raise MB_ERR + 970, , "Normal append was rejected by native continuity: " & reason
+    syntheticRow(2) = MBH_HashText("native replacement revision")
+    syntheticRow(3) = MBH_JoinPath(account, "synthetic-replacement-metadata-only.msg")
+    syntheticRow(6) = MB_SourceKey(TEST_STORE, "native replacement entry")
+    syntheticRow(8) = "native replacement entry"
+    replacementPayload = MB_EncodeFields(syntheticRow)
+    If Not MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then _
+        Err.Raise MB_ERR + 970, , "Disposable tree ownership changed before historical-loss fixture."
+    ' Keep two valid checked rows but omit the snapshot's original proof. The
+    ' journal grows, reproducing loss that checksums and size alone cannot see.
+    Set stream = fso.CreateTextFile(gJournalPath, True, True)
+    MB_WriteCheckedLine stream, laterPayload
+    MB_WriteCheckedLine stream, replacementPayload
+    stream.Close: Set stream = Nothing: MBM_FlushPath gJournalPath
+    If CDbl(fso.GetFile(gJournalPath).Size) < snapshotJournalBytes Then _
+        Err.Raise MB_ERR + 970, , "Historical-loss fixture did not preserve the old size gate."
+    If MBR_StateHealthy(files, reason) Then _
+        Err.Raise MB_ERR + 970, , "Historical row loss was not detected."
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    Set stream = fso.OpenTextFile(gJournalPath, 1, False, -1)
+    recoveredText = stream.ReadAll
+    stream.Close: Set stream = Nothing
+    If InStr(1, recoveredText, originalPayload & vbTab & MBH_HashText(originalPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       InStr(1, recoveredText, laterPayload & vbTab & MBH_HashText(laterPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       InStr(1, recoveredText, replacementPayload & vbTab & MBH_HashText(replacementPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       Not gRecoveryForceFull Or gRecoveryRebased Or MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Lost snapshot proof was not recovered with later proof unchanged."
+    newerJournalHash = MBH_HashFile(gJournalPath)
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If gRecoveryRestoredCount <> 0 Or Not gRecoveryForceFull Or _
+       MBH_HashFile(gJournalPath) <> newerJournalHash Or MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Verified merge checkpoint did not prevent repeated historical restoration."
     If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then _
         Err.Raise MB_ERR + 970, , "Native recovery verification was cancelled or stopped."
     passed = True
@@ -222,7 +282,8 @@ Cleanup:
     If passed And cleaned And n = 0 And Len(cleanup) = 0 And Not gCancel And Not gFatal Then
         detail = "PASS: disposable multi-chunk Unicode metadata snapshot, deleted-state exact-hash restore, " & _
                  "sentinel preservation, durable reconcile token, healthy repeat, unchanged-snapshot reuse, " & _
-                 "ancillary-loss newer-proof preservation and interrupted overlay resume. " & _
+                 "ancillary-loss newer-proof preservation, interrupted overlay resume, bounded native prefix continuity, " & _
+                 "valid historical-row loss recovery and stable post-merge checkpoint. " & _
                  "Synthetic metadata only; no real mail, registry changes or actual power-loss test."
         MBS_NativeRecoverySelfTest = True
     Else

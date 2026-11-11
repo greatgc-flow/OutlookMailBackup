@@ -1,0 +1,134 @@
+' ================= Optional incremental selection progress =================
+' A durable REVIEW remains pending and coverage stays incomplete. On an already
+' established, healthy archive only, this cache avoids repeating a widening
+' recent window for OTHER unchanged sources. Unknown/changed/pending identities
+' and rotating content audits are still selected by MBW_ShouldQueue.
+' No cache may shorten initial, recovered, policy-changed or full reconciliation.
+Private Sub MBW_ResetSelection()
+    Set gSelectionRequired = CreateObject("Scripting.Dictionary")
+    gSelectionRequired.CompareMode = vbBinaryCompare
+    gSelectionUsed = False: gSelectionSaved = False
+    gSelectionPreviousUTC = 0: gSelectionNote = "No optional selection cache used."
+End Sub
+
+Private Function MBW_SelectionPath() As String
+    MBW_SelectionPath = MB_StatePath("selection_" & _
+        Left$(MBH_HashText(MB_EncodeFields(Array(gWindowStore, LCase$(gAutoAccount)))), 32) & ".cache")
+End Function
+
+Private Function MBW_SelectionEligible() As Boolean
+    If gMode <> "AUTO" Or Len(gWindowPath) = 0 Or Len(gWindowAuditPath) = 0 Then Exit Function
+    If gAutoSetupPhase <> "READY" Or Not gWindowAuditLoaded Then Exit Function
+    If gWindowFull Or gRecoveryForceFull Or gStateWasMissing Or gStateMigrated Then Exit Function
+    If Not MBC_ValidDate(gWindowPreviousUTC) Or Not MBC_ValidDate(gWindowStartUTC) Then Exit Function
+    If gWindowPreviousUTC > gWindowStartUTC Then Exit Function
+    If gWindowBadRows <> 0 Or gWindowAuditStateIssues <> 0 Or gJournalIssues <> 0 Then Exit Function
+    If Len(gRoot) = 0 Or Len(gAutoAccount) = 0 Or Len(gWindowStore) = 0 Then Exit Function
+    MBW_SelectionEligible = True
+End Function
+
+Private Function MBW_SelectionDigest(ByVal path As String) As String
+    If Not gFSO.FileExists(path) Then Err.Raise MB_ERR + 1270, , "Selection-cache evidence is missing."
+    MBY_NoReparse path, True
+    MBW_SelectionDigest = MBH_HashFile(path)
+End Function
+
+Private Sub MBW_ApplySelectionCache()
+    Dim path As String, stream As Object, f As Variant, stamp As Date, n As Long, detail As String
+    gSelectionUsed = False: gSelectionPreviousUTC = 0
+    If Not MBW_SelectionEligible() Then
+        gSelectionNote = "Selection cache disabled: initial/full/recovery/context checks remain mandatory."
+        Exit Sub
+    End If
+    On Error GoTo Ignored
+    path = MBW_SelectionPath()
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 1271, , "Incomplete selection cache."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 1271, , "Empty selection cache."
+    f = MB_ReadCheckedLine(stream.ReadLine, 13)
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 1271, , "Extra selection-cache rows."
+    stream.Close: Set stream = Nothing
+    If CStr(f(0)) <> "MBSELECTION1" Or CStr(f(12)) <> "PARTIAL_REVIEW_TRACKED" Then _
+        Err.Raise MB_ERR + 1271, , "Unknown selection-cache schema."
+    If StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), gWindowStore, vbBinaryCompare) <> 0 Or _
+       StrComp(CStr(f(3)), gAutoAccount, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache belongs to another archive/account/store."
+    If CStr(f(5)) <> gWindowContext Or CStr(f(6)) <> MBW_POLICY Or _
+       CStr(f(7)) <> MBC_UtcStamp(gWindowPreviousUTC) Or Len(CStr(f(11))) = 0 Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache has a different coverage/context binding."
+    stamp = MBC_ParseUtcStamp(CStr(f(4)))
+    If Not MBC_ValidDate(stamp) Then Err.Raise MB_ERR + 1271, , "Invalid selection-cache UTC stamp."
+    If stamp <= gWindowPreviousUTC Or stamp > gWindowStartUTC Or CDbl(stamp) < 2# + MBW_OVERLAP_DAYS Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache cannot move backwards or into the future."
+    If CStr(f(8)) <> MBW_SelectionDigest(gWindowPath) Or _
+       CStr(f(9)) <> MBW_SelectionDigest(gJournalPath) Or _
+       CStr(f(10)) <> MBW_SelectionDigest(gWindowAuditPath) Then _
+        Err.Raise MB_ERR + 1271, , "Selection-cache evidence changed; use successful coverage instead."
+    If gCancel Or gFatal Then Exit Sub
+    gSince = MBC_UtcToLocal(DateAdd("d", -MBW_OVERLAP_DAYS, stamp))
+    gSelectionUsed = True: gSelectionPreviousUTC = stamp
+    gSelectionNote = "Recent selection starts at the last fully visited, review-tracked scan minus 7 days. Pending reviews still retry; successful coverage is unchanged."
+    gWindowNote = gWindowNote & " " & gSelectionNote
+    Exit Sub
+Ignored:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    gSelectionNote = "Optional selection cache ignored; successful coverage retained. " & CStr(n) & ": " & detail
+End Sub
+
+Private Sub MBW_TrackSelectionReview(ByVal sourceKey As String, ByVal outcome As Long, ByVal contentLimited As Boolean)
+    If gMode <> "AUTO" Then Exit Sub
+    If gSelectionRequired Is Nothing Then MBW_ResetSelection
+    If outcome = 7 Or contentLimited Then gSelectionRequired(sourceKey) = True
+End Sub
+
+Private Function MBW_CanSaveSelection() As Boolean
+    Dim key As Variant, softReviews As Long
+    If Not MBW_SelectionEligible() Then Exit Function
+    If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then Exit Function
+    If Not gWindowInventoryComplete Or Not gWindowAuditCommitted Then Exit Function
+    If MBR_HasReview() Or gAutoFileReview <> 0 Or gAutoFailureCount <> 0 Then Exit Function
+    If gMailFailed <> 0 Or gMailChanged <> 0 Or gMailPending <> 0 Or gMailPolicy <> 0 Or _
+       gLegacyUnmatched <> 0 Or gAttFailed <> 0 Or gAttPending <> 0 Or _
+       gFolderFailures <> 0 Or gScanChanged <> 0 Then Exit Function
+    If gProcessed <> gPlanned Then Exit Function
+    If Not gJournal Is Nothing Or Not gEvents Is Nothing Then Exit Function
+    If gSelectionRequired Is Nothing Or gWindowSourcePending Is Nothing Then Exit Function
+    softReviews = gMailReview + gContentReview
+    If softReviews <= 0 Or gSelectionRequired.Count <> softReviews Then Exit Function
+    ' Counts alone cannot prove which source was persisted as a retry obligation.
+    For Each key In gSelectionRequired.Keys
+        If Not gWindowSourcePending.Exists(CStr(key)) Then Exit Function
+    Next key
+    MBW_CanSaveSelection = True
+End Function
+
+Private Sub MBW_SaveSelectionCache()
+    Dim payload As String, detail As String
+    On Error GoTo Unavailable
+    If Not MBW_CanSaveSelection() Then Exit Sub
+    payload = MBW_CheckedText(Array("MBSELECTION1", gRoot, gWindowStore, gAutoAccount, _
+        MBC_UtcStamp(gWindowStartUTC), gWindowContext, MBW_POLICY, MBC_UtcStamp(gWindowPreviousUTC), _
+        MBW_SelectionDigest(gWindowPath), MBW_SelectionDigest(gJournalPath), _
+        MBW_SelectionDigest(gWindowAuditPath), gRunId, "PARTIAL_REVIEW_TRACKED"))
+    If gCancel Or gFatal Then Exit Sub
+    MBS_WriteAtomic MBW_SelectionPath(), payload & vbCrLf
+    gSelectionSaved = True
+    Exit Sub
+Unavailable:
+    detail = Err.Description
+    gSelectionNote = gSelectionNote & " Optional selection cache was not saved: " & detail
+    Err.Clear
+End Sub
+
+Private Function MBW_SelectionSummary() As String
+    If Len(gWindowStore) = 0 Then Exit Function
+    MBW_SelectionSummary = vbCrLf & "Optional selection progress: used=" & CStr(gSelectionUsed) & _
+        "; saved=" & CStr(gSelectionSaved) & "; previous scan=" & MBC_UtcStamp(gSelectionPreviousUTC) & vbCrLf & _
+        gSelectionNote & vbCrLf & "Selection progress is not a successful-coverage checkpoint or permission to skip pending reviews."
+End Function

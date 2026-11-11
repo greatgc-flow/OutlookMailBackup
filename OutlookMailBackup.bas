@@ -2,7 +2,7 @@ Attribute VB_Name = "OutlookMailBackup"
 Option Explicit
 
 ' ============================================================================
-' Outlook Mail Backup 3.5.0 - one standard module, Windows classic Outlook
+' Outlook Mail Backup 3.5.1 - one standard module, Windows classic Outlook
 ' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
 '
 ' START -- ONE VISIBLE MACRO
@@ -29,6 +29,8 @@ Option Explicit
 '       restore-intents.tsv / reconcile_*.tsv / recovery-events.tsv / overlays\
 ' State is the active operating directory; _Recovery holds independent metadata.
 ' Existing SafeV2/_MailBackup_Data/_MailBackup_Recovery bindings are read in place.
+' The owner marker records Modern/Legacy explicitly, with a checked HKCU copy.
+' A legacy custom root named MailBackup keeps its proven legacy namespace.
 ' Prior _state TSVs migrate by verified copy; their original history is retained.
 ' No user-specific drive or absolute output directory is embedded in this module.
 ' New MBS4 journal rows use account-relative file paths. At the I/O boundary,
@@ -66,6 +68,10 @@ Option Explicit
 ' A legacy interrupted restore with unbound preserved histories also stops for
 ' review. No automatic choice can prove which conflicting history is correct.
 ' Snapshot order uses a monotonic generation, not only wall-clock time.
+' Live journal/move/baseline bytes must retain each snapshot's exact hashed
+' prefix. A same-length or longer file cannot hide missing historical proof.
+' The latest readable manifest stays pinned; damaged blocks require review.
+' Successful semantic recovery checkpoints its result before recording DONE.
 ' Missing recovery owner can be rebuilt only from a complete exactly bound
 ' snapshot; folder names alone never authorize ownership or destructive actions.
 ' If snapshots are unavailable, surviving checked proof is still retained. The
@@ -146,9 +152,9 @@ Option Explicit
 ' when its mail date is older than the legacy cutoff. Equal content reuses an
 ' existing file; ambiguous, missing or corrupt prior proof remains REVIEW.
 ' This is forward reuse of old outputs. Old writers do not understand new state:
-' owner.txt is upgraded to Schema4 before relative rows; older writers reject it.
-' Do not alternate
-' macro versions; an arbitrary original script cannot be retroactively controlled.
+' owner.txt records Schema4.Modern or Schema4.Legacy before relative rows;
+' older writers reject it. Do not alternate macro versions; an arbitrary
+' original script cannot be retroactively controlled.
 '
 ' ADAPTIVE COVERAGE / INDEPENDENT AUDITS
 ' AUTO reads lightweight metadata for all ordinary MailItems in the DEFAULT
@@ -162,6 +168,11 @@ Option Explicit
 ' restored. AUTO uses typed Table dates rather than locale-formatted Jet filters.
 ' Every run also rotates up to 500 historical source comparisons. Unresolved
 ' source reviews have durable retry obligations outside the normal range/budget.
+' An established healthy archive may reuse a fully visited partial scan START
+' only when every remaining review is durably keyed and the exact successful
+' coverage, journal, audit, root, store, UTC context and policy still match.
+' This disposable selection cache never advances successful coverage. Missing
+' or changed proof falls back to the successful range; recovery stays full.
 ' Source audit cursor advances only after visited results/retry obligations are
 ' written. Unvisited/cancelled work does not falsely pass. Old review aggregates
 ' are refreshed; a persistent issue does not freeze the rest of the audit.
@@ -173,6 +184,9 @@ Option Explicit
 ' Current mail coverage, physical archive integrity, baseline provenance and
 ' reporting are separate summary results. A broad PARTIAL label does not itself
 ' mean that every current-mail coverage checkpoint was rejected.
+' Each run derives review.tsv from its closed event log, with stable reason
+' codes, available subjects/paths and next actions. Event rows are not unique
+' unresolved mail counts. This report never authorizes export or changes proof.
 '
 ' VALIDATION / PERFORMANCE LIMITS
 ' Authoring checks are syntax/static linkage and adversarial state models.
@@ -196,7 +210,7 @@ Option Explicit
 ' Helper/expert procedures are PRIVATE; none needs to be run by the user.
 ' ============================================================================
 
-Private Const MB_VERSION As String = "3.5.0"
+Private Const MB_VERSION As String = "3.5.1"
 Private Const MB_OWNER As String = "OutlookMailBackup.Schema4"
 Private Const MB_OWNER_V34 As String = "OutlookMailBackup.SafeV3.4"
 Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False
@@ -571,9 +585,30 @@ Private gWindowAuditPass As Long
 Private gWindowAuditLoaded As Boolean
 
 
+' Optional selection progress; never a replacement for successful coverage.
+Private gSelectionRequired As Object
+Private gSelectionUsed As Boolean
+Private gSelectionSaved As Boolean
+Private gSelectionPreviousUTC As Date
+Private gSelectionNote As String
+
+
+' Per-run user guidance, derived from events; never a recovery proof.
+Private gReviewGuidePath As String
+Private gReviewGuideState As String
+Private gReviewGuideDetail As String
+Private gReviewGuideRows As Long
+Private gReviewGuideCounts As Object
+
+
 ' Versionless names for new roots; prior absolute SafeV2 bindings stay in place.
 Private Const MBS_DATA_LEAF As String = "State"
 Private Const MBS_DATA_LEAF_LEGACY As String = "_MailBackup_Data"
+Private Const MBS_LAYOUT_MODERN As String = "MODERN"
+Private Const MBS_LAYOUT_LEGACY As String = "LEGACY"
+Private Const MB_OWNER_LAYOUT_MODERN As String = "OutlookMailBackup.Schema4.Modern"
+Private Const MB_OWNER_LAYOUT_LEGACY As String = "OutlookMailBackup.Schema4.Legacy"
+Private gLayoutRoots As Object
 Private Const MB_OWNER_PREVIOUS As String = "OutlookMailBackup.SafeV3.3"
 Private Const MB_OWNER_LEGACY As String = "OutlookMailBackup.SafeV2"
 Private gStateRoot As String
@@ -1267,6 +1302,7 @@ Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
     Dim startTick As Double, errNo As Long, errText As String, rootIndex As Long
     Dim lockHeld As Boolean, attached As String, autoReady As Boolean
     Dim savedCalendar As Long, calendarEntered As Boolean
+    Dim guideDetail As String
     If gBusy Then
         MsgBox "A backup/verification is already running. Use MB_CancelBackup.", vbInformation
         Exit Sub
@@ -1528,6 +1564,9 @@ CleanUp:
     If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Calendar restore: " & Err.Description
     On Error GoTo 0
     MB_CloseResources
+    If Len(gRunDir) > 0 Then
+        If Not MBG_CreateReviewReport(guideDetail) Then gCleanupIssue = gCleanupIssue & " Review guidance: " & guideDetail
+    End If
     ' Coverage advances under the same locks, only after the durable message
     ' journal and both streams closed successfully. Interrupted work replays.
     On Error Resume Next
@@ -1539,6 +1578,7 @@ CleanUp:
         gFatalText = gFatalText & " UTC checkpoint: " & Err.Description
     End If
     On Error GoTo 0
+    If mode = "AUTO" Then MBW_SaveSelectionCache
     If mode = "AUTO" And Len(gRunDir) > 0 Then summary = MB_Summary()
     If mode = "AUTO" And gMaintenanceReady And gJournalIssues = 0 Then
         On Error Resume Next
@@ -1623,6 +1663,7 @@ Private Sub MB_Reset()
     gReuseBlocked = False: gReuseReason = ""
     MBP_Reset
     MBF_Reset
+    MBG_Reset
     MBU_Reset
     MBS_Reset
     MBR_Reset
@@ -1652,10 +1693,14 @@ End Sub
 
 Private Sub MB_CheckOwnership(ByVal rootPath As String)
     Dim p As String, ts As Object, value As String, f As Object, subFolder As Object
+    Dim expectedOwner As String
+    MBS_ValidateLayout rootPath, gFSO
+    expectedOwner = MBS_LayoutOwner(rootPath)
     p = MBH_JoinPath(rootPath, "owner.txt")
     If Not gFSO.FileExists(p) Then
         If MBS_CanRecoverOwner(rootPath, gFSO) Then
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
+            MBS_RememberLayout rootPath
             Exit Sub
         End If
     End If
@@ -1664,17 +1709,19 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
         value = ts.ReadAll
         ts.Close
         If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
-           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf Then
+           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf And _
+           value <> MB_OWNER_LAYOUT_MODERN & vbCrLf And value <> MB_OWNER_LAYOUT_LEGACY & vbCrLf Then
             Err.Raise MB_ERR + 10, "MB_CheckOwnership", "Output owner marker is invalid: " & p
         End If
-        If value <> MB_OWNER & vbCrLf Then
+        If value <> expectedOwner & vbCrLf Then
             ' Preserve the old marker, then reject unsupported downgrade writers.
             If Not gFSO.FileExists(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt")) Then
                 Set ts = gFSO.CreateTextFile(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt"), False, True)
                 ts.Write value: ts.Close
             End If
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
         End If
+        MBS_RememberLayout rootPath
         Exit Sub
     End If
     For Each f In gFSO.GetFolder(rootPath).Files
@@ -1688,8 +1735,9 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
                   "Unowned output folder contains directories. Choose a new empty managed backup folder."
     Next subFolder
     Set ts = gFSO.CreateTextFile(p, False, True)
-    ts.WriteLine MB_OWNER
+    ts.WriteLine expectedOwner
     ts.Close
+    MBS_RememberLayout rootPath
 End Sub
 
 ' ======================= Journal / metadata utilities =======================
@@ -2105,7 +2153,11 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
     If MB_ExistingValid("M|" & revision, relativePath) Then
         stage = "UPGRADE_EXISTING_VALIDATION_NO_SAVEAS"
         validation = MB_UpgradeMsgValidation(mail, q, revision)
-        If validation = MB_NEW_BASIC_VALIDATION Then gContentReview = gContentReview + 1
+        If validation = MB_NEW_BASIC_VALIDATION Then
+            gContentReview = gContentReview + 1
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), q(3), 0, _
+                "Existing MSG retained; special attachment or custom metadata equivalence is not fully proven.", subject
+        End If
         wasNew = False
     Else
         If gReuseBlocked Then
@@ -2215,8 +2267,8 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
         gBytesNew = gBytesNew + bytes
         If validation = MB_NEW_BASIC_VALIDATION Then
             gContentReview = gContentReview + 1
-            MB_LogEvent "WARNING", "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
-                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven."
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
+                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven.", subject
         End If
         wasNew = True
     End If
@@ -2257,7 +2309,7 @@ MessageReady:
     End If
     Exit Function
 LegacyReview:
-    MB_LogEvent "WARNING", "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason
+    MBG_LogReview "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason, subject
     MB_ProcessOne = 7
     Exit Function
 Changed:
@@ -2832,7 +2884,7 @@ Private Function MB_Summary() As String
     s = s & vbCrLf & "Content-verified restored/moved identity aliases (no SaveAs): " & CStr(gIdentityAliases)
     s = s & vbCrLf & "Verified identity-header reads/cache hits: " & CStr(gIdentityHeaderReads) & "/" & CStr(gIdentityHeaderHits)
     s = s & MBV_Summary() & MBF_Summary(gMode)
-    s = s & MBW_Summary()
+    s = s & MBW_Summary() & MBW_SelectionSummary() & MBG_Summary()
     s = s & MBA_Summary() & MBR_Summary() & MBS_Summary()
     If Len(gAutoSetupPhase) > 0 Then
         s = s & vbCrLf & "Automatic setup phase: " & gAutoSetupPhase & vbCrLf & _
@@ -3293,7 +3345,8 @@ Private Function MBP_ExactOwner(ByVal rootPath As String, ByVal fso As Object) A
     stream.Close
     Set stream = Nothing
     If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_V34 & vbCrLf And _
-       value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf Then
+       value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
+       value <> MB_OWNER_LAYOUT_MODERN & vbCrLf And value <> MB_OWNER_LAYOUT_LEGACY & vbCrLf Then
         Err.Raise MB_ERR + 205, "MBP_ExactOwner", _
                   "An invalid owner marker already exists: " & marker
     End If
@@ -3612,7 +3665,8 @@ Private Function MBL_HasOwner(ByVal folderPath As String) As Boolean
     value = stream.ReadAll
     stream.Close
     MBL_HasOwner = (value = MB_OWNER & vbCrLf Or value = MB_OWNER_LEGACY & vbCrLf Or _
-                   value = MB_OWNER_PREVIOUS & vbCrLf Or value = MB_OWNER_V34 & vbCrLf)
+                   value = MB_OWNER_PREVIOUS & vbCrLf Or value = MB_OWNER_V34 & vbCrLf Or _
+                   value = MB_OWNER_LAYOUT_MODERN & vbCrLf Or value = MB_OWNER_LAYOUT_LEGACY & vbCrLf)
     Exit Function
 Failed:
     n = Err.Number: d = Err.Description
@@ -8495,6 +8549,7 @@ End Function
 ' in a deterministic rotating audit. This is a per-run budget, not a deadline or
 ' proof against providers changing content without changing any metadata.
 Private Sub MBW_Reset()
+    MBW_ResetSelection
     Set gWindowKnown = Nothing: Set gWindowAudit = Nothing
     Set gWindowAuditOrder = Nothing: Set gWindowAuditSeen = Nothing
     Set gWindowAuditResults = Nothing: Set gWindowSourcePending = Nothing
@@ -8599,6 +8654,7 @@ Private Sub MBW_Prepare()
     If gWindowFull Then gSince = 0
     gUntil = MBC_UtcToLocal(gWindowStartUTC)
     MBW_LoadAuditState
+    MBW_ApplySelectionCache
     MBW_BuildAudit
     MB_LogEvent "INFO", "ADAPTIVE_RANGE", "", gWindowPath, 0, gWindowNote & _
         " UTC start=" & MBC_UtcStamp(gWindowStartUTC) & "; local since=" & MB_Stamp(gSince) & _
@@ -8884,6 +8940,7 @@ Private Sub MBW_RecordAuditResult(ByVal sourceKey As String, ByVal outcome As Lo
     If outcome = 5 Then Exit Sub
     If gMode = "REGISTER_LEGACY" And outcome = 8 Then Exit Sub
     If Not MB_IsHexKey(sourceKey) Then Err.Raise MB_ERR + 743, , "Invalid source-audit identity."
+    MBW_TrackSelectionReview sourceKey, outcome, contentLimited
     isSuccess = ((outcome = 1 Or outcome = 2) And Not contentLimited)
     relevant = Not isSuccess
     If gWindowAudit.Exists(sourceKey) Or gWindowSourcePending.Exists(sourceKey) Then relevant = True
@@ -8981,8 +9038,376 @@ Private Function MBW_LinesText(ByVal rows As Collection) As String
 End Function
 
 
+' ================= Optional incremental selection progress =================
+' A durable REVIEW remains pending and coverage stays incomplete. On an already
+' established, healthy archive only, this cache avoids repeating a widening
+' recent window for OTHER unchanged sources. Unknown/changed/pending identities
+' and rotating content audits are still selected by MBW_ShouldQueue.
+' No cache may shorten initial, recovered, policy-changed or full reconciliation.
+Private Sub MBW_ResetSelection()
+    Set gSelectionRequired = CreateObject("Scripting.Dictionary")
+    gSelectionRequired.CompareMode = vbBinaryCompare
+    gSelectionUsed = False: gSelectionSaved = False
+    gSelectionPreviousUTC = 0: gSelectionNote = "No optional selection cache used."
+End Sub
+
+Private Function MBW_SelectionPath() As String
+    MBW_SelectionPath = MB_StatePath("selection_" & _
+        Left$(MBH_HashText(MB_EncodeFields(Array(gWindowStore, LCase$(gAutoAccount)))), 32) & ".cache")
+End Function
+
+Private Function MBW_SelectionEligible() As Boolean
+    If gMode <> "AUTO" Or Len(gWindowPath) = 0 Or Len(gWindowAuditPath) = 0 Then Exit Function
+    If gAutoSetupPhase <> "READY" Or Not gWindowAuditLoaded Then Exit Function
+    If gWindowFull Or gRecoveryForceFull Or gStateWasMissing Or gStateMigrated Then Exit Function
+    If Not MBC_ValidDate(gWindowPreviousUTC) Or Not MBC_ValidDate(gWindowStartUTC) Then Exit Function
+    If gWindowPreviousUTC > gWindowStartUTC Then Exit Function
+    If gWindowBadRows <> 0 Or gWindowAuditStateIssues <> 0 Or gJournalIssues <> 0 Then Exit Function
+    If Len(gRoot) = 0 Or Len(gAutoAccount) = 0 Or Len(gWindowStore) = 0 Then Exit Function
+    MBW_SelectionEligible = True
+End Function
+
+Private Function MBW_SelectionDigest(ByVal path As String) As String
+    If Not gFSO.FileExists(path) Then Err.Raise MB_ERR + 1270, , "Selection-cache evidence is missing."
+    MBY_NoReparse path, True
+    MBW_SelectionDigest = MBH_HashFile(path)
+End Function
+
+Private Sub MBW_ApplySelectionCache()
+    Dim path As String, stream As Object, f As Variant, stamp As Date, n As Long, detail As String
+    gSelectionUsed = False: gSelectionPreviousUTC = 0
+    If Not MBW_SelectionEligible() Then
+        gSelectionNote = "Selection cache disabled: initial/full/recovery/context checks remain mandatory."
+        Exit Sub
+    End If
+    On Error GoTo Ignored
+    path = MBW_SelectionPath()
+    If Not gFSO.FileExists(path) Then Exit Sub
+    MBY_NoReparse path, True
+    If CDbl(gFSO.GetFile(path).Size) Mod 2 <> 0 Then Err.Raise MB_ERR + 1271, , "Incomplete selection cache."
+    Set stream = gFSO.OpenTextFile(path, 1, False, -1)
+    If stream.AtEndOfStream Then Err.Raise MB_ERR + 1271, , "Empty selection cache."
+    f = MB_ReadCheckedLine(stream.ReadLine, 13)
+    If Not stream.AtEndOfStream Then Err.Raise MB_ERR + 1271, , "Extra selection-cache rows."
+    stream.Close: Set stream = Nothing
+    If CStr(f(0)) <> "MBSELECTION1" Or CStr(f(12)) <> "PARTIAL_REVIEW_TRACKED" Then _
+        Err.Raise MB_ERR + 1271, , "Unknown selection-cache schema."
+    If StrComp(CStr(f(1)), gRoot, vbTextCompare) <> 0 Or _
+       StrComp(CStr(f(2)), gWindowStore, vbBinaryCompare) <> 0 Or _
+       StrComp(CStr(f(3)), gAutoAccount, vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache belongs to another archive/account/store."
+    If CStr(f(5)) <> gWindowContext Or CStr(f(6)) <> MBW_POLICY Or _
+       CStr(f(7)) <> MBC_UtcStamp(gWindowPreviousUTC) Or Len(CStr(f(11))) = 0 Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache has a different coverage/context binding."
+    stamp = MBC_ParseUtcStamp(CStr(f(4)))
+    If Not MBC_ValidDate(stamp) Then Err.Raise MB_ERR + 1271, , "Invalid selection-cache UTC stamp."
+    If stamp <= gWindowPreviousUTC Or stamp > gWindowStartUTC Or CDbl(stamp) < 2# + MBW_OVERLAP_DAYS Then _
+        Err.Raise MB_ERR + 1271, , "Selection cache cannot move backwards or into the future."
+    If CStr(f(8)) <> MBW_SelectionDigest(gWindowPath) Or _
+       CStr(f(9)) <> MBW_SelectionDigest(gJournalPath) Or _
+       CStr(f(10)) <> MBW_SelectionDigest(gWindowAuditPath) Then _
+        Err.Raise MB_ERR + 1271, , "Selection-cache evidence changed; use successful coverage instead."
+    If gCancel Or gFatal Then Exit Sub
+    gSince = MBC_UtcToLocal(DateAdd("d", -MBW_OVERLAP_DAYS, stamp))
+    gSelectionUsed = True: gSelectionPreviousUTC = stamp
+    gSelectionNote = "Recent selection starts at the last fully visited, review-tracked scan minus 7 days. Pending reviews still retry; successful coverage is unchanged."
+    gWindowNote = gWindowNote & " " & gSelectionNote
+    Exit Sub
+Ignored:
+    n = Err.Number: detail = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    gSelectionNote = "Optional selection cache ignored; successful coverage retained. " & CStr(n) & ": " & detail
+End Sub
+
+Private Sub MBW_TrackSelectionReview(ByVal sourceKey As String, ByVal outcome As Long, ByVal contentLimited As Boolean)
+    If gMode <> "AUTO" Then Exit Sub
+    If gSelectionRequired Is Nothing Then MBW_ResetSelection
+    If outcome = 7 Or contentLimited Then gSelectionRequired(sourceKey) = True
+End Sub
+
+Private Function MBW_CanSaveSelection() As Boolean
+    Dim key As Variant, softReviews As Long
+    If Not MBW_SelectionEligible() Then Exit Function
+    If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then Exit Function
+    If Not gWindowInventoryComplete Or Not gWindowAuditCommitted Then Exit Function
+    If MBR_HasReview() Or gAutoFileReview <> 0 Or gAutoFailureCount <> 0 Then Exit Function
+    If gMailFailed <> 0 Or gMailChanged <> 0 Or gMailPending <> 0 Or gMailPolicy <> 0 Or _
+       gLegacyUnmatched <> 0 Or gAttFailed <> 0 Or gAttPending <> 0 Or _
+       gFolderFailures <> 0 Or gScanChanged <> 0 Then Exit Function
+    If gProcessed <> gPlanned Then Exit Function
+    If Not gJournal Is Nothing Or Not gEvents Is Nothing Then Exit Function
+    If gSelectionRequired Is Nothing Or gWindowSourcePending Is Nothing Then Exit Function
+    softReviews = gMailReview + gContentReview
+    If softReviews <= 0 Or gSelectionRequired.Count <> softReviews Then Exit Function
+    ' Counts alone cannot prove which source was persisted as a retry obligation.
+    For Each key In gSelectionRequired.Keys
+        If Not gWindowSourcePending.Exists(CStr(key)) Then Exit Function
+    Next key
+    MBW_CanSaveSelection = True
+End Function
+
+Private Sub MBW_SaveSelectionCache()
+    Dim payload As String, detail As String
+    On Error GoTo Unavailable
+    If Not MBW_CanSaveSelection() Then Exit Sub
+    payload = MBW_CheckedText(Array("MBSELECTION1", gRoot, gWindowStore, gAutoAccount, _
+        MBC_UtcStamp(gWindowStartUTC), gWindowContext, MBW_POLICY, MBC_UtcStamp(gWindowPreviousUTC), _
+        MBW_SelectionDigest(gWindowPath), MBW_SelectionDigest(gJournalPath), _
+        MBW_SelectionDigest(gWindowAuditPath), gRunId, "PARTIAL_REVIEW_TRACKED"))
+    If gCancel Or gFatal Then Exit Sub
+    MBS_WriteAtomic MBW_SelectionPath(), payload & vbCrLf
+    gSelectionSaved = True
+    Exit Sub
+Unavailable:
+    detail = Err.Description
+    gSelectionNote = gSelectionNote & " Optional selection cache was not saved: " & detail
+    Err.Clear
+End Sub
+
+Private Function MBW_SelectionSummary() As String
+    If Len(gWindowStore) = 0 Then Exit Function
+    MBW_SelectionSummary = vbCrLf & "Optional selection progress: used=" & CStr(gSelectionUsed) & _
+        "; saved=" & CStr(gSelectionSaved) & "; previous scan=" & MBC_UtcStamp(gSelectionPreviousUTC) & vbCrLf & _
+        gSelectionNote & vbCrLf & "Selection progress is not a successful-coverage checkpoint or permission to skip pending reviews."
+End Function
+
+
+' ======================= Per-run review guidance ===========================
+' This report explains observed events. It is not an outstanding-work ledger,
+' does not authorize SaveAs, and must never be read as recovery evidence.
+Private Sub MBG_Reset()
+    gReviewGuidePath = "": gReviewGuideState = "NOT_CREATED"
+    gReviewGuideDetail = "": gReviewGuideRows = 0
+    Set gReviewGuideCounts = Nothing
+End Sub
+
+Private Sub MBG_LogReview(ByVal stage As String, ByVal key As String, ByVal path As String, _
+                          ByVal errorNumber As Long, ByVal reason As String, ByVal subject As String)
+    ' An adjacent context event gives the user a searchable subject without
+    ' parsing it as an error reason or keeping every subject in memory.
+    MB_LogEvent "INFO", "REVIEW_SUBJECT", key, path, 0, subject
+    MB_LogEvent "WARNING", stage, key, path, errorNumber, reason
+End Sub
+
+Private Function MBG_Has(ByVal text As String, ByVal part As String) As Boolean
+    MBG_Has = (InStr(1, text, part, vbTextCompare) > 0)
+End Function
+
+Private Function MBG_Code(ByVal level As String, ByVal stage As String, ByVal reason As String) As String
+    ' Stable producer phrases are matched only in the reason, never subjects
+    ' or paths. An unfamiliar warning retains its full text under a fallback.
+    If level <> "WARNING" And level <> "WARN" And level <> "ERROR" Then Exit Function
+    If stage = "SPECIAL_ATTACHMENT_CONTENT_REVIEW" Then
+        MBG_Code = "CONTENT_LIMITED"
+    ElseIf stage = "SOURCE_CHANGED_RETRY" Or stage = "TYPE_CHANGED" Then
+        MBG_Code = "SOURCE_CHANGED"
+    ElseIf stage = "DOWNLOAD_STATE" And MBG_Has(reason, "Header-only message") Then
+        MBG_Code = "DOWNLOAD_REQUIRED"
+    ElseIf stage = "RECOVERY_NEW_BASELINE" Then
+        MBG_Code = "CURRENT_BASELINE"
+    ElseIf stage = "SCAN_TABLE_FALLBACK" Then
+        MBG_Code = "SCAN_FALLBACK"
+    ElseIf MBG_Has(reason, "No verified old-file match") And MBG_Has(reason, "latest write") Then
+        MBG_Code = "HISTORY_CUTOFF"
+    ElseIf stage = "LEGACY_LOOKUP_UNRESOLVED" Or MBG_Has(reason, "no readable filename/SentOn lookup") Then
+        MBG_Code = "LEGACY_UNREADABLE"
+    ElseIf MBG_Has(reason, "candidate limit reached") Or MBG_Has(reason, "bucket exceeds 512 files") Or _
+           MBG_Has(reason, "Legacy candidate budget exceeded") Then
+        MBG_Code = "CANDIDATE_LIMIT"
+    ElseIf MBG_Has(reason, "Indexed file is missing") Or MBG_Has(reason, "Referenced file is unavailable") Or _
+           MBG_Has(reason, "previously linked old MSG is unavailable") Then
+        MBG_Code = "FILE_MISSING"
+    ElseIf MBG_Has(reason, "SHA-256 mismatch") Or MBG_Has(reason, "changed SHA-256") Or _
+           MBG_Has(reason, "SHA-256 differs from") Or MBG_Has(reason, "Indexed file size mismatch") Or _
+           MBG_Has(reason, "Archived file size differs") Or MBG_Has(reason, "old MSG has changed size") Or _
+           MBG_Has(reason, "Recovered MSG differs from its recorded baseline") Then
+        MBG_Code = "FILE_CHANGED"
+    ElseIf MBG_Has(reason, "provider revision already has a file proof") Then
+        MBG_Code = "REVISION_CONFLICT"
+    ElseIf MBG_Has(reason, "conflicting") Or MBG_Has(reason, "different file proof") Or _
+           MBG_Has(reason, "Multiple content-equal MSG candidates have different file bytes") Or _
+           MBG_Has(reason, "Multiple matching legacy files have different bytes") Then
+        MBG_Code = "PROOF_CONFLICT"
+    ElseIf MBG_Has(reason, "Custom UserProperties are present") Or _
+           MBG_Has(reason, "Embedded/OLE/reference attachment") Or _
+           MBG_Has(reason, "special attachment or custom metadata equivalence") Then
+        MBG_Code = "CONTENT_LIMITED"
+    ElseIf MBG_Has(reason, "restored identity is uncertain") Or _
+           MBG_Has(reason, "provider/import rewriting requires review") Then
+        MBG_Code = "IDENTITY_UNCERTAIN"
+    ElseIf stage = "INVALID_INDEX_ROW" Or stage = "SOURCE_AUDIT_STATE_REVIEW" Or _
+           stage = "STAGE_LEDGER_REVIEW" Or stage = "SEMANTIC_INDEX_RECOVERY" Then
+        MBG_Code = "STATE_REVIEW"
+    ElseIf stage = "LEGACY_REVIEW_REQUIRED" Then
+        MBG_Code = "MATCH_UNPROVEN"
+    ElseIf level = "ERROR" Then
+        MBG_Code = "OPERATION_FAILED"
+    Else
+        MBG_Code = "REVIEW_REQUIRED"
+    End If
+End Function
+
+Private Function MBG_Action(ByVal code As String) As String
+    Select Case code
+        Case "HISTORY_CUTOFF"
+            MBG_Action = "Find this subject in the existing MSG archive and confirm the account folder. " & _
+                "Only if you confirm it was never backed up, save that source once as a Unicode MSG with an unused name in the selected account archive. " & _
+                "Keep the source and rerun MB_01_RunBackup; only verified content can clear review. Never overwrite old files, change dates or delete history."
+        Case "LEGACY_UNREADABLE"
+            MBG_Action = "Check the listed existing MSG in Outlook and make its drive available. " & _
+                "Restore an unreadable file from a known-good backup, then rerun MB_01_RunBackup. Preserve the current file for comparison."
+        Case "CANDIDATE_LIMIT"
+            MBG_Action = "Compare the same-subject candidates and their sender, dates and attachments. " & _
+                "Keep every candidate and the source mail; the tool has not selected a unique match. Do not remove files merely to reduce the count."
+        Case "FILE_MISSING"
+            MBG_Action = "Reconnect the archive drive or restore the original MSG to its recorded location from a known-good backup, " & _
+                "then rerun MB_01_RunBackup. Keep the index and recovery records."
+        Case "FILE_CHANGED"
+            MBG_Action = "Preserve the current MSG separately and compare it with a known-good backup. " & _
+                "Restore the expected original only after checking it. Do not replace the recorded hash with the current file hash."
+        Case "PROOF_CONFLICT", "REVISION_CONFLICT"
+            MBG_Action = "Keep both files and their operating records. Compare the source mail and known-good backups before choosing a recovery path. " & _
+                "Do not edit hashes, merge records by hand or delete one proof to make the conflict disappear."
+        Case "CONTENT_LIMITED"
+            MBG_Action = "Open the source and saved MSG in Outlook and inspect special attachments and custom properties. " & _
+                "Keep the source mail; manual inspection does not automatically certify unsupported properties or clear this review."
+        Case "IDENTITY_UNCERTAIN", "MATCH_UNPROVEN"
+            MBG_Action = "Search for this subject in the existing account archive and compare sender, dates, body and attachments. " & _
+                "Confirm the correct account folder and retain the source mail until a match or an explicit recovery decision is established."
+        Case "SOURCE_CHANGED"
+            MBG_Action = "Let Outlook finish moving, editing or synchronizing this mail, then rerun MB_01_RunBackup."
+        Case "DOWNLOAD_REQUIRED"
+            MBG_Action = "Download the complete mail and its attachments in Outlook, then rerun MB_01_RunBackup."
+        Case "CURRENT_BASELINE"
+            MBG_Action = "The readable MSG is recorded as it exists now. Keep the operating and recovery folders with the archive. " & _
+                "Only a known-good older copy can establish whether its bytes match the original backup."
+        Case "SCAN_FALLBACK"
+            MBG_Action = "Check the final folder-failure and scan-issue counts. The folder may have completed through a slower listing. " & _
+                "If failures remain, make the folder available in Outlook and rerun MB_01_RunBackup."
+        Case "STATE_REVIEW"
+            MBG_Action = "Keep the operating and recovery folders and the MSG files together. Make a separate copy before examining the named operating record. " & _
+                "Do not clear checksums or replace only one state file from another run."
+        Case "OPERATION_FAILED"
+            MBG_Action = "Resolve the reported drive, free-space, permission or Outlook error, then rerun MB_01_RunBackup. " & _
+                "Keep existing MSG and operating records while investigating."
+        Case Else
+            MBG_Action = "Read the reason and final summary, then inspect the named mail or file. " & _
+                "Keep the existing MSG and operating records; a warning event may already have been resolved later in the same run."
+    End Select
+End Function
+
+Private Function MBG_CreateReviewReport(ByRef detail As String) As Boolean
+    Dim reader As Object, writer As Object, counts As Object, fields As Variant
+    Dim source As String, target As String, partial As String, line As String, code As String
+    Dim contextKey As String, contextSubject As String, subject As String, row As Long, recorded As Long
+    Dim n As Long, errorText As String
+    detail = ""
+    If gReviewGuideState = "COMPLETE" Then MBG_CreateReviewReport = True: Exit Function
+    If gReviewGuideState = "FAILED" Then detail = gReviewGuideDetail: Exit Function
+    If Len(gRunDir) = 0 Then MBG_CreateReviewReport = True: Exit Function
+    On Error GoTo Failed
+    If Not gEvents Is Nothing Then Err.Raise MB_ERR + 1260, , "Close the event stream before building review guidance."
+    source = MBH_JoinPath(gRunDir, "events.tsv")
+    target = MBH_JoinPath(gRunDir, "review.tsv")
+    partial = MBH_JoinPath(gRunDir, "review.partial.tsv")
+    gReviewGuidePath = partial
+    MBY_NoReparse source, True
+    MBY_NoReparse partial, False
+    MBY_NoReparse target, False
+    If gFSO.FileExists(target) Or gFSO.FolderExists(target) Or gFSO.FileExists(partial) Or gFSO.FolderExists(partial) Then _
+        Err.Raise MB_ERR + 1261, , "An existing review report was retained; report overwrite is not permitted."
+    Set reader = gFSO.OpenTextFile(source, 1, False, -1)
+    If reader.AtEndOfStream Then Err.Raise MB_ERR + 1262, , "The event log has no header."
+    line = reader.ReadLine
+    If line <> "time" & vbTab & "level" & vbTab & "stage" & vbTab & "key" & vbTab & _
+               "path" & vbTab & "error" & vbTab & "detail" Then _
+        Err.Raise MB_ERR + 1262, , "The event log header is not recognized."
+    Set writer = gFSO.CreateTextFile(partial, False, True)
+    writer.WriteLine "event_row" & vbTab & "time" & vbTab & "code" & vbTab & "subject" & vbTab & _
+                     "location" & vbTab & "source_key" & vbTab & "reason" & vbTab & "action" & vbTab & _
+                     "stage" & vbTab & "error"
+    Set counts = CreateObject("Scripting.Dictionary")
+    counts.CompareMode = vbBinaryCompare
+    row = 1
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine: row = row + 1
+        If Len(line) = 0 Then Err.Raise MB_ERR + 1263, , "An empty event row prevents a complete guidance report."
+        fields = MBM_Unpack(line, 7)
+        If fields(1) <> "INFO" And fields(1) <> "WARNING" And fields(1) <> "WARN" And fields(1) <> "ERROR" Then _
+            Err.Raise MB_ERR + 1263, , "An unknown event level prevents a complete guidance report."
+        If fields(1) = "INFO" And fields(2) = "REVIEW_SUBJECT" Then
+            contextKey = CStr(fields(3)): contextSubject = CStr(fields(6))
+        Else
+            subject = ""
+            If Len(contextKey) > 0 And CStr(fields(3)) = contextKey Then subject = contextSubject
+            contextKey = "": contextSubject = ""
+            code = MBG_Code(CStr(fields(1)), CStr(fields(2)), CStr(fields(6)))
+            If Len(code) > 0 Then
+                writer.WriteLine MB_EncodeFields(Array(CStr(row), fields(0), code, subject, fields(4), fields(3), _
+                    fields(6), MBG_Action(code), fields(2), fields(5)))
+                recorded = recorded + 1
+                If Not counts.Exists(code) Then counts.Add code, 0&
+                counts(code) = CLng(counts(code)) + 1
+            End If
+        End If
+        ' Finish the already-written log even after cancellation. This bounded
+        ' streaming cleanup does not query mail, authorize export or change state.
+        If row Mod 256 = 0 Then DoEvents
+    Loop
+    reader.Close: Set reader = Nothing
+    writer.WriteLine MB_EncodeFields(Array("END", "", "END_OF_REPORT", "", "", "", _
+        "event_rows=" & CStr(recorded), "Observed events, not unique unresolved mails. Use the final summary for completion status.", "", ""))
+    writer.Close: Set writer = Nothing
+    MBM_FlushPath partial
+    MBY_NoReparse partial, True
+    MBY_NoReparse target, False
+    If MBM_MoveFileExW(StrPtr(partial), StrPtr(target), 8) = 0 Then
+        n = Err.LastDllError
+        Err.Raise MB_ERR + 1264, , "Cannot publish the review report; Win32=" & CStr(n)
+    End If
+    gReviewGuidePath = target
+    MBM_FlushPath target
+    gReviewGuideRows = recorded
+    Set gReviewGuideCounts = counts
+    gReviewGuideState = "COMPLETE"
+    MBG_CreateReviewReport = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    If Not reader Is Nothing Then reader.Close
+    If Not writer Is Nothing Then writer.Close
+    On Error GoTo 0
+    gReviewGuideState = "FAILED"
+    gReviewGuideDetail = "Review guidance could not be completed: " & CStr(n) & " - " & errorText
+    detail = gReviewGuideDetail
+End Function
+
+Private Function MBG_Summary() As String
+    Dim result As String, code As Variant
+    If gReviewGuideState = "COMPLETE" Then
+        result = vbCrLf & "Review guidance: " & gReviewGuidePath & vbCrLf & _
+                 "Observed warning/error event rows: " & CStr(gReviewGuideRows) & _
+                 " (not unique unresolved mail count)."
+        If Not gReviewGuideCounts Is Nothing Then
+            For Each code In gReviewGuideCounts.Keys
+                result = result & vbCrLf & "  " & CStr(code) & ": " & CStr(gReviewGuideCounts(code))
+            Next code
+        End If
+    ElseIf gReviewGuideState = "FAILED" Then
+        result = vbCrLf & gReviewGuideDetail
+        If Len(gReviewGuidePath) > 0 Then result = result & vbCrLf & "Report output path (inspect if present): " & gReviewGuidePath
+    End If
+    MBG_Summary = result
+End Function
+
+
 ' ================= Operating metadata / restart recovery ===================
 Private Sub MBS_Reset()
+    Set gLayoutRoots = CreateObject("Scripting.Dictionary")
+    gLayoutRoots.CompareMode = vbTextCompare
     gStateRoot = "": gStateWasMissing = False: gStateMigrated = False
     gStageEnabled = False: Set gStageRecords = Nothing
     Set gStageExpected = CreateObject("Scripting.Dictionary")
@@ -9005,14 +9430,12 @@ Private Function MB_StatePath(Optional ByVal relative As String = "") As String
 End Function
 
 Private Function MBS_IsModernLayout(ByVal managedRoot As String) As Boolean
-    managedRoot = MBH_NormalizePath(managedRoot)
-    MBS_IsModernLayout = (StrComp(Mid$(managedRoot, InStrRev(managedRoot, "\") + 1), _
-                                 MBP_MANAGED_LEAF, vbTextCompare) = 0)
+    MBS_IsModernLayout = (MBS_LayoutKind(managedRoot) = MBS_LAYOUT_MODERN)
 End Function
 
 Private Function MBS_DataLeaf(ByVal managedRoot As String) As String
-    ' The immutable managed-root name selects its whole directory namespace.
-    ' Deleting State/Recovery/settings cannot silently select a different path.
+    ' A proven layout binding selects the whole namespace. The root name is
+    ' only the fresh-root default, never an override of prior layout evidence.
     If MBS_IsModernLayout(managedRoot) Then
         MBS_DataLeaf = MBS_DATA_LEAF
     Else
@@ -9022,7 +9445,8 @@ Private Function MBS_DataLeaf(ByVal managedRoot As String) As String
 End Function
 
 Private Sub MBS_ValidateLayout(ByVal managedRoot As String, ByVal fso As Object)
-    Dim other As String, expected As String, folder As Object
+    Dim other As String, expected As String, folder As Object, selected As String
+    selected = MBS_ResolveLayout(managedRoot, fso, True)
     expected = MBS_DataLeaf(managedRoot)
     If expected = MBS_DATA_LEAF Then other = MBS_DATA_LEAF_LEGACY Else other = MBS_DATA_LEAF
     other = MBH_JoinPath(managedRoot, other)
@@ -9814,6 +10238,183 @@ Private Sub MBS_ClearLoadedIndex(ByVal storeId As String)
 End Sub
 
 
+' ================= Persistent directory namespace selection =================
+' A layout hint chooses names only. It never proves root/account ownership.
+' owner.txt carries the chosen namespace; a checked HKCU copy and surviving
+' bound state/recovery evidence can recover it without moving historical files.
+
+Private Function MBS_LayoutSettingKey(ByVal rootPath As String) As String
+    MBS_LayoutSettingKey = "OperatingLayout_" & MBH_HashText(LCase$(MBH_NormalizePath(rootPath)))
+End Function
+
+Private Function MBS_LayoutSettingValue(ByVal line As String, ByVal rootPath As String) As String
+    Dim fields As Variant
+    fields = MB_ReadCheckedLine(line, 3)
+    If CStr(fields(0)) <> "MBLAYOUT1" Or _
+       StrComp(MBH_NormalizePath(CStr(fields(1))), MBH_NormalizePath(rootPath), vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1230, , "The saved layout binding belongs to another root or schema."
+    If CStr(fields(2)) <> MBS_LAYOUT_MODERN And CStr(fields(2)) <> MBS_LAYOUT_LEGACY Then _
+        Err.Raise MB_ERR + 1230, , "The saved layout binding has an unknown namespace."
+    MBS_LayoutSettingValue = CStr(fields(2))
+End Function
+
+Private Sub MBS_AddLayoutEvidence(ByRef selected As String, ByVal candidate As String, ByVal source As String)
+    If Len(candidate) = 0 Then Exit Sub
+    If candidate <> MBS_LAYOUT_MODERN And candidate <> MBS_LAYOUT_LEGACY Then _
+        Err.Raise MB_ERR + 1230, , "Unknown layout evidence: " & source
+    If Len(selected) > 0 And selected <> candidate Then Err.Raise MB_ERR + 1231, , _
+        "Conflicting directory-layout evidence requires review. No prior path was changed: " & source
+    selected = candidate
+End Sub
+
+Private Function MBS_LayoutOwnerKind(ByVal value As String) As String
+    Select Case value
+        Case MB_OWNER_LAYOUT_MODERN
+            MBS_LayoutOwnerKind = MBS_LAYOUT_MODERN
+        Case MB_OWNER_LAYOUT_LEGACY, MB_OWNER_V34, MB_OWNER_PREVIOUS, MB_OWNER_LEGACY
+            ' Every pre-3.5 writer used the legacy names, including a custom
+            ' root that happens to be called MailBackup.
+            MBS_LayoutOwnerKind = MBS_LAYOUT_LEGACY
+        Case MB_OWNER
+            ' Generic Schema4 predates explicit layout owners. Its surviving
+            ' exact namespace evidence must decide the ambiguous MailBackup case.
+        Case Else
+            Err.Raise MB_ERR + 1230, , "The existing owner marker has an unknown layout generation."
+    End Select
+End Function
+
+Private Function MBS_LayoutPopulated(ByVal rootPath As String, ByVal leaf As String, ByVal fso As Object) As Boolean
+    Dim path As String, folder As Object
+    path = MBH_JoinPath(rootPath, leaf)
+    MBP_NoReparse path, fso
+    If fso.FileExists(path) Then Err.Raise MB_ERR + 1232, , _
+        "A file occupies an operating-directory name. Existing bytes were retained: " & path
+    If Not fso.FolderExists(path) Then Exit Function
+    Set folder = fso.GetFolder(path)
+    MBS_LayoutPopulated = (folder.Files.Count > 0 Or folder.SubFolders.Count > 0)
+End Function
+
+Private Sub MBS_LayoutRecoveryAccount(ByVal accountPath As String, ByVal rootPath As String, _
+                                      ByVal fso As Object, ByRef selected As String)
+    Dim leaf As Variant, marker As String, candidate As String
+    If Len(accountPath) = 0 Then Exit Sub
+    For Each leaf In Array(MBR_FOLDER, MBR_FOLDER_LEGACY)
+        marker = MBH_JoinPath(MBH_JoinPath(accountPath, CStr(leaf)), MBR_OWNER_FILE)
+        ' Broad discovery borrows only exact checked root/account bindings.
+        ' Unrelated or malformed sibling files never decide this root's layout.
+        If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, accountPath) Then
+            candidate = MBS_LAYOUT_LEGACY
+            If CStr(leaf) = MBR_FOLDER Then candidate = MBS_LAYOUT_MODERN
+            MBS_AddLayoutEvidence selected, candidate, marker
+        End If
+    Next leaf
+End Sub
+
+Private Sub MBS_LayoutRecoveryEvidence(ByVal rootPath As String, ByVal fso As Object, ByRef selected As String)
+    Dim account As String, parent As String, child As Object
+    account = MBP_OwnerAccountHint(Application.Session.DefaultStore.StoreID, rootPath)
+    If Len(account) > 0 Then MBS_LayoutRecoveryAccount account, rootPath, fso, selected
+    parent = CStr(fso.GetParentFolderName(rootPath))
+    If Len(parent) = 0 Or Not fso.FolderExists(parent) Then Exit Sub
+    MBP_NoReparse parent, fso
+    MBS_LayoutRecoveryAccount parent, rootPath, fso, selected
+    For Each child In fso.GetFolder(parent).SubFolders
+        If (CLng(child.Attributes) And 1024) = 0 Then _
+            MBS_LayoutRecoveryAccount CStr(child.Path), rootPath, fso, selected
+    Next child
+End Sub
+
+Private Function MBS_ResolveLayout(ByVal rootPath As String, ByVal fso As Object, _
+                                    Optional ByVal refresh As Boolean = False) As String
+    Dim selected As String, path As String, value As String, saved As String
+    Dim owned As Boolean, modernState As Boolean, legacyState As Boolean
+    Dim defaultModern As Boolean
+    rootPath = MBH_NormalizePath(rootPath)
+    If gLayoutRoots Is Nothing Then
+        Set gLayoutRoots = CreateObject("Scripting.Dictionary")
+        gLayoutRoots.CompareMode = vbTextCompare
+    End If
+    If gLayoutRoots.Exists(rootPath) Then
+        selected = CStr(gLayoutRoots(rootPath))
+        If Not refresh Then MBS_ResolveLayout = selected: Exit Function
+        ' Refresh rechecks surviving evidence but cannot silently change the
+        ' already selected namespace if files disappear during this same run.
+    End If
+    MBP_NoReparse rootPath, fso
+    path = MBH_JoinPath(rootPath, "owner.txt")
+    If fso.FileExists(path) Then
+        value = MBP_ReadOneLine(path, fso)
+        MBS_AddLayoutEvidence selected, MBS_LayoutOwnerKind(value), path
+        owned = True
+    Else
+        ' Ownership remains a separate exact-evidence decision. A registry
+        ' layout hint alone must never make CanRecoverOwner return True.
+        owned = MBS_CanRecoverOwner(rootPath, fso)
+    End If
+    saved = MBP_GetSettingText(MBS_LayoutSettingKey(rootPath), "")
+    If Len(saved) > 0 Then _
+        MBS_AddLayoutEvidence selected, MBS_LayoutSettingValue(saved, rootPath), "saved layout binding"
+    modernState = MBS_LayoutPopulated(rootPath, MBS_DATA_LEAF, fso)
+    legacyState = MBS_LayoutPopulated(rootPath, MBS_DATA_LEAF_LEGACY, fso)
+    If modernState And legacyState Then Err.Raise MB_ERR + 1231, , _
+        "Both operating-directory layouts contain records. Existing histories require review."
+    If owned Then
+        If modernState Then MBS_AddLayoutEvidence selected, MBS_LAYOUT_MODERN, MBS_DATA_LEAF
+        If legacyState Then MBS_AddLayoutEvidence selected, MBS_LAYOUT_LEGACY, MBS_DATA_LEAF_LEGACY
+        MBS_LayoutRecoveryEvidence rootPath, fso, selected
+    End If
+    defaultModern = (StrComp(Mid$(rootPath, InStrRev(rootPath, "\") + 1), _
+                             MBP_MANAGED_LEAF, vbTextCompare) = 0)
+    If Len(selected) = 0 Then
+        If owned And defaultModern Then Err.Raise MB_ERR + 1233, , _
+            "This existing MailBackup root has lost every proven layout binding. Restore its owner/layout evidence before writing; do not guess or rename folders."
+        ' Earlier generic Schema4 writers used legacy names for every root
+        ' except MailBackup. An unowned fresh MailBackup uses the new names.
+        selected = MBS_LAYOUT_LEGACY
+        If Not owned And defaultModern Then selected = MBS_LAYOUT_MODERN
+    End If
+    If selected = MBS_LAYOUT_MODERN And legacyState Then Err.Raise MB_ERR + 1231, , _
+        "The chosen layout conflicts with existing legacy operating records."
+    If selected = MBS_LAYOUT_LEGACY And modernState Then Err.Raise MB_ERR + 1231, , _
+        "The chosen layout conflicts with existing modern operating records."
+    gLayoutRoots(rootPath) = selected
+    MBS_ResolveLayout = selected
+End Function
+
+Private Function MBS_LayoutKind(ByVal rootPath As String) As String
+    Dim fso As Object
+    rootPath = MBH_NormalizePath(rootPath)
+    If Not gLayoutRoots Is Nothing Then
+        If gLayoutRoots.Exists(rootPath) Then
+            MBS_LayoutKind = CStr(gLayoutRoots(rootPath))
+            Exit Function
+        End If
+    End If
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    MBS_LayoutKind = MBS_ResolveLayout(rootPath, fso)
+End Function
+
+Private Function MBS_LayoutOwner(ByVal rootPath As String) As String
+    If MBS_LayoutKind(rootPath) = MBS_LAYOUT_MODERN Then
+        MBS_LayoutOwner = MB_OWNER_LAYOUT_MODERN
+    Else
+        MBS_LayoutOwner = MB_OWNER_LAYOUT_LEGACY
+    End If
+End Function
+
+Private Sub MBS_RememberLayout(ByVal rootPath As String)
+    Dim ownerPath As String, selected As String, payload As String
+    rootPath = MBH_NormalizePath(rootPath)
+    selected = MBS_LayoutKind(rootPath)
+    ownerPath = MBH_JoinPath(rootPath, "owner.txt")
+    If Not gFSO.FileExists(ownerPath) Then Err.Raise MB_ERR + 1234, , "Cannot remember a layout before the exact owner marker exists."
+    If MBP_ReadOneLine(ownerPath, gFSO) <> MBS_LayoutOwner(rootPath) Then Err.Raise MB_ERR + 1234, , _
+        "The owner marker changed before its layout could be remembered."
+    payload = MB_EncodeFields(Array("MBLAYOUT1", rootPath, selected))
+    MBP_SaveSettingText MBS_LayoutSettingKey(rootPath), payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+End Sub
+
+
 ' ================== Independent metadata recovery / MSG baseline =============
 ' The independent recovery directory holds metadata only, never extra MSG copies.
 ' Snapshots are immutable manifests over content-addressed 1 MiB chunks, so an
@@ -10278,6 +10879,62 @@ Private Function MBR_FindSnapshot(ByVal recoveryRoot As String, ByVal accountRoo
     Set files = Nothing: Set chunks = Nothing
 End Function
 
+Private Function MBR_HashPrefix(ByVal path As String, ByVal byteCount As Double) As String
+    ' The snapshot digest authenticates exactly its original raw byte prefix.
+    ' Hash only that prefix: later append-only records are allowed, but deleting,
+    ' replacing or reordering valid older rows cannot hide behind a larger size.
+    ' Sequential bounded reads avoid Long offsets and preserve UTF-16/BOM bytes.
+    Dim context As MBH_HashContext, buffer(0 To 65535) As Byte
+    Dim remaining As Double, request As Long, count As Long, rc As Long, winError As Long
+    Dim n As Long, source As String, detail As String
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = -1
+    On Error GoTo Failed
+    If byteCount < 0 Or byteCount <> Fix(byteCount) Or byteCount > 9007199254740991# Then _
+        Err.Raise MB_ERR + 1190, , "Invalid exact recovery-prefix byte count."
+    path = MBH_NormalizePath(path)
+    MBY_NoReparse path, True
+    ' Deny write/delete while checking the full historical prefix.
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL Or MBH_FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        Err.Raise MB_ERR + 1191, , "Cannot protect recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+    End If
+    MBH_HashOpen context
+    remaining = byteCount
+    Do While remaining > 0
+        request = 65536
+        If remaining < CDbl(request) Then request = CLng(remaining)
+        If MBH_ReadFile(handle, buffer(0), request, count, 0) = 0 Then
+            winError = Err.LastDllError
+            Err.Raise MB_ERR + 1192, , "Cannot read recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+        End If
+        If count <= 0 Or count > request Then Err.Raise MB_ERR + 1193, , _
+            "Recovery prefix ended before the recorded snapshot boundary: " & path
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), count, 0), "RecoveryPrefixHash"
+        remaining = remaining - CDbl(count)
+    Loop
+    MBR_HashPrefix = MBH_HashFinish(context)
+    rc = MBH_CloseHandle(handle)
+    winError = Err.LastDllError
+    If rc = 0 Then Err.Raise MB_ERR + 1194, , "Cannot close recovery-prefix reader; Win32=" & CStr(winError)
+    handle = -1
+    MBH_HashClose context
+    Exit Function
+Failed:
+    n = Err.Number: source = Err.Source: detail = Err.Description
+    On Error Resume Next
+    If handle <> -1 Then rc = MBH_CloseHandle(handle)
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise n, source, detail
+End Function
+
 Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As String) As Boolean
     Dim dir As String, item As Object, key As Variant, meta As Variant, path As String
     reason = ""
@@ -10301,6 +10958,9 @@ Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As
                 meta = MBM_Unpack(CStr(snapshotFiles(key)), 3)
                 If CDbl(gFSO.GetFile(path).Size) < MB_ByteCount(CStr(meta(0))) Then
                     reason = "Append-only state is shorter than its recovery snapshot: " & CStr(key): Exit Function
+                End If
+                If MBR_HashPrefix(path, MB_ByteCount(CStr(meta(0)))) <> CStr(meta(1)) Then
+                    reason = "Append-only history differs from its recovery snapshot: " & CStr(key): Exit Function
                 End If
             End If
         Next key
@@ -10706,9 +11366,16 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
                 "Legacy interrupted recovery has preserved history outside a bound overlay. Review those originals before resuming; no proof may be discarded."
             baseReference = pending
         Else
-            manifest = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, files, chunks, True)
             baseReference = "MSG_ONLY"
-            If Len(manifest) > 0 Then baseReference = manifest
+            If Len(manifest) > 0 Then
+                ' Pin the newest readable history that StateHealthy compared.
+                ' An older valid snapshot may omit the very proof lost from the
+                ' live prefix. Missing/corrupt blocks must not downgrade history
+                ' to an older generation or a fresh MSG-only baseline.
+                If Not MBR_BlocksValid(recoveryRoot, files, chunks, reason) Then _
+                    Err.Raise MB_ERR + 1195, , "Newest readable recovery history is unavailable; preserve state and repair its blocks before retrying. " & reason
+                baseReference = manifest
+            End If
         End If
         intent = MBR_CaptureOverlay(recoveryRoot, accountRoot, storeId, baseReference)
     End If
@@ -10740,6 +11407,12 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
         gRecoveryRebased = True
     End If
     MBR_ApplyOverlay recoveryRoot, overlayFiles, accountRoot, storeId
+    ' A successful semantic merge may normalize harmless blank lines or older
+    ' serialization. Checkpoint those verified bytes before DONE so a restart
+    ' does not compare them repeatedly with an obsolete physical prefix. The
+    ' original snapshot and overlay stay immutable; a failed checkpoint keeps
+    ' START and its exact original plan available for retry.
+    MBR_SaveSnapshot accountRoot, storeId
     ' No DONE is emitted if valid historical proofs conflict or any owned
     ' merge could not be published. Both original byte sets remain available.
     MBR_WriteIntent recoveryRoot, accountRoot, storeId, intent, "DONE"
@@ -11526,6 +12199,8 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     Dim sentinelPath As String, sentinelHash As String, text As String, recovery As String
     Dim manifest As String, reason As String, cleanup As String, errorText As String
     Dim newerJournalHash As String, overlayIntent As String, syntheticRow As Variant, stamp As String
+    Dim originalPayload As String, laterPayload As String, replacementPayload As String, recoveredText As String
+    Dim snapshotJournalBytes As Double
     Dim owned As Boolean, initialized As Boolean, rootLocked As Boolean, accountLocked As Boolean
     Dim passed As Boolean, cleaned As Boolean, n As Long, savedBefore As Long, gateError As Long
     detail = ""
@@ -11691,6 +12366,64 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     MBR_RestoreState account, TEST_STORE
     If gRecoveryRestoredCount <> 0 Or MBH_HashFile(gJournalPath) <> newerJournalHash Then _
         Err.Raise MB_ERR + 970, , "Merged healthy repeat rewrote prior expected proof."
+
+    ' Native prefix continuity uses the real bounded Win32 reader, including a
+    ' greater-than-1-MiB Unicode file. This is still disposable metadata only.
+    If MBR_HashPrefix(probePath, CDbl(fso.GetFile(probePath).Size)) <> probeHash Then _
+        Err.Raise MB_ERR + 970, , "Native prefix continuity failed across the chunk boundary."
+    originalPayload = MB_EncodeFields(syntheticRow)
+    ' Blank lines are valid older append history. A successful recovery may
+    ' normalize them, but its new checkpoint must prevent repeated restoration.
+    Set stream = fso.OpenTextFile(gJournalPath, 8, True, -1)
+    stream.WriteLine "": stream.Close: Set stream = Nothing
+    MBM_FlushPath gJournalPath
+    snapshotJournalBytes = CDbl(fso.GetFile(gJournalPath).Size)
+    MBR_SaveSnapshot account, TEST_STORE
+    manifest = MBR_FindSnapshot(recovery, account, TEST_STORE, files, chunks, True)
+    If Len(manifest) = 0 Then Err.Raise MB_ERR + 970, , "Native continuity snapshot is unavailable."
+    syntheticRow(2) = MBH_HashText("native later revision")
+    syntheticRow(3) = MBH_JoinPath(account, "synthetic-later-metadata-only.msg")
+    syntheticRow(6) = MB_SourceKey(TEST_STORE, "native later entry")
+    syntheticRow(8) = "native later entry"
+    laterPayload = MB_EncodeFields(syntheticRow)
+    Set stream = fso.OpenTextFile(gJournalPath, 8, True, -1)
+    MB_WriteCheckedLine stream, laterPayload
+    stream.Close: Set stream = Nothing: MBM_FlushPath gJournalPath
+    If Not MBR_StateHealthy(files, reason) Then _
+        Err.Raise MB_ERR + 970, , "Normal append was rejected by native continuity: " & reason
+    syntheticRow(2) = MBH_HashText("native replacement revision")
+    syntheticRow(3) = MBH_JoinPath(account, "synthetic-replacement-metadata-only.msg")
+    syntheticRow(6) = MB_SourceKey(TEST_STORE, "native replacement entry")
+    syntheticRow(8) = "native replacement entry"
+    replacementPayload = MB_EncodeFields(syntheticRow)
+    If Not MBS_NativeOwnedTreeSafe(fso, testBase, tempRoot, ownerHash, reason) Then _
+        Err.Raise MB_ERR + 970, , "Disposable tree ownership changed before historical-loss fixture."
+    ' Keep two valid checked rows but omit the snapshot's original proof. The
+    ' journal grows, reproducing loss that checksums and size alone cannot see.
+    Set stream = fso.CreateTextFile(gJournalPath, True, True)
+    MB_WriteCheckedLine stream, laterPayload
+    MB_WriteCheckedLine stream, replacementPayload
+    stream.Close: Set stream = Nothing: MBM_FlushPath gJournalPath
+    If CDbl(fso.GetFile(gJournalPath).Size) < snapshotJournalBytes Then _
+        Err.Raise MB_ERR + 970, , "Historical-loss fixture did not preserve the old size gate."
+    If MBR_StateHealthy(files, reason) Then _
+        Err.Raise MB_ERR + 970, , "Historical row loss was not detected."
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    Set stream = fso.OpenTextFile(gJournalPath, 1, False, -1)
+    recoveredText = stream.ReadAll
+    stream.Close: Set stream = Nothing
+    If InStr(1, recoveredText, originalPayload & vbTab & MBH_HashText(originalPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       InStr(1, recoveredText, laterPayload & vbTab & MBH_HashText(laterPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       InStr(1, recoveredText, replacementPayload & vbTab & MBH_HashText(replacementPayload) & vbTab & "END", vbBinaryCompare) = 0 Or _
+       Not gRecoveryForceFull Or gRecoveryRebased Or MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Lost snapshot proof was not recovered with later proof unchanged."
+    newerJournalHash = MBH_HashFile(gJournalPath)
+    MBR_Reset
+    MBR_RestoreState account, TEST_STORE
+    If gRecoveryRestoredCount <> 0 Or Not gRecoveryForceFull Or _
+       MBH_HashFile(gJournalPath) <> newerJournalHash Or MBH_HashFile(sentinelPath) <> sentinelHash Then _
+        Err.Raise MB_ERR + 970, , "Verified merge checkpoint did not prevent repeated historical restoration."
     If gCancel Or gFatal Or Len(gCleanupIssue) > 0 Then _
         Err.Raise MB_ERR + 970, , "Native recovery verification was cancelled or stopped."
     passed = True
@@ -11738,7 +12471,8 @@ Cleanup:
     If passed And cleaned And n = 0 And Len(cleanup) = 0 And Not gCancel And Not gFatal Then
         detail = "PASS: disposable multi-chunk Unicode metadata snapshot, deleted-state exact-hash restore, " & _
                  "sentinel preservation, durable reconcile token, healthy repeat, unchanged-snapshot reuse, " & _
-                 "ancillary-loss newer-proof preservation and interrupted overlay resume. " & _
+                 "ancillary-loss newer-proof preservation, interrupted overlay resume, bounded native prefix continuity, " & _
+                 "valid historical-row loss recovery and stable post-merge checkpoint. " & _
                  "Synthetic metadata only; no real mail, registry changes or actual power-loss test."
         MBS_NativeRecoverySelfTest = True
     Else

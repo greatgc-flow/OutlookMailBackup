@@ -2,6 +2,8 @@
 
 검토일: **2026-11-11 (Asia/Seoul)**
 
+이 문서는 v3.5.0의 당시 검토 결과를 보존합니다. 후속 코드 수정과 새 평가는 [v3.5.1 수정 검토](REMEDIATION_20261111.md)에 기록했습니다.
+
 ## 결론
 
 **종합 검토 점수는 85/100, 가중 계산값은 85.44/100입니다.** 이 점수는 구현·자동 검증·실제 운용 증거를 함께 본 검토자 평가이며, 성공 확률이나 무결함 보증이 아닙니다.
@@ -30,7 +32,7 @@
 
 이번 검토에서 로컬/원격 커밋과 BAS 해시를 재확인하고 `tools/build.py --check`, `tools/release_evidence.py`를 다시 실행했습니다. 원격 CI와 네 작업의 성공도 재조회했습니다. 동일 커밋의 427개 테스트 전체 및 ANTLR 파서는 이번 읽기 검토 중 다시 실행하지 않았으며, 해당 정확한 BAS에 연결된 기존 실행 증거를 사용했습니다.
 
-근거: [대상 PR](https://github.com/greatgc-flow/OutlookMailBackup/pull/1), [해당 커밋의 원격 CI](https://github.com/greatgc-flow/OutlookMailBackup/actions/runs/42981954710), [검증 JSON](validation.json), [검증 범위](VALIDATION.md).
+근거: [대상 PR](https://github.com/greatgc-flow/OutlookMailBackup/pull/1), [해당 커밋의 원격 CI](https://github.com/greatgc-flow/OutlookMailBackup/actions/runs/42981954710), [당시 검증 JSON](history/validation-v3.5.0.json), [검증 범위](VALIDATION.md).
 
 ## 점수 기준
 

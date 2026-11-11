@@ -1,0 +1,175 @@
+' ================= Persistent directory namespace selection =================
+' A layout hint chooses names only. It never proves root/account ownership.
+' owner.txt carries the chosen namespace; a checked HKCU copy and surviving
+' bound state/recovery evidence can recover it without moving historical files.
+
+Private Function MBS_LayoutSettingKey(ByVal rootPath As String) As String
+    MBS_LayoutSettingKey = "OperatingLayout_" & MBH_HashText(LCase$(MBH_NormalizePath(rootPath)))
+End Function
+
+Private Function MBS_LayoutSettingValue(ByVal line As String, ByVal rootPath As String) As String
+    Dim fields As Variant
+    fields = MB_ReadCheckedLine(line, 3)
+    If CStr(fields(0)) <> "MBLAYOUT1" Or _
+       StrComp(MBH_NormalizePath(CStr(fields(1))), MBH_NormalizePath(rootPath), vbTextCompare) <> 0 Then _
+        Err.Raise MB_ERR + 1230, , "The saved layout binding belongs to another root or schema."
+    If CStr(fields(2)) <> MBS_LAYOUT_MODERN And CStr(fields(2)) <> MBS_LAYOUT_LEGACY Then _
+        Err.Raise MB_ERR + 1230, , "The saved layout binding has an unknown namespace."
+    MBS_LayoutSettingValue = CStr(fields(2))
+End Function
+
+Private Sub MBS_AddLayoutEvidence(ByRef selected As String, ByVal candidate As String, ByVal source As String)
+    If Len(candidate) = 0 Then Exit Sub
+    If candidate <> MBS_LAYOUT_MODERN And candidate <> MBS_LAYOUT_LEGACY Then _
+        Err.Raise MB_ERR + 1230, , "Unknown layout evidence: " & source
+    If Len(selected) > 0 And selected <> candidate Then Err.Raise MB_ERR + 1231, , _
+        "Conflicting directory-layout evidence requires review. No prior path was changed: " & source
+    selected = candidate
+End Sub
+
+Private Function MBS_LayoutOwnerKind(ByVal value As String) As String
+    Select Case value
+        Case MB_OWNER_LAYOUT_MODERN
+            MBS_LayoutOwnerKind = MBS_LAYOUT_MODERN
+        Case MB_OWNER_LAYOUT_LEGACY, MB_OWNER_V34, MB_OWNER_PREVIOUS, MB_OWNER_LEGACY
+            ' Every pre-3.5 writer used the legacy names, including a custom
+            ' root that happens to be called MailBackup.
+            MBS_LayoutOwnerKind = MBS_LAYOUT_LEGACY
+        Case MB_OWNER
+            ' Generic Schema4 predates explicit layout owners. Its surviving
+            ' exact namespace evidence must decide the ambiguous MailBackup case.
+        Case Else
+            Err.Raise MB_ERR + 1230, , "The existing owner marker has an unknown layout generation."
+    End Select
+End Function
+
+Private Function MBS_LayoutPopulated(ByVal rootPath As String, ByVal leaf As String, ByVal fso As Object) As Boolean
+    Dim path As String, folder As Object
+    path = MBH_JoinPath(rootPath, leaf)
+    MBP_NoReparse path, fso
+    If fso.FileExists(path) Then Err.Raise MB_ERR + 1232, , _
+        "A file occupies an operating-directory name. Existing bytes were retained: " & path
+    If Not fso.FolderExists(path) Then Exit Function
+    Set folder = fso.GetFolder(path)
+    MBS_LayoutPopulated = (folder.Files.Count > 0 Or folder.SubFolders.Count > 0)
+End Function
+
+Private Sub MBS_LayoutRecoveryAccount(ByVal accountPath As String, ByVal rootPath As String, _
+                                      ByVal fso As Object, ByRef selected As String)
+    Dim leaf As Variant, marker As String, candidate As String
+    If Len(accountPath) = 0 Then Exit Sub
+    For Each leaf In Array(MBR_FOLDER, MBR_FOLDER_LEGACY)
+        marker = MBH_JoinPath(MBH_JoinPath(accountPath, CStr(leaf)), MBR_OWNER_FILE)
+        ' Broad discovery borrows only exact checked root/account bindings.
+        ' Unrelated or malformed sibling files never decide this root's layout.
+        If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, accountPath) Then
+            candidate = MBS_LAYOUT_LEGACY
+            If CStr(leaf) = MBR_FOLDER Then candidate = MBS_LAYOUT_MODERN
+            MBS_AddLayoutEvidence selected, candidate, marker
+        End If
+    Next leaf
+End Sub
+
+Private Sub MBS_LayoutRecoveryEvidence(ByVal rootPath As String, ByVal fso As Object, ByRef selected As String)
+    Dim account As String, parent As String, child As Object
+    account = MBP_OwnerAccountHint(Application.Session.DefaultStore.StoreID, rootPath)
+    If Len(account) > 0 Then MBS_LayoutRecoveryAccount account, rootPath, fso, selected
+    parent = CStr(fso.GetParentFolderName(rootPath))
+    If Len(parent) = 0 Or Not fso.FolderExists(parent) Then Exit Sub
+    MBP_NoReparse parent, fso
+    MBS_LayoutRecoveryAccount parent, rootPath, fso, selected
+    For Each child In fso.GetFolder(parent).SubFolders
+        If (CLng(child.Attributes) And 1024) = 0 Then _
+            MBS_LayoutRecoveryAccount CStr(child.Path), rootPath, fso, selected
+    Next child
+End Sub
+
+Private Function MBS_ResolveLayout(ByVal rootPath As String, ByVal fso As Object, _
+                                    Optional ByVal refresh As Boolean = False) As String
+    Dim selected As String, path As String, value As String, saved As String
+    Dim owned As Boolean, modernState As Boolean, legacyState As Boolean
+    Dim defaultModern As Boolean
+    rootPath = MBH_NormalizePath(rootPath)
+    If gLayoutRoots Is Nothing Then
+        Set gLayoutRoots = CreateObject("Scripting.Dictionary")
+        gLayoutRoots.CompareMode = vbTextCompare
+    End If
+    If gLayoutRoots.Exists(rootPath) Then
+        selected = CStr(gLayoutRoots(rootPath))
+        If Not refresh Then MBS_ResolveLayout = selected: Exit Function
+        ' Refresh rechecks surviving evidence but cannot silently change the
+        ' already selected namespace if files disappear during this same run.
+    End If
+    MBP_NoReparse rootPath, fso
+    path = MBH_JoinPath(rootPath, "owner.txt")
+    If fso.FileExists(path) Then
+        value = MBP_ReadOneLine(path, fso)
+        MBS_AddLayoutEvidence selected, MBS_LayoutOwnerKind(value), path
+        owned = True
+    Else
+        ' Ownership remains a separate exact-evidence decision. A registry
+        ' layout hint alone must never make CanRecoverOwner return True.
+        owned = MBS_CanRecoverOwner(rootPath, fso)
+    End If
+    saved = MBP_GetSettingText(MBS_LayoutSettingKey(rootPath), "")
+    If Len(saved) > 0 Then _
+        MBS_AddLayoutEvidence selected, MBS_LayoutSettingValue(saved, rootPath), "saved layout binding"
+    modernState = MBS_LayoutPopulated(rootPath, MBS_DATA_LEAF, fso)
+    legacyState = MBS_LayoutPopulated(rootPath, MBS_DATA_LEAF_LEGACY, fso)
+    If modernState And legacyState Then Err.Raise MB_ERR + 1231, , _
+        "Both operating-directory layouts contain records. Existing histories require review."
+    If owned Then
+        If modernState Then MBS_AddLayoutEvidence selected, MBS_LAYOUT_MODERN, MBS_DATA_LEAF
+        If legacyState Then MBS_AddLayoutEvidence selected, MBS_LAYOUT_LEGACY, MBS_DATA_LEAF_LEGACY
+        MBS_LayoutRecoveryEvidence rootPath, fso, selected
+    End If
+    defaultModern = (StrComp(Mid$(rootPath, InStrRev(rootPath, "\") + 1), _
+                             MBP_MANAGED_LEAF, vbTextCompare) = 0)
+    If Len(selected) = 0 Then
+        If owned And defaultModern Then Err.Raise MB_ERR + 1233, , _
+            "This existing MailBackup root has lost every proven layout binding. Restore its owner/layout evidence before writing; do not guess or rename folders."
+        ' Earlier generic Schema4 writers used legacy names for every root
+        ' except MailBackup. An unowned fresh MailBackup uses the new names.
+        selected = MBS_LAYOUT_LEGACY
+        If Not owned And defaultModern Then selected = MBS_LAYOUT_MODERN
+    End If
+    If selected = MBS_LAYOUT_MODERN And legacyState Then Err.Raise MB_ERR + 1231, , _
+        "The chosen layout conflicts with existing legacy operating records."
+    If selected = MBS_LAYOUT_LEGACY And modernState Then Err.Raise MB_ERR + 1231, , _
+        "The chosen layout conflicts with existing modern operating records."
+    gLayoutRoots(rootPath) = selected
+    MBS_ResolveLayout = selected
+End Function
+
+Private Function MBS_LayoutKind(ByVal rootPath As String) As String
+    Dim fso As Object
+    rootPath = MBH_NormalizePath(rootPath)
+    If Not gLayoutRoots Is Nothing Then
+        If gLayoutRoots.Exists(rootPath) Then
+            MBS_LayoutKind = CStr(gLayoutRoots(rootPath))
+            Exit Function
+        End If
+    End If
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    MBS_LayoutKind = MBS_ResolveLayout(rootPath, fso)
+End Function
+
+Private Function MBS_LayoutOwner(ByVal rootPath As String) As String
+    If MBS_LayoutKind(rootPath) = MBS_LAYOUT_MODERN Then
+        MBS_LayoutOwner = MB_OWNER_LAYOUT_MODERN
+    Else
+        MBS_LayoutOwner = MB_OWNER_LAYOUT_LEGACY
+    End If
+End Function
+
+Private Sub MBS_RememberLayout(ByVal rootPath As String)
+    Dim ownerPath As String, selected As String, payload As String
+    rootPath = MBH_NormalizePath(rootPath)
+    selected = MBS_LayoutKind(rootPath)
+    ownerPath = MBH_JoinPath(rootPath, "owner.txt")
+    If Not gFSO.FileExists(ownerPath) Then Err.Raise MB_ERR + 1234, , "Cannot remember a layout before the exact owner marker exists."
+    If MBP_ReadOneLine(ownerPath, gFSO) <> MBS_LayoutOwner(rootPath) Then Err.Raise MB_ERR + 1234, , _
+        "The owner marker changed before its layout could be remembered."
+    payload = MB_EncodeFields(Array("MBLAYOUT1", rootPath, selected))
+    MBP_SaveSettingText MBS_LayoutSettingKey(rootPath), payload & vbTab & MBH_HashText(payload) & vbTab & "END"
+End Sub
