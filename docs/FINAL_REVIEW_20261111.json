@@ -1,0 +1,237 @@
+{
+  "review_date": "2026-11-11",
+  "timezone": "Asia/Seoul",
+  "target": {
+    "version": "3.5.0",
+    "commit": "a3cead7c8c78de572bc8cca13ad2d3e489fb4af5",
+    "bas_sha256": "040b82feac03fedaeed05de305d865d200e77065d11292e35d5ea660a2984122"
+  },
+  "rubric": {
+    "code_design": 70,
+    "automated_evidence": 20,
+    "target_runtime": 10,
+    "explanation": "Human review scores, not success probabilities. Outlook runtime points are withheld. The validation-tool row receives runtime points for the Python tools actually executed in CI."
+  },
+  "weighted_score": 85.44,
+  "rounded_score": 85,
+  "items": [
+    {
+      "id": "C01",
+      "category": "원본·기존 MSG 보존과 신규 게시",
+      "weight": 14,
+      "code_design": 69,
+      "automated_evidence": 19,
+      "target_runtime": 0,
+      "score": 88,
+      "rationale": "임시 저장·재열기·해시·게시·저널 순서와 덮어쓰기 거부를 확인. 실제 Outlook/Win32 게시·저장장치 장애 미실행."
+    },
+    {
+      "id": "C02",
+      "category": "동일성·중복·재가져오기",
+      "weight": 10,
+      "code_design": 67,
+      "automated_evidence": 19,
+      "target_runtime": 0,
+      "score": 86,
+      "rationale": "후보 선별과 최종 내용·해시 비교를 분리. 불명확한 후보 128개 한도와 특수 속성 비교 범위, 실제 MSG 미실증."
+    },
+    {
+      "id": "C03",
+      "category": "내용 변경·리비전",
+      "weight": 6,
+      "code_design": 68,
+      "automated_evidence": 19,
+      "target_runtime": 0,
+      "score": 87,
+      "rationale": "과거 기대 해시를 보존하고 별도 리비전 처리. 공급자 수정 표식이 그대로인 내용 변경과 실제 COM 동작 미실증."
+    },
+    {
+      "id": "C04",
+      "category": "이전 출력·운영 형식 호환",
+      "weight": 8,
+      "code_design": 64,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 82,
+      "rationale": "MBS2/MBS3 읽기와 MBS4 원문 보존. 옛 사용자 지정 MailBackup 루트 충돌 예외 R02, 이전 작성기와 교대 쓰기 미지원."
+    },
+    {
+      "id": "C05",
+      "category": "운영 기록 손실·복구",
+      "weight": 10,
+      "code_design": 61,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 79,
+      "rationale": "파일 단위 삭제·스냅샷/잔존 기록 병합·MSG-only 구분. 부분 복원 조합의 과거 증거 재발견 공백 R01 및 실제 복구 미실증."
+    },
+    {
+      "id": "C06",
+      "category": "취소·중단·재실행·완료시각",
+      "weight": 8,
+      "code_design": 68,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 86,
+      "rationale": "단계 기록·재개 계획·flush/close 후 완료시각 기록. 강제 종료·부분 쓰기·정리 실패 조합 실증 부족."
+    },
+    {
+      "id": "C07",
+      "category": "경로·소유권·계정 경계",
+      "weight": 8,
+      "code_design": 68,
+      "automated_evidence": 19,
+      "target_runtime": 0,
+      "score": 87,
+      "rationale": "MBS4 상대 경로 검증, 정확한 루트/StoreID 연결과 쓰기 전 경로 확인. Win32 실제 경합 및 임의 위치 이동 미인증."
+    },
+    {
+      "id": "C08",
+      "category": "폴더명·선택·경로 재사용",
+      "weight": 5,
+      "code_design": 70,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 88,
+      "rationale": "신규 MailBackup/State/_Recovery, 폴더 선택·위치 재발견, 개인 고정 경로 제거. 실제 Shell/HKCU/오프라인 조합 미실행."
+    },
+    {
+      "id": "C09",
+      "category": "자동 범위·장기 미실행",
+      "weight": 6,
+      "code_design": 66,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 84,
+      "rationale": "스캔 시작 UTC−7일 중첩과 unknown/changed 전기간 선별. R03의 자동 저장 보류 및 R04의 미완료 범위 반복 비용."
+    },
+    {
+      "id": "C10",
+      "category": "일시·문화권·시간대",
+      "weight": 5,
+      "code_design": 69,
+      "automated_evidence": 19,
+      "target_runtime": 0,
+      "score": 88,
+      "rationale": "ASCII/Gregorian/UTC·형식 변화 감지·달력 복원. 실제 로캘/DST/provider 조합 미실행."
+    },
+    {
+      "id": "C11",
+      "category": "연월·파일명·Everything 검색",
+      "weight": 5,
+      "code_design": 68,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 86,
+      "rationale": "기존 이름 보존·제목 길이 예산·Unicode surrogate 보호·충돌 회피. 긴 제목·이미 축약된 이름을 모두 표현하지 못함."
+    },
+    {
+      "id": "C12",
+      "category": "10만 건 성능·예측",
+      "weight": 7,
+      "code_design": 60,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 78,
+      "rationale": "같은 제목 후보 반복 탐색 개선, NEW/REUSE 표본 분리. O(N) 순회·초기 해시/재열기 비용 및 실제 10만 건 시간·메모리 미실측."
+    },
+    {
+      "id": "C13",
+      "category": "단일 실행·결과 보고",
+      "weight": 4,
+      "code_design": 70,
+      "automated_evidence": 18,
+      "target_runtime": 0,
+      "score": 88,
+      "rationale": "공개 매크로 하나와 FAILED/CANCELLED/PARTIAL/선언 범위 COMPLETE 구분. REVIEW 해소는 사용자의 판단이 필요할 수 있음."
+    },
+    {
+      "id": "C14",
+      "category": "검증 도구·배포 추적성",
+      "weight": 4,
+      "code_design": 68,
+      "automated_evidence": 19,
+      "target_runtime": 10,
+      "score": 97,
+      "rationale": "427개 검사, 4개 원격 CI, BAS/소스/증거 해시 연결. 별도 ANTLR 검사 환경은 저장소 기본 재현 범위에 포함되지 않음."
+    }
+  ],
+  "findings": [
+    {
+      "id": "R01",
+      "severity": "P2",
+      "classification": "Conditional static-analysis gap; native reproduction not performed",
+      "title": "Snapshot-only historical proof may be missed after a consistent-looking partial restore",
+      "sources": [
+        "development/mb_recovery.basfrag::MBR_StateHealthy",
+        "development/mb_recovery.basfrag::MBR_RestoreState",
+        "development/mb_recovery.basfrag::MBR_BuildBaseline",
+        "development/mb_recovery.basfrag::MBR_CaptureBaseline"
+      ]
+    },
+    {
+      "id": "R02",
+      "severity": "P2",
+      "classification": "Source-confirmed compatibility/documentation exception",
+      "title": "A legacy custom managed root named MailBackup is classified as modern",
+      "sources": [
+        "development/mb_operating.basfrag::MBS_IsModernLayout",
+        "development/mb_operating.basfrag::MBS_ValidateLayout",
+        "development/mb_paths.basfrag::MBP_TryBackupBase",
+        "docs/PATHS.md"
+      ]
+    },
+    {
+      "id": "R03",
+      "severity": "P2",
+      "classification": "Intentional conservative policy with completion tradeoff",
+      "title": "Unknown historical messages can be selected but still blocked from SaveAs",
+      "sources": [
+        "development/mb_reuse.basfrag::MB_NewExportAllowed",
+        "development/mb_legacy.basfrag::MBL_BuildIndex"
+      ]
+    },
+    {
+      "id": "R04",
+      "severity": "P2",
+      "classification": "Operational performance and detection-latency boundary",
+      "title": "Persistent review can hold coverage progress; rotating audits are bounded",
+      "sources": [
+        "development/mb_window.basfrag::MBW_CanCommit",
+        "development/mb_window_declarations.basfrag",
+        "development/mb_archiveaudit_declarations.basfrag",
+        "development/mb_identity_declarations.basfrag"
+      ]
+    },
+    {
+      "id": "G01",
+      "severity": "P1",
+      "classification": "Required operational evidence missing, not a confirmed compiler failure",
+      "title": "Actual Outlook compile/runtime, archive compatibility and 100000-message performance remain untested",
+      "sources": [
+        "docs/OUTLOOK_VALIDATION.md",
+        "docs/validation.json"
+      ]
+    }
+  ],
+  "evidence": {
+    "model_source_tests": 380,
+    "validator_tests": 47,
+    "total_tests": 427,
+    "ci_matrix_passed": 4,
+    "ci_run_url": "https://github.com/greatgc-flow/OutlookMailBackup/actions/runs/42981954710",
+    "fresh_review_checks": [
+      "Source/remote target and BAS SHA verified",
+      "Byte-identical BAS rebuild verified",
+      "Current release-evidence binding verified",
+      "CI result and four jobs rechecked",
+      "Independent source reviews reconciled"
+    ],
+    "full_test_suite_rerun_this_review": false,
+    "code_changed": false,
+    "outlook_compile": "NOT_RUN",
+    "outlook_runtime": "NOT_RUN",
+    "real_100000_benchmark": "NOT_RUN"
+  },
+  "closure": "Principal normal/review/failure transitions are connected; arbitrary-input automatic recovery, all prior writer interoperability and real-environment validation are not completely closed."
+}
