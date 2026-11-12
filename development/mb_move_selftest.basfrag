@@ -28,7 +28,7 @@ Private Function MBT_YearMonthSelfTest(ByRef resultDetail As String) As Boolean
     gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
     Set gFSO = CreateObject("Scripting.FileSystemObject")
     Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
-    testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBYM_" & gFSO.GetTempName)
+    testBase = MBH_JoinPath(MBT_TestParent(gFSO), "MBYM_" & gFSO.GetTempName)
     gFSO.CreateFolder testBase
     owned = True
     gRoot = MBH_JoinPath(testBase, MBP_MANAGED_LEAF): gBaseRoot = gRoot
@@ -135,15 +135,21 @@ Failed:
     n = Err.Number: detail = Err.Description
 CleanUp:
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Year/month stream close", Err.Number, Err.Description
+    Err.Clear
     If Not gEvents Is Nothing Then gEvents.Close
+    MBT_NoteCleanup "Year/month event close", Err.Number, Err.Description
     Set gEvents = Nothing
     Err.Clear
     MBM_ReleaseAccountLocks
     If Err.Number <> 0 Then cleanup = " Account lock cleanup: " & Err.Description
+    MBT_NoteCleanup "Year/month account lock cleanup", Err.Number, Err.Description
     Err.Clear
     MBH_ReleaseCrypto
     If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    MBT_NoteCleanup "Year/month crypto cleanup", Err.Number, Err.Description
     If owned Then
         Err.Clear
         gFSO.DeleteFolder testBase, True

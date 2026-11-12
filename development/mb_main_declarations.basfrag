@@ -1,6 +1,6 @@
 ' ============================================================================
-' Outlook Mail Backup 3.5.1 - one standard module, Windows classic Outlook
-' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
+' Outlook Mail Backup 3.5.2 - one standard module, Windows classic Outlook
+' Built: 2026-11-12. ASCII source / CRLF for VBA File > Import.
 '
 ' START -- ONE VISIBLE MACRO
 ' 1. Replace the previous OutlookMailBackup module, then Debug > Compile.
@@ -9,6 +9,9 @@
 '    hashing, locale/UTC, file moves, MSG comparison and metadata recovery.
 '    Synthetic UNSENT messages and owned temporary metadata are used. No real
 '    mailbox item is saved, sent, moved or deleted by the acceptance checks.
+'    A clean failed attempt is retried once with fresh files and alternate
+'    TEMP/LOCALAPPDATA preference. Cancellation or unfinished cleanup stops.
+'    Persistent failures show the check/detail and open a local text report.
 ' 4. Select a base/account directory only when no usable remembered path exists.
 '    Setup, safe recovery, year/month maintenance, legacy linking and adaptive
 '    backup are automatic. There is no separate sequence of public commands.
@@ -207,7 +210,7 @@
 ' Helper/expert procedures are PRIVATE; none needs to be run by the user.
 ' ============================================================================
 
-Private Const MB_VERSION As String = "3.5.1"
+Private Const MB_VERSION As String = "3.5.2"
 Private Const MB_OWNER As String = "OutlookMailBackup.Schema4"
 Private Const MB_OWNER_V34 As String = "OutlookMailBackup.SafeV3.4"
 Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False

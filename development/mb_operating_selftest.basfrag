@@ -29,7 +29,7 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     Set fso = CreateObject("Scripting.FileSystemObject"): Set gFSO = fso
     Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
     Set gIndex = CreateObject("Scripting.Dictionary"): gIndex.CompareMode = vbBinaryCompare
-    tempRoot = MBH_NormalizePath(CStr(fso.GetSpecialFolder(2).Path))
+    tempRoot = MBT_TestParent(fso)
     testBase = MBH_JoinPath(tempRoot, "MBREC_" & fso.GetTempName)
     ' CreateFolder claims a NEW directory. Never reuse or clean an older test.
     fso.CreateFolder testBase: owned = True
@@ -243,15 +243,19 @@ Failed:
     n = Err.Number: errorText = Err.Description
 Cleanup:
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Recovery stream close", Err.Number, Err.Description
     Set stream = Nothing
     If accountLocked Then
         Err.Clear: MBM_ReleaseAccountLocks
         If Err.Number <> 0 Then cleanup = cleanup & " Account lock: " & Err.Description
+        MBT_NoteCleanup "Recovery account lock cleanup", Err.Number, Err.Description
     End If
     If rootLocked Then
         Err.Clear: MBH_ReleaseRunLock
         If Err.Number <> 0 Then cleanup = cleanup & " Root lock: " & Err.Description
+        MBT_NoteCleanup "Recovery root lock cleanup", Err.Number, Err.Description
     End If
     On Error GoTo 0
     ' On any test failure retain every disposable byte for diagnosis. Cleanup
@@ -273,6 +277,7 @@ Cleanup:
     On Error Resume Next
     Err.Clear: MBH_ReleaseCrypto
     If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    MBT_NoteCleanup "Recovery crypto cleanup", Err.Number, Err.Description
     If initialized Then
         gStageEnabled = False: gWindowCommitted = False
         Set gDirs = Nothing: Set gIndex = Nothing: Set gFSO = Nothing

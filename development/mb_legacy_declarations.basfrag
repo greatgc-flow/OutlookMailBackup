@@ -11,6 +11,15 @@ Private Const MBL_REPARSE_POINT As Long = 1024
 Private Const MBL_ID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
 Private Const MBL_ID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
 Private Const MBL_MAPI_NOT_FOUND As Long = &H8004010F
+' CVErr accepts only 0..65535. MAPI uses signed 32-bit HRESULTs instead.
+' Only local, initialized VARIANT/Integer/Long storage is passed to this API.
+#If VBA7 Then
+Private Declare PtrSafe Sub MBL_CopyErrorMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
+    ByVal destination As LongPtr, ByVal source As LongPtr, ByVal bytes As LongPtr)
+#Else
+Private Declare Sub MBL_CopyErrorMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
+    ByVal destination As Long, ByVal source As Long, ByVal bytes As Long)
+#End If
 Private Const MBL_CID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 Private Const MBL_CID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
 Private Const MBL_LOCATION_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3713001F"

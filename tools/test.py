@@ -38,6 +38,8 @@ SUITES = (
     ("v351_layout_binding_models.py", (), 57),
     ("v351_review_guidance_models.py", ("--integration",), 46),
     ("v351_selection_models.py", (), 36),
+    ("test_hresult_contract.py", (), 21),
+    ("v352_startup_models.py", (), 31),
 )
 
 

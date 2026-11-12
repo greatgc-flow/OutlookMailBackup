@@ -2,8 +2,8 @@ Attribute VB_Name = "OutlookMailBackup"
 Option Explicit
 
 ' ============================================================================
-' Outlook Mail Backup 3.5.1 - one standard module, Windows classic Outlook
-' Built: 2026-11-11. ASCII source / CRLF for VBA File > Import.
+' Outlook Mail Backup 3.5.2 - one standard module, Windows classic Outlook
+' Built: 2026-11-12. ASCII source / CRLF for VBA File > Import.
 '
 ' START -- ONE VISIBLE MACRO
 ' 1. Replace the previous OutlookMailBackup module, then Debug > Compile.
@@ -12,6 +12,9 @@ Option Explicit
 '    hashing, locale/UTC, file moves, MSG comparison and metadata recovery.
 '    Synthetic UNSENT messages and owned temporary metadata are used. No real
 '    mailbox item is saved, sent, moved or deleted by the acceptance checks.
+'    A clean failed attempt is retried once with fresh files and alternate
+'    TEMP/LOCALAPPDATA preference. Cancellation or unfinished cleanup stops.
+'    Persistent failures show the check/detail and open a local text report.
 ' 4. Select a base/account directory only when no usable remembered path exists.
 '    Setup, safe recovery, year/month maintenance, legacy linking and adaptive
 '    backup are automatic. There is no separate sequence of public commands.
@@ -210,7 +213,7 @@ Option Explicit
 ' Helper/expert procedures are PRIVATE; none needs to be run by the user.
 ' ============================================================================
 
-Private Const MB_VERSION As String = "3.5.1"
+Private Const MB_VERSION As String = "3.5.2"
 Private Const MB_OWNER As String = "OutlookMailBackup.Schema4"
 Private Const MB_OWNER_V34 As String = "OutlookMailBackup.SafeV3.4"
 Private Const MB_EXTRACT_ATTACHMENTS As Boolean = False
@@ -380,6 +383,15 @@ Private Const MBL_REPARSE_POINT As Long = 1024
 Private Const MBL_ID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001F"
 Private Const MBL_ID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
 Private Const MBL_MAPI_NOT_FOUND As Long = &H8004010F
+' CVErr accepts only 0..65535. MAPI uses signed 32-bit HRESULTs instead.
+' Only local, initialized VARIANT/Integer/Long storage is passed to this API.
+#If VBA7 Then
+Private Declare PtrSafe Sub MBL_CopyErrorMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
+    ByVal destination As LongPtr, ByVal source As LongPtr, ByVal bytes As LongPtr)
+#Else
+Private Declare Sub MBL_CopyErrorMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
+    ByVal destination As Long, ByVal source As Long, ByVal bytes As Long)
+#End If
 Private Const MBL_CID_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 Private Const MBL_CID_ANSI As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
 Private Const MBL_LOCATION_UNICODE As String = "http://schemas.microsoft.com/mapi/proptag/0x3713001F"
@@ -480,6 +492,11 @@ Private gAutoTestReport As String
 ' Acceptance reports describe their tested scope; unexecuted operational gates
 ' remain NOT_RUN. No global pass flag is stored here or in the Windows registry.
 Private Const MBT_REPORT_SCHEMA As String = "MBTEST1"
+Private Const MBT_MAX_ATTEMPTS As Long = 2
+Private mbtScratchParent As String
+Private mbtFailureLines As String
+Private mbtCleanupFault As String
+Private mbtStartupNote As String
 
 
 
@@ -731,12 +748,17 @@ Public Sub MB_01_RunBackup()
     End If
     On Error GoTo Failed
     If Not nativeTestsPassed Then
-        If Not MBT_RunAcceptanceReport(nativeReport, detail) Then
-            MsgBox "Environment check did not pass. No archive workflow was started." & _
-                   vbCrLf & detail & vbCrLf & "Report: " & nativeReport, vbExclamation, "Mail Backup"
+        If Not MBT_RunStartupChecks(nativeReport, detail) Then
+            MBT_ShowStartupFailure nativeReport, detail
             Exit Sub
         End If
         nativeTestsPassed = True
+    End If
+    ' A prior successful self-test does not authorize resetting live resources
+    ' left by a later backup failure in the same VBA session.
+    If Not MBT_ResourcesClean(detail) Then
+        MsgBox detail, vbExclamation, "Mail Backup " & MB_VERSION
+        Exit Sub
     End If
     gAutoTestReport = nativeReport
     MB_Run "AUTO", False, True, False
@@ -935,15 +957,280 @@ Failed:
 End Sub
 
 
+' Bounded recovery uses only new disposable files. It never resets an archive,
+' deletes old reports, clears live handles or waives a failed acceptance check.
+Private Function MBT_RunStartupChecks(ByRef reportPath As String, ByRef detail As String) As Boolean
+    Dim attempt As Long, attemptReport As String, attemptDetail As String
+    Dim history As String, cleanup As String, passed As Boolean, clean As Boolean
+    Dim n As Long, errorText As String
+    On Error GoTo Failed
+    reportPath = "": detail = "": mbtStartupNote = ""
+    If gBusy Then detail = "A backup or native test is already running.": Exit Function
+    For attempt = 1 To MBT_MAX_ATTEMPTS
+        ' Check before MB_Reset can discard state from an unfinished operation.
+        clean = MBT_ResourcesClean(cleanup)
+        If Not clean Then
+            detail = "CLEANUP_PENDING: " & cleanup
+            Exit For
+        End If
+        mbtScratchParent = "": mbtFailureLines = ""
+        passed = MBT_RunAcceptanceReport(attemptReport, attemptDetail, attempt)
+        If Len(attemptReport) > 0 Then reportPath = attemptReport
+        history = history & "Attempt " & CStr(attempt) & "/" & CStr(MBT_MAX_ATTEMPTS) & ": " & _
+                  attemptDetail & vbCrLf & mbtFailureLines & "Report: " & attemptReport & vbCrLf & vbCrLf
+        clean = MBT_ResourcesClean(cleanup)
+        If passed And Not gCancel And clean Then
+            MBT_RunStartupChecks = True
+            detail = "Native checks passed on attempt " & CStr(attempt) & "."
+            Exit For
+        End If
+        detail = attemptDetail
+        If Len(mbtFailureLines) > 0 Then detail = detail & vbCrLf & mbtFailureLines
+        If Not clean Then detail = detail & vbCrLf & "CLEANUP_PENDING: " & cleanup
+        If gCancel Then detail = "Cancelled. Automatic retry was not started." & vbCrLf & detail
+        If Not MBT_CanRetry(attempt, gCancel, clean) Then Exit For
+    Next attempt
+Finish:
+    mbtScratchParent = ""
+    If Not MBT_RunStartupChecks Then
+        detail = "Startup checks stopped before backup." & vbCrLf & detail
+    End If
+    mbtStartupNote = MBT_WriteStartupNote(reportPath, detail & vbCrLf & vbCrLf & history)
+    If MBT_RunStartupChecks Then
+        If Not MBT_ResourcesClean(cleanup) Then
+            MBT_RunStartupChecks = False
+            detail = "CLEANUP_PENDING after diagnostic write: " & cleanup
+        End If
+    End If
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    MBT_RunStartupChecks = False
+    detail = "STARTUP_ERROR: " & CStr(n) & " - " & errorText
+    Resume Finish
+End Function
+
+Private Function MBT_CanRetry(ByVal completedAttempts As Long, ByVal cancelled As Boolean, _
+                              ByVal clean As Boolean) As Boolean
+    MBT_CanRetry = completedAttempts < MBT_MAX_ATTEMPTS And Not cancelled And clean
+End Function
+
+Private Function MBT_ResourcesClean(ByRef detail As String) As Boolean
+    On Error GoTo Unknown
+    detail = ""
+    If MBH_RunLock <> 0 Then detail = detail & " Root lock is still open."
+    If Not mbmAccountLocks Is Nothing Then
+        If mbmAccountLocks.Count > 0 Then detail = detail & " Account locks are still open."
+    End If
+    If Not gJournal Is Nothing Then detail = detail & " Journal stream is still open."
+    If Not gEvents Is Nothing Then detail = detail & " Event stream is still open."
+    If MBH_OpenHashes <> 0 Then detail = detail & " Hash objects are still active."
+    If Not MBH_Stages Is Nothing Then
+        If MBH_Stages.Count > 0 Then detail = detail & " Owned stage reservations remain."
+    End If
+    If gStageEnabled Then detail = detail & " Archive stage tracking is still active."
+    detail = detail & gCleanupIssue & mbtCleanupFault
+    If Len(detail) > 0 Then
+        detail = Trim$(detail) & " Restart Outlook to release unfinished resources, then run MB_01_RunBackup."
+        Exit Function
+    End If
+    MBT_ResourcesClean = True
+    Exit Function
+Unknown:
+    detail = "Cannot verify idle resources: " & CStr(Err.Number) & " - " & Err.Description
+End Function
+
+Private Sub MBT_NoteCleanup(ByVal operation As String, ByVal number As Long, ByVal description As String)
+    If number <> 0 Then mbtCleanupFault = mbtCleanupFault & " " & operation & ": " & CStr(number) & " - " & description
+End Sub
+
+Private Function MBT_FinishNativeAttempt(ByRef detail As String) As Boolean
+    On Error GoTo Failed
+    If Not MBT_ResourcesClean(detail) Then Exit Function
+    MBH_ReleaseCrypto
+    detail = "PASS: no live archive streams, locks, hash objects or stage reservations."
+    MBT_FinishNativeAttempt = True
+    Exit Function
+Failed:
+    detail = "Idle crypto cleanup: " & CStr(Err.Number) & " - " & Err.Description
+    mbtCleanupFault = mbtCleanupFault & " " & detail
+End Function
+
+Private Function MBT_TempParent(ByVal fso As Object) As String
+    On Error GoTo Unavailable
+    MBT_TempParent = CStr(fso.GetSpecialFolder(2).Path)
+Unavailable:
+End Function
+
+Private Function MBT_TestParent(ByVal fso As Object) As String
+    Dim path As String
+    path = mbtScratchParent
+    If Len(path) = 0 Then path = MBT_TempParent(fso)
+    path = MBH_NormalizePath(path)
+    MBP_NoReparse path, fso
+    If Not fso.FolderExists(path) Then Err.Raise MB_ERR + 720, , "Disposable test parent is unavailable."
+    MBT_TestParent = path
+End Function
+
+Private Function MBT_SelectTestParent(ByVal fso As Object, ByVal attempt As Long) As String
+    Dim candidates As Variant, candidate As Variant, path As String, reason As String, failures As String
+    If attempt = 1 Then
+        candidates = Array(MBT_TempParent(fso), Environ$("LOCALAPPDATA"))
+    Else
+        candidates = Array(Environ$("LOCALAPPDATA"), MBT_TempParent(fso))
+    End If
+    For Each candidate In candidates
+        If MBT_TryScratchParent(fso, CStr(candidate), path, reason) Then
+            MBT_SelectTestParent = path
+            Exit Function
+        End If
+        failures = failures & " " & reason
+        If Len(mbtCleanupFault) > 0 Then Exit For
+    Next candidate
+    Err.Raise MB_ERR + 720, , "No writable disposable test parent." & failures
+End Function
+
+Private Function MBT_TryScratchParent(ByVal fso As Object, ByVal candidate As String, _
+                                      ByRef path As String, ByRef reason As String) As Boolean
+    Dim probe As String, stream As Object, n As Long, errorText As String
+    On Error GoTo Failed
+    path = "": reason = ""
+    If Len(candidate) = 0 Then reason = "An environment path is unavailable.": Exit Function
+    candidate = MBH_NormalizePath(candidate)
+    MBP_NoReparse candidate, fso
+    If Not fso.FolderExists(candidate) Then Err.Raise MB_ERR + 720, , "Directory is unavailable: " & candidate
+    probe = MBH_JoinPath(candidate, "MBProbe_" & fso.GetTempName)
+    fso.CreateFolder probe
+    Set stream = fso.CreateTextFile(MBH_JoinPath(probe, "write.txt"), False, True)
+    stream.Write "Owned startup write probe."
+    stream.Close: Set stream = Nothing
+    MBP_NoReparse probe, fso
+    fso.DeleteFolder probe, True
+    path = candidate
+    MBT_TryScratchParent = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Probe stream close", Err.Number, Err.Description
+    On Error GoTo 0
+    ' An unsuccessful probe is left intact; never delete a pre-existing path.
+    reason = CStr(n) & " - " & errorText
+End Function
+
+Private Function MBT_CreateAcceptanceReport(ByVal fso As Object, ByVal attempt As Long) As String
+    Dim candidates As Variant, candidate As Variant, path As String, reason As String, failures As String
+    If attempt = 1 Then
+        candidates = Array(Environ$("LOCALAPPDATA"), MBT_TempParent(fso))
+    Else
+        candidates = Array(MBT_TempParent(fso), Environ$("LOCALAPPDATA"))
+    End If
+    For Each candidate In candidates
+        If MBT_TryReport(fso, CStr(candidate), path, reason) Then
+            MBT_CreateAcceptanceReport = path
+            Exit Function
+        End If
+        failures = failures & " " & reason
+        If Len(mbtCleanupFault) > 0 Then Exit For
+    Next candidate
+    Err.Raise MB_ERR + 721, , "Cannot create a native test report." & failures
+End Function
+
+Private Function MBT_TryReport(ByVal fso As Object, ByVal parent As String, _
+                               ByRef path As String, ByRef reason As String) As Boolean
+    Dim base As String, runFolder As String, candidate As String, stream As Object
+    Dim n As Long, errorText As String
+    On Error GoTo Failed
+    path = "": reason = ""
+    If Len(parent) = 0 Then reason = "An environment path is unavailable.": Exit Function
+    parent = MBH_NormalizePath(parent)
+    MBP_NoReparse parent, fso
+    If Not fso.FolderExists(parent) Then Err.Raise MB_ERR + 721, , "Report parent is unavailable: " & parent
+    base = MBH_JoinPath(parent, "OutlookMailBackupValidation")
+    MBP_NoReparse base, fso
+    MBH_EnsureDirectory base
+    runFolder = MBH_JoinPath(base, MBC_FileStamp(Now) & "_" & fso.GetTempName)
+    ' Exclusive creation preserves all previous reports, including the failed one.
+    fso.CreateFolder runFolder
+    MBP_NoReparse runFolder, fso
+    candidate = MBH_JoinPath(runFolder, "acceptance.tsv")
+    Set stream = fso.CreateTextFile(candidate, False, True)
+    stream.WriteLine "schema" & vbTab & "module_version" & vbTab & "local_time" & vbTab & _
+                     "check" & vbTab & "status" & vbTab & "seconds" & vbTab & "detail"
+    stream.Close: Set stream = Nothing
+    path = candidate: MBT_TryReport = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Report stream close", Err.Number, Err.Description
+    On Error GoTo 0
+    reason = CStr(n) & " - " & errorText
+End Function
+
+Private Function MBT_WriteStartupNote(ByVal reportPath As String, ByVal contents As String) As String
+    Dim fso As Object, path As String, stream As Object
+    On Error GoTo Unavailable
+    If Len(reportPath) = 0 Then Exit Function
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    path = MBH_JoinPath(CStr(fso.GetParentFolderName(reportPath)), "startup.txt")
+    MBP_NoReparse path, fso
+    Set stream = fso.CreateTextFile(path, False, True)
+    stream.Write "Outlook Mail Backup " & MB_VERSION & vbCrLf & contents
+    stream.Close: Set stream = Nothing
+    MBT_WriteStartupNote = path
+    Exit Function
+Unavailable:
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Startup note stream close", Err.Number, Err.Description
+    On Error GoTo 0
+End Function
+
+Private Function MBT_OpenDiagnostic(ByVal path As String) As Boolean
+    Dim fso As Object, program As String, task As Double
+    On Error GoTo Unavailable
+    If Len(path) = 0 Then Exit Function
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    path = MBH_NormalizePath(path)
+    MBP_NoReparse path, fso
+    If Not fso.FileExists(path) Then Exit Function
+    program = MBH_JoinPath(CStr(fso.GetSpecialFolder(1).Path), "notepad.exe")
+    If Not fso.FileExists(program) Then Exit Function
+    ' Explicit text viewer; no cmd.exe, file association or executable report.
+    task = Shell(Chr$(34) & program & Chr$(34) & " " & Chr$(34) & path & Chr$(34), vbNormalFocus)
+    MBT_OpenDiagnostic = (task <> 0)
+Unavailable:
+End Function
+
+Private Sub MBT_ShowStartupFailure(ByVal reportPath As String, ByVal detail As String)
+    Dim path As String, shown As String, opened As Boolean
+    path = mbtStartupNote
+    If Len(path) = 0 Then path = reportPath
+    opened = MBT_OpenDiagnostic(path)
+    shown = Left$(detail, 650)
+    If Len(detail) > 650 Then shown = shown & vbCrLf & "Full details are in the report."
+    If opened Then shown = shown & vbCrLf & "The report is open in Notepad. A screenshot is enough."
+    If Len(path) > 0 Then shown = shown & vbCrLf & "Report: " & path
+    MsgBox shown, vbExclamation, "Mail Backup " & MB_VERSION
+End Sub
+
+
 ' ======================= Native acceptance report ===========================
 ' Called by the single public command, once per VBA session after a successful
 ' result. Uses only newly owned local test files and unsent, undisplayed messages.
 ' No MailItem.Save, Send, real archive migration or original-mail reads occur.
-Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detail As String) As Boolean
-    Dim fso As Object, stream As Object, base As String, runFolder As String
+Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detail As String, _
+                                         Optional ByVal attempt As Long = 1) As Boolean
+    Dim fso As Object, stream As Object, runFolder As String
     Dim testDetail As String, envOK As Boolean, helperOK As Boolean, moveOK As Boolean
     Dim plainOK As Boolean, htmlOK As Boolean, propertyOK As Boolean, localeOK As Boolean
-    Dim recoveryOK As Boolean, relativeOK As Boolean
+    Dim recoveryOK As Boolean, relativeOK As Boolean, cleanupOK As Boolean, cleanupDetail As String
     Dim started As Double, failures As Long, savedCalendar As Long, calendarEntered As Boolean
     Dim n As Long, errorText As String, ownsBusy As Boolean
     reportPath = "": detail = ""
@@ -951,23 +1238,20 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
         detail = "A backup or native test is already running."
         Exit Function
     End If
+    If Not MBT_ResourcesClean(detail) Then
+        detail = "CLEANUP_PENDING: " & detail
+        Exit Function
+    End If
     On Error GoTo Failed
     gBusy = True: ownsBusy = True
     MBC_EnterGregorian savedCalendar, calendarEntered
     MB_Reset
     Set fso = CreateObject("Scripting.FileSystemObject")
-    base = Environ$("LOCALAPPDATA")
-    If Len(base) = 0 Then Err.Raise MB_ERR + 700, , "LOCALAPPDATA is unavailable for the native test report."
-    base = MBH_JoinPath(MBH_NormalizePath(base), "OutlookMailBackupValidation")
-    MBH_EnsureDirectory base
-    runFolder = MBH_JoinPath(base, MBC_FileStamp(Now) & "_" & fso.GetTempName)
-    ' CreateFolder must claim a new directory. Never reuse/delete a prior report.
-    fso.CreateFolder runFolder
-    reportPath = MBH_JoinPath(runFolder, "acceptance.tsv")
-    Set stream = fso.CreateTextFile(reportPath, False, True)
-    stream.WriteLine "schema" & vbTab & "module_version" & vbTab & "local_time" & vbTab & _
-                     "check" & vbTab & "status" & vbTab & "seconds" & vbTab & "detail"
-    stream.Close: Set stream = Nothing
+    reportPath = MBT_CreateAcceptanceReport(fso, attempt)
+    runFolder = CStr(fso.GetParentFolderName(reportPath))
+    mbtScratchParent = MBT_SelectTestParent(fso, attempt)
+    MBT_ReportRow reportPath, "DISPOSABLE_WORKSPACE", "PASS", 0, _
+                  "Attempt=" & CStr(attempt) & "; new test files below " & mbtScratchParent
 
     started = Timer
     envOK = MBT_Environment(testDetail)
@@ -1053,7 +1337,10 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
     MBT_ReportRow reportPath, "REAL_ARCHIVE_COMPATIBILITY", "NOT_RUN", 0, "No original mail or archive files were used by these tests."
     MBT_ReportRow reportPath, "SPECIAL_ATTACHMENTS_AND_ALL_MAPI", "NOT_RUN", 0, "Synthetic tests cover ordinary by-value attachments only."
     MBT_ReportRow reportPath, "100000_ITEM_PERFORMANCE", "NOT_RUN", 0, "No large real-account workload was executed."
-    MBT_RunAcceptanceReport = envOK And helperOK And localeOK And relativeOK And propertyOK And moveOK And recoveryOK And plainOK And htmlOK And Not gCancel
+    cleanupOK = MBT_FinishNativeAttempt(cleanupDetail)
+    MBT_ReportRow reportPath, "CLEAN_RESOURCES", MBT_PassFail(cleanupOK), 0, cleanupDetail
+    If Not cleanupOK Then failures = failures + 1
+    MBT_RunAcceptanceReport = envOK And helperOK And localeOK And relativeOK And propertyOK And moveOK And recoveryOK And plainOK And htmlOK And cleanupOK And Not gCancel
     detail = "Built-in native checks: " & MBT_PassFail(MBT_RunAcceptanceReport) & _
              "; failed checks=" & CStr(failures) & ". Four operational gates remain NOT_RUN."
     MBT_ReportRow reportPath, "RUN_RESULT", MBT_PassFail(MBT_RunAcceptanceReport), 0, detail
@@ -1062,13 +1349,18 @@ Private Function MBT_RunAcceptanceReport(ByRef reportPath As String, ByRef detai
     Exit Function
 Failed:
     n = Err.Number: errorText = Err.Description
+    mbtFailureLines = mbtFailureLines & "NATIVE_RUNNER: " & CStr(n) & " - " & errorText & vbCrLf
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Acceptance stream close", Err.Number, Err.Description
     If Len(reportPath) > 0 Then
         MBT_ReportRow reportPath, "RUN_RESULT", "FAIL", 0, "Test runner error " & CStr(n) & ": " & errorText
     End If
-    MBH_ReleaseCrypto
+    cleanupOK = MBT_FinishNativeAttempt(cleanupDetail)
+    Err.Clear
     MBC_LeaveGregorian savedCalendar, calendarEntered
+    MBT_NoteCleanup "Calendar restore", Err.Number, Err.Description
     On Error GoTo 0
     If ownsBusy Then gBusy = False
     detail = "Native acceptance could not complete: " & CStr(n) & " - " & errorText
@@ -1102,16 +1394,20 @@ Private Sub MBT_ReportRow(ByVal path As String, ByVal check As String, ByVal sta
     If status <> "PASS" And status <> "FAIL" And status <> "NOT_RUN" Then
         Err.Raise MB_ERR + 701, , "Unknown acceptance status."
     End If
+    If status = "FAIL" And check <> "RUN_RESULT" Then mbtFailureLines = mbtFailureLines & check & ": " & detail & vbCrLf
     Set fso = CreateObject("Scripting.FileSystemObject")
+    MBP_NoReparse path, fso
     Set stream = fso.OpenTextFile(path, 8, False, -1)
     stream.WriteLine MB_EncodeFields(Array(MBT_REPORT_SCHEMA, MB_VERSION, MB_Stamp(Now), check, status, _
                       Trim$(Str$(seconds)), detail))
-    stream.Close
+    stream.Close: Set stream = Nothing
     Exit Sub
 Failed:
     n = Err.Number: errorText = Err.Description
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Acceptance row close", Err.Number, Err.Description
     On Error GoTo 0
     Err.Raise n, "MBT_ReportRow", errorText
 End Sub
@@ -1150,7 +1446,7 @@ Private Function MBT_SyntheticMsgSelfTest(ByVal bodyFormat As Long, ByRef detail
     gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
     Set gFSO = CreateObject("Scripting.FileSystemObject")
     Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
-    testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBMSG_" & gFSO.GetTempName)
+    testBase = MBH_JoinPath(MBT_TestParent(gFSO), "MBMSG_" & gFSO.GetTempName)
     gFSO.CreateFolder testBase: owned = True
     gRoot = testBase: gBaseRoot = testBase: gRunDir = testBase
     gRunId = "synthetic_msg"
@@ -1216,16 +1512,22 @@ Failed:
     n = Err.Number: errorText = Err.Description
 CleanUp:
     On Error Resume Next
+    Err.Clear
     MBH_CloseGuard readGuard
+    MBT_NoteCleanup "Synthetic file guard close", Err.Number, Err.Description
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Synthetic stream close", Err.Number, Err.Description
     Set attachment = Nothing
     Err.Clear
     If Not reopened Is Nothing Then reopened.Close olDiscard
     If Err.Number <> 0 Then cleanup = " Reopened MSG close: " & Err.Description
+    MBT_NoteCleanup "Synthetic reopened MSG close", Err.Number, Err.Description
     Set reopened = Nothing: Set obj = Nothing
     Err.Clear
     If Not source Is Nothing Then source.Close olDiscard
     If Err.Number <> 0 Then cleanup = cleanup & " Synthetic source close: " & Err.Description
+    MBT_NoteCleanup "Synthetic source close", Err.Number, Err.Description
     Set source = Nothing
     If Len(stagePath) > 0 Then
         Err.Clear
@@ -1235,6 +1537,7 @@ CleanUp:
     Err.Clear
     MBH_ReleaseCrypto
     If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    MBT_NoteCleanup "Synthetic crypto cleanup", Err.Number, Err.Description
     If owned Then
         Err.Clear
         gFSO.DeleteFolder testBase, True
@@ -2953,18 +3256,18 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
         Err.Raise MB_ERR + 66, , "Calendar-month boundary test failed."
     End If
     Set fso = CreateObject("Scripting.FileSystemObject")
-    testDir = MBH_JoinPath(fso.GetSpecialFolder(2).Path, "MBTest_" & fso.GetTempName)
+    testDir = MBH_JoinPath(MBT_TestParent(fso), "MBTest_" & fso.GetTempName)
     ' Claim a NEW directory; never clean up an existing directory on collision.
     fso.CreateFolder testDir
     ownsTestDir = True
     finalPath = MBH_JoinPath(testDir, "test.txt")
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "first": ts.Close
+    ts.Write "first": ts.Close: Set ts = Nothing
     MBH_CommitStage stagePath, finalPath
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "second": ts.Close
+    ts.Write "second": ts.Close: Set ts = Nothing
     On Error Resume Next
     Err.Clear
     MBH_CommitStage stagePath, finalPath
@@ -2973,7 +3276,7 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
     On Error GoTo Failed
     If Not rejected Then Err.Raise MB_ERR + 67, , "Existing final file was overwritten."
     Set ts = fso.OpenTextFile(finalPath, 1, False, 0)
-    s = ts.ReadAll: ts.Close
+    s = ts.ReadAll: ts.Close: Set ts = Nothing
     If s <> "first" Then Err.Raise MB_ERR + 68, , "Existing bytes were changed."
     MBH_DeleteStage stagePath: stagePath = ""
     fso.DeleteFolder testDir, True: testDir = "": ownsTestDir = False
@@ -2985,10 +3288,14 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
 Failed:
     errNo = Err.Number: errText = Err.Description
     On Error Resume Next
+    Err.Clear
     If Not ts Is Nothing Then ts.Close
+    MBT_NoteCleanup "Helper stream close", Err.Number, Err.Description
     If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
     If ownsTestDir Then fso.DeleteFolder testDir, True
+    Err.Clear
     MBH_ReleaseCrypto
+    MBT_NoteCleanup "Helper crypto cleanup", Err.Number, Err.Description
     On Error GoTo 0
     detail = "FAIL: " & CStr(errNo) & " - " & errText
 End Function
@@ -3934,15 +4241,44 @@ Private Function MBL_ReadProperties(ByVal item As Object, ByVal names As Variant
     MBL_ReadProperties = values
 End Function
 
+Private Function MBL_ErrorHResult(ByVal value As Variant) As Long
+    Dim localValue As Variant, storedType As Integer, result As Long
+    If VarType(value) <> vbError Then Err.Raise MB_ERR + 177, "MBL_ErrorHResult", _
+        "A scalar MAPI Error variant is required."
+    localValue = value
+    ' Windows VARIANT: four 16-bit header fields, then the value union at +8.
+    ' SCODE remains 4 bytes on both 32-bit and 64-bit Office. Read the local
+    ' copied scalar only; reject BYREF/array tags instead of following pointers.
+    ' CLng(Error) may map implementation-defined errors to VBA error numbers;
+    ' raw SCODE preserves the full HRESULT/facility and cannot alias low bits.
+    MBL_CopyErrorMemory VarPtr(storedType), VarPtr(localValue), 2
+    If storedType <> vbError Then Err.Raise MB_ERR + 177, "MBL_ErrorHResult", _
+        "Unsupported MAPI Error variant storage."
+    MBL_CopyErrorMemory VarPtr(result), VarPtr(localValue) + 8, 4
+    MBL_ErrorHResult = result
+End Function
+
+Private Function MBL_HResultError(ByVal code As Long) As Variant
+    Dim value As Variant
+    ' CVErr cannot construct negative HRESULTs (MS-VBAL 6.1.2.3.1.14).
+    ' Initialize a genuine scalar Error, then change exactly its 4-byte SCODE.
+    ' Never copy a whole VARIANT or alter its type/reserved/pointer fields.
+    value = CVErr(0)
+    MBL_CopyErrorMemory VarPtr(value) + 8, VarPtr(code), 4
+    If MBL_ErrorHResult(value) <> code Then Err.Raise MB_ERR + 177, "MBL_HResultError", _
+        "MAPI Error variant did not retain its exact HRESULT."
+    MBL_HResultError = value
+End Function
+
 Private Function MBL_MissingProperty(ByVal value As Variant, ByVal label As String) As Boolean
+    Dim code As Long
     If Not IsError(value) Then Exit Function
-    ' CStr(Error) preserves the error number; compare two Error variants after
-    ' conversion so neither a localized description nor a Boolean Error is used.
-    If CStr(value) = CStr(CVErr(MBL_MAPI_NOT_FOUND)) Then
+    code = MBL_ErrorHResult(value)
+    If code = MBL_MAPI_NOT_FOUND Then
         MBL_MissingProperty = True
     Else
         Err.Raise MB_ERR + 178, "MBL_MissingProperty", _
-                  "Cannot verify " & label & ": " & CStr(value)
+                  "Cannot verify " & label & ": HRESULT 0x" & Right$("00000000" & Hex$(code), 8)
     End If
 End Function
 
@@ -3988,11 +4324,23 @@ Private Sub MBL_CompareAttachmentProperties(ByVal source As Outlook.Attachment, 
 End Sub
 
 Private Function MBL_PropertySelfTest() As Boolean
-    Dim absent As Variant, denied As Variant
-    absent = CVErr(MBL_MAPI_NOT_FOUND)
-    denied = CVErr(&H80070005)
+    Dim absent As Variant, denied As Variant, code As Variant, sample As Variant
+    absent = MBL_HResultError(MBL_MAPI_NOT_FOUND)
+    denied = MBL_HResultError(&H80070005)
+    If Not IsError(absent) Or Not IsError(denied) Then Exit Function
+    If MBL_ErrorHResult(absent) <> MBL_MAPI_NOT_FOUND Then Exit Function
+    If MBL_ErrorHResult(denied) <> &H80070005 Then Exit Function
+    For Each code In Array(0&, 65535&, &H7FFFFFFF, &H80000000, &HFFFFFFFF)
+        sample = MBL_HResultError(CLng(code))
+        If MBL_ErrorHResult(sample) <> CLng(code) Then Exit Function
+    Next code
     If Not MBL_MissingProperty(absent, "test") Then Exit Function
+    ' The low 16 bits or another HRESULT facility do not prove absence.
+    If Not MBL_TestRejectProperty(CVErr(271), "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(MBL_HResultError(&H8007010F), "ansi") Then Exit Function
     If MBL_MissingProperty("", "test") Then Exit Function
+    If MBL_MissingProperty(MBL_MAPI_NOT_FOUND, "test") Then Exit Function
+    If MBL_MissingProperty(False, "test") Then Exit Function
     If MBL_OptionalText("unicode", "ansi", "test") <> "unicode" Then Exit Function
     If MBL_OptionalText(absent, "ansi", "test") <> "ansi" Then Exit Function
     If MBL_OptionalText(absent, absent, "test") <> "" Then Exit Function
@@ -6370,7 +6718,7 @@ Private Function MBT_YearMonthSelfTest(ByRef resultDetail As String) As Boolean
     gClockStart = MB_Clock(): gRunStart = Now: gUntil = gRunStart
     Set gFSO = CreateObject("Scripting.FileSystemObject")
     Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
-    testBase = MBH_JoinPath(gFSO.GetSpecialFolder(2).Path, "MBYM_" & gFSO.GetTempName)
+    testBase = MBH_JoinPath(MBT_TestParent(gFSO), "MBYM_" & gFSO.GetTempName)
     gFSO.CreateFolder testBase
     owned = True
     gRoot = MBH_JoinPath(testBase, MBP_MANAGED_LEAF): gBaseRoot = gRoot
@@ -6477,15 +6825,21 @@ Failed:
     n = Err.Number: detail = Err.Description
 CleanUp:
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Year/month stream close", Err.Number, Err.Description
+    Err.Clear
     If Not gEvents Is Nothing Then gEvents.Close
+    MBT_NoteCleanup "Year/month event close", Err.Number, Err.Description
     Set gEvents = Nothing
     Err.Clear
     MBM_ReleaseAccountLocks
     If Err.Number <> 0 Then cleanup = " Account lock cleanup: " & Err.Description
+    MBT_NoteCleanup "Year/month account lock cleanup", Err.Number, Err.Description
     Err.Clear
     MBH_ReleaseCrypto
     If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    MBT_NoteCleanup "Year/month crypto cleanup", Err.Number, Err.Description
     If owned Then
         Err.Clear
         gFSO.DeleteFolder testBase, True
@@ -7640,7 +7994,7 @@ Private Function MBH_HashSelfTest() As Boolean
     If MBH_HashText(vbNullString) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty UTF-16 hash mismatch."
     If MBH_HashText("abc") <> UTF16_ABC_SHA Then MBH_Fail "HashSelfTest", "UTF-16 abc hash mismatch."
     Set fso = MBH_FileSystem()
-    finalPath = MBH_JoinPath(CStr(fso.GetSpecialFolder(2).Path), "mailbackup_hash_selftest.bin")
+    finalPath = MBH_JoinPath(MBT_TestParent(fso), "mailbackup_hash_selftest.bin")
     stagePath = MBH_NewStagePath(finalPath)
     If MBH_HashFile(stagePath) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty file hash mismatch."
     bytes(0) = 97: bytes(1) = 98: bytes(2) = 99
@@ -12218,7 +12572,7 @@ Private Function MBS_NativeRecoverySelfTest(ByRef detail As String) As Boolean
     Set fso = CreateObject("Scripting.FileSystemObject"): Set gFSO = fso
     Set gDirs = CreateObject("Scripting.Dictionary"): gDirs.CompareMode = vbTextCompare
     Set gIndex = CreateObject("Scripting.Dictionary"): gIndex.CompareMode = vbBinaryCompare
-    tempRoot = MBH_NormalizePath(CStr(fso.GetSpecialFolder(2).Path))
+    tempRoot = MBT_TestParent(fso)
     testBase = MBH_JoinPath(tempRoot, "MBREC_" & fso.GetTempName)
     ' CreateFolder claims a NEW directory. Never reuse or clean an older test.
     fso.CreateFolder testBase: owned = True
@@ -12432,15 +12786,19 @@ Failed:
     n = Err.Number: errorText = Err.Description
 Cleanup:
     On Error Resume Next
+    Err.Clear
     If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Recovery stream close", Err.Number, Err.Description
     Set stream = Nothing
     If accountLocked Then
         Err.Clear: MBM_ReleaseAccountLocks
         If Err.Number <> 0 Then cleanup = cleanup & " Account lock: " & Err.Description
+        MBT_NoteCleanup "Recovery account lock cleanup", Err.Number, Err.Description
     End If
     If rootLocked Then
         Err.Clear: MBH_ReleaseRunLock
         If Err.Number <> 0 Then cleanup = cleanup & " Root lock: " & Err.Description
+        MBT_NoteCleanup "Recovery root lock cleanup", Err.Number, Err.Description
     End If
     On Error GoTo 0
     ' On any test failure retain every disposable byte for diagnosis. Cleanup
@@ -12462,6 +12820,7 @@ Cleanup:
     On Error Resume Next
     Err.Clear: MBH_ReleaseCrypto
     If Err.Number <> 0 Then cleanup = cleanup & " Crypto cleanup: " & Err.Description
+    MBT_NoteCleanup "Recovery crypto cleanup", Err.Number, Err.Description
     If initialized Then
         gStageEnabled = False: gWindowCommitted = False
         Set gDirs = Nothing: Set gIndex = Nothing: Set gFSO = Nothing
@@ -13409,7 +13768,7 @@ End Sub
 Private Function MBE_CategorySelfTest() As Boolean
     Dim first As Object, second As Object, missing As Variant, unicodeName As String
     On Error GoTo Failed
-    missing = CVErr(MBL_MAPI_NOT_FOUND)
+    missing = MBL_HResultError(MBL_MAPI_NOT_FOUND)
     Set first = MBE_CategorySet(missing, "")
     Set second = MBE_CategorySet(Array(), "")
     If Not MBE_SameCategorySets(first, second) Then Exit Function
@@ -13426,7 +13785,7 @@ Private Function MBE_CategorySelfTest() As Boolean
     If Not MBE_CategoryRejects(Array(123), "123") Then Exit Function
     If Not MBE_CategoryRejects(Array(""), "") Then Exit Function
     If Not MBE_CategoryRejects(Array("present"), "") Then Exit Function
-    If Not MBE_CategoryRejects(CVErr(&H80070005), "") Then Exit Function
+    If Not MBE_CategoryRejects(MBL_HResultError(&H80070005), "") Then Exit Function
     MBE_CategorySelfTest = True
 Failed:
 End Function

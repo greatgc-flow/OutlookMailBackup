@@ -349,15 +349,44 @@ Private Function MBL_ReadProperties(ByVal item As Object, ByVal names As Variant
     MBL_ReadProperties = values
 End Function
 
+Private Function MBL_ErrorHResult(ByVal value As Variant) As Long
+    Dim localValue As Variant, storedType As Integer, result As Long
+    If VarType(value) <> vbError Then Err.Raise MB_ERR + 177, "MBL_ErrorHResult", _
+        "A scalar MAPI Error variant is required."
+    localValue = value
+    ' Windows VARIANT: four 16-bit header fields, then the value union at +8.
+    ' SCODE remains 4 bytes on both 32-bit and 64-bit Office. Read the local
+    ' copied scalar only; reject BYREF/array tags instead of following pointers.
+    ' CLng(Error) may map implementation-defined errors to VBA error numbers;
+    ' raw SCODE preserves the full HRESULT/facility and cannot alias low bits.
+    MBL_CopyErrorMemory VarPtr(storedType), VarPtr(localValue), 2
+    If storedType <> vbError Then Err.Raise MB_ERR + 177, "MBL_ErrorHResult", _
+        "Unsupported MAPI Error variant storage."
+    MBL_CopyErrorMemory VarPtr(result), VarPtr(localValue) + 8, 4
+    MBL_ErrorHResult = result
+End Function
+
+Private Function MBL_HResultError(ByVal code As Long) As Variant
+    Dim value As Variant
+    ' CVErr cannot construct negative HRESULTs (MS-VBAL 6.1.2.3.1.14).
+    ' Initialize a genuine scalar Error, then change exactly its 4-byte SCODE.
+    ' Never copy a whole VARIANT or alter its type/reserved/pointer fields.
+    value = CVErr(0)
+    MBL_CopyErrorMemory VarPtr(value) + 8, VarPtr(code), 4
+    If MBL_ErrorHResult(value) <> code Then Err.Raise MB_ERR + 177, "MBL_HResultError", _
+        "MAPI Error variant did not retain its exact HRESULT."
+    MBL_HResultError = value
+End Function
+
 Private Function MBL_MissingProperty(ByVal value As Variant, ByVal label As String) As Boolean
+    Dim code As Long
     If Not IsError(value) Then Exit Function
-    ' CStr(Error) preserves the error number; compare two Error variants after
-    ' conversion so neither a localized description nor a Boolean Error is used.
-    If CStr(value) = CStr(CVErr(MBL_MAPI_NOT_FOUND)) Then
+    code = MBL_ErrorHResult(value)
+    If code = MBL_MAPI_NOT_FOUND Then
         MBL_MissingProperty = True
     Else
         Err.Raise MB_ERR + 178, "MBL_MissingProperty", _
-                  "Cannot verify " & label & ": " & CStr(value)
+                  "Cannot verify " & label & ": HRESULT 0x" & Right$("00000000" & Hex$(code), 8)
     End If
 End Function
 
@@ -403,11 +432,23 @@ Private Sub MBL_CompareAttachmentProperties(ByVal source As Outlook.Attachment, 
 End Sub
 
 Private Function MBL_PropertySelfTest() As Boolean
-    Dim absent As Variant, denied As Variant
-    absent = CVErr(MBL_MAPI_NOT_FOUND)
-    denied = CVErr(&H80070005)
+    Dim absent As Variant, denied As Variant, code As Variant, sample As Variant
+    absent = MBL_HResultError(MBL_MAPI_NOT_FOUND)
+    denied = MBL_HResultError(&H80070005)
+    If Not IsError(absent) Or Not IsError(denied) Then Exit Function
+    If MBL_ErrorHResult(absent) <> MBL_MAPI_NOT_FOUND Then Exit Function
+    If MBL_ErrorHResult(denied) <> &H80070005 Then Exit Function
+    For Each code In Array(0&, 65535&, &H7FFFFFFF, &H80000000, &HFFFFFFFF)
+        sample = MBL_HResultError(CLng(code))
+        If MBL_ErrorHResult(sample) <> CLng(code) Then Exit Function
+    Next code
     If Not MBL_MissingProperty(absent, "test") Then Exit Function
+    ' The low 16 bits or another HRESULT facility do not prove absence.
+    If Not MBL_TestRejectProperty(CVErr(271), "ansi") Then Exit Function
+    If Not MBL_TestRejectProperty(MBL_HResultError(&H8007010F), "ansi") Then Exit Function
     If MBL_MissingProperty("", "test") Then Exit Function
+    If MBL_MissingProperty(MBL_MAPI_NOT_FOUND, "test") Then Exit Function
+    If MBL_MissingProperty(False, "test") Then Exit Function
     If MBL_OptionalText("unicode", "ansi", "test") <> "unicode" Then Exit Function
     If MBL_OptionalText(absent, "ansi", "test") <> "ansi" Then Exit Function
     If MBL_OptionalText(absent, absent, "test") <> "" Then Exit Function

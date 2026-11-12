@@ -1698,18 +1698,18 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
         Err.Raise MB_ERR + 66, , "Calendar-month boundary test failed."
     End If
     Set fso = CreateObject("Scripting.FileSystemObject")
-    testDir = MBH_JoinPath(fso.GetSpecialFolder(2).Path, "MBTest_" & fso.GetTempName)
+    testDir = MBH_JoinPath(MBT_TestParent(fso), "MBTest_" & fso.GetTempName)
     ' Claim a NEW directory; never clean up an existing directory on collision.
     fso.CreateFolder testDir
     ownsTestDir = True
     finalPath = MBH_JoinPath(testDir, "test.txt")
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "first": ts.Close
+    ts.Write "first": ts.Close: Set ts = Nothing
     MBH_CommitStage stagePath, finalPath
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "second": ts.Close
+    ts.Write "second": ts.Close: Set ts = Nothing
     On Error Resume Next
     Err.Clear
     MBH_CommitStage stagePath, finalPath
@@ -1718,7 +1718,7 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
     On Error GoTo Failed
     If Not rejected Then Err.Raise MB_ERR + 67, , "Existing final file was overwritten."
     Set ts = fso.OpenTextFile(finalPath, 1, False, 0)
-    s = ts.ReadAll: ts.Close
+    s = ts.ReadAll: ts.Close: Set ts = Nothing
     If s <> "first" Then Err.Raise MB_ERR + 68, , "Existing bytes were changed."
     MBH_DeleteStage stagePath: stagePath = ""
     fso.DeleteFolder testDir, True: testDir = "": ownsTestDir = False
@@ -1730,10 +1730,14 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
 Failed:
     errNo = Err.Number: errText = Err.Description
     On Error Resume Next
+    Err.Clear
     If Not ts Is Nothing Then ts.Close
+    MBT_NoteCleanup "Helper stream close", Err.Number, Err.Description
     If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
     If ownsTestDir Then fso.DeleteFolder testDir, True
+    Err.Clear
     MBH_ReleaseCrypto
+    MBT_NoteCleanup "Helper crypto cleanup", Err.Number, Err.Description
     On Error GoTo 0
     detail = "FAIL: " & CStr(errNo) & " - " & errText
 End Function

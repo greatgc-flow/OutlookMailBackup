@@ -99,7 +99,7 @@ End Sub
 Private Function MBE_CategorySelfTest() As Boolean
     Dim first As Object, second As Object, missing As Variant, unicodeName As String
     On Error GoTo Failed
-    missing = CVErr(MBL_MAPI_NOT_FOUND)
+    missing = MBL_HResultError(MBL_MAPI_NOT_FOUND)
     Set first = MBE_CategorySet(missing, "")
     Set second = MBE_CategorySet(Array(), "")
     If Not MBE_SameCategorySets(first, second) Then Exit Function
@@ -116,7 +116,7 @@ Private Function MBE_CategorySelfTest() As Boolean
     If Not MBE_CategoryRejects(Array(123), "123") Then Exit Function
     If Not MBE_CategoryRejects(Array(""), "") Then Exit Function
     If Not MBE_CategoryRejects(Array("present"), "") Then Exit Function
-    If Not MBE_CategoryRejects(CVErr(&H80070005), "") Then Exit Function
+    If Not MBE_CategoryRejects(MBL_HResultError(&H80070005), "") Then Exit Function
     MBE_CategorySelfTest = True
 Failed:
 End Function

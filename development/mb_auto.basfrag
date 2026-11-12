@@ -10,12 +10,17 @@ Public Sub MB_01_RunBackup()
     End If
     On Error GoTo Failed
     If Not nativeTestsPassed Then
-        If Not MBT_RunAcceptanceReport(nativeReport, detail) Then
-            MsgBox "Environment check did not pass. No archive workflow was started." & _
-                   vbCrLf & detail & vbCrLf & "Report: " & nativeReport, vbExclamation, "Mail Backup"
+        If Not MBT_RunStartupChecks(nativeReport, detail) Then
+            MBT_ShowStartupFailure nativeReport, detail
             Exit Sub
         End If
         nativeTestsPassed = True
+    End If
+    ' A prior successful self-test does not authorize resetting live resources
+    ' left by a later backup failure in the same VBA session.
+    If Not MBT_ResourcesClean(detail) Then
+        MsgBox detail, vbExclamation, "Mail Backup " & MB_VERSION
+        Exit Sub
     End If
     gAutoTestReport = nativeReport
     MB_Run "AUTO", False, True, False
