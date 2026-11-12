@@ -193,7 +193,10 @@ Private Function MBR_ParseIndexFields(ByVal line As String) As Variant
     ' Establish whether the framing IS checked before interpreting a schema.
     ' An unknown but valid future schema is not a disposable truncated row.
     f = MB_ReadCheckedLine(line, count)
-    If CStr(f(0)) = "MBS3" And count = 17 Then
+    If CStr(f(0)) = "MBS4" And count = 17 Then
+        If CStr(f(1)) <> "N" And CStr(f(1)) <> "T" And CStr(f(1)) <> "R" And CStr(f(1)) <> "L" Then _
+            Err.Raise MB_ERR + 1154, , "Unknown checked MBS4 record kind requires review."
+    ElseIf CStr(f(0)) = "MBS3" And count = 17 Then
         If CStr(f(1)) <> "N" And CStr(f(1)) <> "T" And CStr(f(1)) <> "R" Then _
             Err.Raise MB_ERR + 1154, , "Unknown checked MBS3 record kind requires review."
     ElseIf CStr(f(0)) = "MBS2" And count = 16 Then
@@ -238,7 +241,7 @@ End Function
 Private Sub MBR_MergeJournal(ByVal priorRaw As String, ByVal storeId As String)
     Dim oldIndex As Object, oldExternal As Object, oldMeta As Object, oldStores As Object
     Dim oldBindings As Object, oldSources As Object, oldOwners As Object
-    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object
+    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object, oldLookup As Object
     Dim inputStream As Object, outputStream As Object, baseRows As New Collection, paths(0 To 1) As String
     Dim source As String, finalPath As String, stage As String, line As String, reason As String, rowHash As String
     Dim pass As Long, added As Long, rejected As Long, cached As Boolean, n As Long, detail As String
@@ -254,6 +257,7 @@ Private Sub MBR_MergeJournal(ByVal priorRaw As String, ByVal storeId As String)
     Set oldIndex = gIndex: Set oldExternal = gExternalRoots: Set oldMeta = gRecordMeta: Set oldStores = gStoreTokens
     Set oldBindings = gLegacyBindings: Set oldSources = gLegacySources: Set oldOwners = gLegacyOwners
     Set oldBuckets = gIdentityBuckets: Set oldSeen = gIdentitySeen: Set oldKnown = gWindowKnown
+    Set oldLookup = gIdentityLookupState
     Set oldHeads = gRevisionHeads: cached = True
     Set gIndex = CreateObject("Scripting.Dictionary")
     Set gExternalRoots = CreateObject("Scripting.Dictionary")
@@ -328,6 +332,7 @@ Cleanup:
         Set gIndex = oldIndex: Set gExternalRoots = oldExternal: Set gRecordMeta = oldMeta: Set gStoreTokens = oldStores
         Set gLegacyBindings = oldBindings: Set gLegacySources = oldSources: Set gLegacyOwners = oldOwners
         Set gIdentityBuckets = oldBuckets: Set gIdentitySeen = oldSeen: Set gWindowKnown = oldKnown
+        Set gIdentityLookupState = oldLookup
         Set gRevisionHeads = oldHeads
     End If
     On Error GoTo 0

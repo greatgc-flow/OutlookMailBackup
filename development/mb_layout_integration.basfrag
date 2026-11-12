@@ -34,6 +34,7 @@ End Function
 Private Sub MBX_CacheRecord(ByVal f As Variant)
     Dim key As String, kind As String, p As String, bytes As Double
     Dim reference As String, referenceFields As Variant, referenceMeta As Variant
+    f = MBX_ExpandIndexFields(f)
     kind = CStr(f(1)): key = MBX_IndexKey(kind, CStr(f(2)))
     bytes = MB_ByteCount(CStr(f(4)))
     If (kind = "M" Or kind = "N" Or kind = "L" Or kind = "R") And bytes <= 0 Then
@@ -42,6 +43,9 @@ Private Sub MBX_CacheRecord(ByVal f As Variant)
     If MB_SourceKey(CStr(f(7)), CStr(f(8))) <> CStr(f(6)) Then
         Err.Raise MB_ERR + 601, , "Index source identity mismatch."
     End If
+    ' Every reader/writer shares the immutable expected-byte contract. Normal
+    ' journal replay must not silently replace proof that recovery would reject.
+    MBR_RejectIndexConflict f
     Select Case kind
         Case "N", "T", "R"
             If UBound(f) <> 16 Or CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 602, , "Missing account root binding."

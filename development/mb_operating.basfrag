@@ -1,5 +1,7 @@
 ' ================= Operating metadata / restart recovery ===================
 Private Sub MBS_Reset()
+    Set gLayoutRoots = CreateObject("Scripting.Dictionary")
+    gLayoutRoots.CompareMode = vbTextCompare
     gStateRoot = "": gStateWasMissing = False: gStateMigrated = False
     gStageEnabled = False: Set gStageRecords = Nothing
     Set gStageExpected = CreateObject("Scripting.Dictionary")
@@ -12,7 +14,7 @@ End Sub
 Private Function MB_StatePath(Optional ByVal relative As String = "") As String
     Dim value As String, part As Variant
     If Len(gRoot) = 0 Then Err.Raise MB_ERR + 900, , "State root is not initialized."
-    value = MBH_JoinPath(gRoot, MBS_DATA_LEAF)
+    value = MBH_JoinPath(gRoot, MBS_DataLeaf(gRoot))
     If Len(relative) > 0 Then
         For Each part In Split(relative, "\")
             value = MBH_JoinPath(value, CStr(part))
@@ -20,6 +22,37 @@ Private Function MB_StatePath(Optional ByVal relative As String = "") As String
     End If
     MB_StatePath = value
 End Function
+
+Private Function MBS_IsModernLayout(ByVal managedRoot As String) As Boolean
+    MBS_IsModernLayout = (MBS_LayoutKind(managedRoot) = MBS_LAYOUT_MODERN)
+End Function
+
+Private Function MBS_DataLeaf(ByVal managedRoot As String) As String
+    ' A proven layout binding selects the whole namespace. The root name is
+    ' only the fresh-root default, never an override of prior layout evidence.
+    If MBS_IsModernLayout(managedRoot) Then
+        MBS_DataLeaf = MBS_DATA_LEAF
+    Else
+        ' Prior exactly owned custom roots also retain the historical layout.
+        MBS_DataLeaf = MBS_DATA_LEAF_LEGACY
+    End If
+End Function
+
+Private Sub MBS_ValidateLayout(ByVal managedRoot As String, ByVal fso As Object)
+    Dim other As String, expected As String, folder As Object, selected As String
+    selected = MBS_ResolveLayout(managedRoot, fso, True)
+    expected = MBS_DataLeaf(managedRoot)
+    If expected = MBS_DATA_LEAF Then other = MBS_DATA_LEAF_LEGACY Else other = MBS_DATA_LEAF
+    other = MBH_JoinPath(managedRoot, other)
+    MBP_NoReparse other, fso
+    If fso.FileExists(other) Then Err.Raise MB_ERR + 1210, , _
+        "A conflicting operating-directory name is occupied by a file: " & other
+    If fso.FolderExists(other) Then
+        Set folder = fso.GetFolder(other)
+        If folder.Files.Count > 0 Or folder.SubFolders.Count > 0 Then Err.Raise MB_ERR + 1210, , _
+            "Both directory layouts or a mixed legacy layout need review. Existing state was retained: " & other
+    End If
+End Sub
 
 Private Function MBS_Checked(ByVal values As Variant) As String
     Dim payload As String
@@ -105,7 +138,7 @@ Private Function MBS_CanRecoverOwner(ByVal rootPath As String, ByVal fso As Obje
     If Len(saved) > 0 Then
         If MBS_OwnerEvidenceRow(saved, rootPath, "STORE") Then GoTo Proven
     End If
-    For Each account In Array(MBS_DATA_LEAF, "_state")
+    For Each account In Array(MBS_DATA_LEAF, MBS_DATA_LEAF_LEGACY, "_state")
         marker = MBH_JoinPath(MBH_JoinPath(rootPath, CStr(account)), MBY_MAP_FILE)
         If MBS_OwnerEvidenceMap(marker, rootPath, fso) Then GoTo Proven
     Next account
@@ -114,26 +147,36 @@ Private Function MBS_CanRecoverOwner(ByVal rootPath As String, ByVal fso As Obje
     account = MBP_OwnerAccountHint(Application.Session.DefaultStore.StoreID, rootPath)
     If Len(CStr(account)) > 0 Then
         If MBS_OwnerEvidenceFile(MBH_JoinPath(CStr(account), MBY_ACCOUNT_MARKER), rootPath, "ACCOUNT", fso, CStr(account)) Then GoTo Proven
-        marker = MBH_JoinPath(MBH_JoinPath(CStr(account), MBR_FOLDER), MBR_OWNER_FILE)
-        If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, CStr(account)) Then GoTo Proven
+        If MBS_OwnerRecoveryEvidence(CStr(account), rootPath, fso) Then GoTo Proven
     End If
     parent = CStr(fso.GetParentFolderName(rootPath))
     If Len(parent) = 0 Or Not fso.FolderExists(parent) Then Exit Function
     If MBS_OwnerEvidenceFile(MBH_JoinPath(parent, MBY_ACCOUNT_MARKER), rootPath, "ACCOUNT", fso, parent) Then GoTo Proven
-    marker = MBH_JoinPath(MBH_JoinPath(parent, MBR_FOLDER), MBR_OWNER_FILE)
-    If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, parent) Then GoTo Proven
+    If MBS_OwnerRecoveryEvidence(parent, rootPath, fso) Then GoTo Proven
     For Each child In fso.GetFolder(parent).SubFolders
         If (CLng(child.Attributes) And 1024) = 0 Then
             account = CStr(child.Path)
             If MBS_OwnerEvidenceFile(MBH_JoinPath(CStr(account), MBY_ACCOUNT_MARKER), rootPath, "ACCOUNT", fso, CStr(account)) Then GoTo Proven
-            marker = MBH_JoinPath(MBH_JoinPath(CStr(account), MBR_FOLDER), MBR_OWNER_FILE)
-            If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, CStr(account)) Then GoTo Proven
+            If MBS_OwnerRecoveryEvidence(CStr(account), rootPath, fso) Then GoTo Proven
         End If
     Next child
     Exit Function
 Proven:
     MBS_CanRecoverOwner = True
 Unknown:
+End Function
+
+Private Function MBS_OwnerRecoveryEvidence(ByVal accountPath As String, ByVal rootPath As String, ByVal fso As Object) As Boolean
+    Dim leaf As Variant, marker As String
+    ' A broad sibling scan borrows only an exact checked root/account binding.
+    ' Conflicts in the actually selected account are checked by RecoveryRoot.
+    For Each leaf In Array(MBR_FOLDER, MBR_FOLDER_LEGACY)
+        marker = MBH_JoinPath(MBH_JoinPath(accountPath, CStr(leaf)), MBR_OWNER_FILE)
+        If MBS_OwnerEvidenceFile(marker, rootPath, "RECOVERY", fso, accountPath) Then
+            MBS_OwnerRecoveryEvidence = True
+            Exit Function
+        End If
+    Next leaf
 End Function
 
 Private Sub MBS_WriteAtomic(ByVal path As String, ByVal contents As String)
@@ -174,6 +217,7 @@ End Sub
 Private Sub MBS_Initialize()
     Dim anchor As String, prior As Boolean, oldDir As String, f As Object, target As String
     Dim stream As Object, row As Variant, saved As String, key As String, oldHash As String
+    MBS_ValidateLayout gRoot, gFSO
     gStateRoot = MB_StatePath()
     anchor = MBH_JoinPath(gRoot, "operating-format.tsv")
     key = "OperatingFormat_" & MBH_HashText(LCase$(gRoot))
@@ -234,7 +278,7 @@ Private Sub MBS_Initialize()
             "Outlook Mail Backup operating files. Keep this folder with your MSG archive." & vbCrLf & _
             "journal.tsv: verified file identities and hashes; moves.tsv: path redirects." & vbCrLf & _
             "account-roots.tsv: remembered account folders; coverage/audit TSVs: progress." & vbCrLf & _
-            "runs: per-run reports and fixed plans. _MailBackup_Recovery in the account" & vbCrLf & _
+            "runs: per-run reports and fixed plans. The independent recovery directory in the account" & vbCrLf & _
             "folder contains independent checked recovery generations. Re-run the ONE" & vbCrLf & _
             "macro after accidental deletion. MSG-only recovery establishes a new baseline;" & vbCrLf & _
             "it cannot prove hashes or history that no longer exist. Never alternate older" & vbCrLf & _

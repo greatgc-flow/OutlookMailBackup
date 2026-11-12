@@ -544,7 +544,7 @@ Public Function MBH_HashSelfTest() As Boolean
     If MBH_HashText(vbNullString) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty UTF-16 hash mismatch."
     If MBH_HashText("abc") <> UTF16_ABC_SHA Then MBH_Fail "HashSelfTest", "UTF-16 abc hash mismatch."
     Set fso = MBH_FileSystem()
-    finalPath = MBH_JoinPath(CStr(fso.GetSpecialFolder(2).Path), "mailbackup_hash_selftest.bin")
+    finalPath = MBH_JoinPath(MBT_TestParent(fso), "mailbackup_hash_selftest.bin")
     stagePath = MBH_NewStagePath(finalPath)
     If MBH_HashFile(stagePath) <> EMPTY_SHA Then MBH_Fail "HashSelfTest", "Empty file hash mismatch."
     bytes(0) = 97: bytes(1) = 98: bytes(2) = 99

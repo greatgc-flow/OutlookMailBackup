@@ -83,7 +83,8 @@ Private Function MBR_ReadOwner(ByVal folderPath As String) As Variant
     If CStr(fields(0)) <> "MBRECOVERY1" Or CStr(fields(4)) <> "1" Then _
         Err.Raise MB_ERR + 803, , "Unknown recovery owner schema."
     If Len(CStr(fields(3))) = 0 Then Err.Raise MB_ERR + 804, , "Recovery owner has no StoreID."
-    If StrComp(MBH_JoinPath(CStr(fields(2)), MBR_FOLDER), folderPath, vbTextCompare) <> 0 Then _
+    If StrComp(MBH_JoinPath(CStr(fields(2)), MBR_FOLDER), folderPath, vbTextCompare) <> 0 And _
+       StrComp(MBH_JoinPath(CStr(fields(2)), MBR_FOLDER_LEGACY), folderPath, vbTextCompare) <> 0 Then _
         Err.Raise MB_ERR + 805, , "Recovery directory moved outside its bound account."
     If Len(gRoot) > 0 Then
         If StrComp(MBH_NormalizePath(CStr(fields(1))), MBH_NormalizePath(gRoot), vbTextCompare) <> 0 Then _
@@ -99,6 +100,28 @@ Failed:
     Err.Raise n, "MBR_ReadOwner", detail
 End Function
 
+Private Function MBR_ExpectedRecoveryPath(ByVal accountRoot As String, ByVal managedRoot As String) As String
+    If MBS_IsModernLayout(managedRoot) Then
+        MBR_ExpectedRecoveryPath = MBH_JoinPath(accountRoot, MBR_FOLDER)
+    Else
+        MBR_ExpectedRecoveryPath = MBH_JoinPath(accountRoot, MBR_FOLDER_LEGACY)
+    End If
+End Function
+
+Private Function MBR_ExistingRecoveryPath(ByVal accountRoot As String, ByVal fso As Object) As String
+    Dim modern As String, legacy As String, hasModern As Boolean, hasLegacy As Boolean
+    modern = MBH_JoinPath(accountRoot, MBR_FOLDER)
+    legacy = MBH_JoinPath(accountRoot, MBR_FOLDER_LEGACY)
+    MBP_NoReparse modern, fso: MBP_NoReparse legacy, fso
+    If fso.FileExists(modern) Or fso.FileExists(legacy) Then Err.Raise MB_ERR + 1211, , _
+        "A file occupies a recovery-directory name. Existing files were retained."
+    hasModern = fso.FolderExists(modern): hasLegacy = fso.FolderExists(legacy)
+    If hasModern And hasLegacy Then Err.Raise MB_ERR + 1212, , _
+        "Both _Recovery and _MailBackup_Recovery exist. Review the independent histories before choosing a layout."
+    If hasModern Then MBR_ExistingRecoveryPath = modern
+    If hasLegacy Then MBR_ExistingRecoveryPath = legacy
+End Function
+
 Private Function MBR_IsRecoveryDirectory(ByVal folderPath As String) As Boolean
     Dim fields As Variant
     If Not gFSO.FileExists(MBH_JoinPath(folderPath, MBR_OWNER_FILE)) Then Exit Function
@@ -108,12 +131,17 @@ End Function
 
 Private Function MBR_RecoveryRoot(ByVal accountRoot As String, ByVal storeId As String) As String
     Dim root As String, marker As String, fields As Variant, stream As Object, folder As Object
-    Dim n As Long, detail As String, manifest As String, files As Object, chunks As Object
+    Dim n As Long, detail As String, manifest As String, files As Object, chunks As Object, existing As String
     On Error GoTo Failed
     accountRoot = MBH_NormalizePath(accountRoot)
     If Len(storeId) = 0 Or Len(gRoot) = 0 Then Err.Raise MB_ERR + 807, , "Recovery needs root and StoreID bindings."
     MBY_NoReparse accountRoot, True
-    root = MBH_JoinPath(accountRoot, MBR_FOLDER)
+    root = MBR_ExpectedRecoveryPath(accountRoot, gRoot)
+    existing = MBR_ExistingRecoveryPath(accountRoot, gFSO)
+    If Len(existing) > 0 Then
+        If StrComp(existing, root, vbTextCompare) <> 0 Then Err.Raise MB_ERR + 1213, , _
+            "Recovery metadata uses a different layout from the managed root. Existing paths were retained for review: " & existing
+    End If
     marker = MBH_JoinPath(root, MBR_OWNER_FILE)
     If gFSO.FolderExists(root) Then
         MBY_NoReparse root, True
@@ -434,6 +462,62 @@ Private Function MBR_FindSnapshot(ByVal recoveryRoot As String, ByVal accountRoo
     Set files = Nothing: Set chunks = Nothing
 End Function
 
+Private Function MBR_HashPrefix(ByVal path As String, ByVal byteCount As Double) As String
+    ' The snapshot digest authenticates exactly its original raw byte prefix.
+    ' Hash only that prefix: later append-only records are allowed, but deleting,
+    ' replacing or reordering valid older rows cannot hide behind a larger size.
+    ' Sequential bounded reads avoid Long offsets and preserve UTF-16/BOM bytes.
+    Dim context As MBH_HashContext, buffer(0 To 65535) As Byte
+    Dim remaining As Double, request As Long, count As Long, rc As Long, winError As Long
+    Dim n As Long, source As String, detail As String
+#If VBA7 Then
+    Dim handle As LongPtr
+#Else
+    Dim handle As Long
+#End If
+    handle = -1
+    On Error GoTo Failed
+    If byteCount < 0 Or byteCount <> Fix(byteCount) Or byteCount > 9007199254740991# Then _
+        Err.Raise MB_ERR + 1190, , "Invalid exact recovery-prefix byte count."
+    path = MBH_NormalizePath(path)
+    MBY_NoReparse path, True
+    ' Deny write/delete while checking the full historical prefix.
+    handle = MBH_CreateFileW(StrPtr(path), MBH_GENERIC_READ, MBH_FILE_SHARE_READ, 0, _
+                            MBH_OPEN_EXISTING, MBH_FILE_ATTRIBUTE_NORMAL Or MBH_FILE_FLAG_SEQUENTIAL_SCAN, 0)
+    If handle = -1 Then
+        winError = Err.LastDllError
+        Err.Raise MB_ERR + 1191, , "Cannot protect recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+    End If
+    MBH_HashOpen context
+    remaining = byteCount
+    Do While remaining > 0
+        request = 65536
+        If remaining < CDbl(request) Then request = CLng(remaining)
+        If MBH_ReadFile(handle, buffer(0), request, count, 0) = 0 Then
+            winError = Err.LastDllError
+            Err.Raise MB_ERR + 1192, , "Cannot read recovery prefix; Win32=" & CStr(winError) & "; path=" & path
+        End If
+        If count <= 0 Or count > request Then Err.Raise MB_ERR + 1193, , _
+            "Recovery prefix ended before the recorded snapshot boundary: " & path
+        MBH_CheckStatus MBH_BCryptHashData(context.Handle, VarPtr(buffer(0)), count, 0), "RecoveryPrefixHash"
+        remaining = remaining - CDbl(count)
+    Loop
+    MBR_HashPrefix = MBH_HashFinish(context)
+    rc = MBH_CloseHandle(handle)
+    winError = Err.LastDllError
+    If rc = 0 Then Err.Raise MB_ERR + 1194, , "Cannot close recovery-prefix reader; Win32=" & CStr(winError)
+    handle = -1
+    MBH_HashClose context
+    Exit Function
+Failed:
+    n = Err.Number: source = Err.Source: detail = Err.Description
+    On Error Resume Next
+    If handle <> -1 Then rc = MBH_CloseHandle(handle)
+    MBH_HashClose context
+    On Error GoTo 0
+    Err.Raise n, source, detail
+End Function
+
 Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As String) As Boolean
     Dim dir As String, item As Object, key As Variant, meta As Variant, path As String
     reason = ""
@@ -457,6 +541,9 @@ Private Function MBR_StateHealthy(ByVal snapshotFiles As Object, ByRef reason As
                 meta = MBM_Unpack(CStr(snapshotFiles(key)), 3)
                 If CDbl(gFSO.GetFile(path).Size) < MB_ByteCount(CStr(meta(0))) Then
                     reason = "Append-only state is shorter than its recovery snapshot: " & CStr(key): Exit Function
+                End If
+                If MBR_HashPrefix(path, MB_ByteCount(CStr(meta(0)))) <> CStr(meta(1)) Then
+                    reason = "Append-only history differs from its recovery snapshot: " & CStr(key): Exit Function
                 End If
             End If
         Next key
@@ -701,14 +788,7 @@ End Sub
 Private Function MBR_TryIndexRow(ByVal line As String, ByRef reason As String) As Boolean
     Dim f As Variant, n As Long
     On Error GoTo Rejected
-    If Left$(line, 6) = "MBS3" & vbTab & "N" Or Left$(line, 6) = "MBS3" & vbTab & "T" Or _
-       Left$(line, 6) = "MBS3" & vbTab & "R" Then
-        f = MB_ReadCheckedLine(line, 17)
-        If CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    Else
-        f = MB_ReadCheckedLine(line, 16)
-        If CStr(f(0)) <> "MBS2" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    End If
+    f = MBR_ParseIndexFields(line)
     If Not MB_IsHexKey(CStr(f(2))) Or Not MB_IsHexKey(CStr(f(5))) Or Not MB_IsHexKey(CStr(f(6))) Then _
         Err.Raise MB_ERR + 25, , "Invalid source/revision/file digest."
     ' This is the REAL index semantic validator, in isolated temporary caches.
@@ -720,7 +800,8 @@ Rejected:
     n = Err.Number: reason = Err.Description
     If (n >= MB_ERR + 15 And n <= MB_ERR + 25) Or _
        (n >= MB_ERR + 263 And n <= MB_ERR + 269) Or n = MB_ERR + 326 Or _
-       (n >= MB_ERR + 600 And n <= MB_ERR + 610) Or n = MBH_ERR_BASE + 2 Then Exit Function
+       (n >= MB_ERR + 600 And n <= MB_ERR + 610) Or _
+       (n >= MB_ERR + 1180 And n <= MB_ERR + 1183) Or n = MBH_ERR_BASE + 2 Then Exit Function
     ' Unexpected resource/crypto/runtime failures are not corrupt-row evidence.
     Err.Raise n, "MBR_TryIndexRow", reason
 End Function
@@ -728,7 +809,7 @@ End Function
 Private Function MBR_SalvageJournal(ByVal recoveryRoot As String) As String
     Dim oldIndex As Object, oldExternal As Object, oldMeta As Object, oldStores As Object
     Dim oldBindings As Object, oldSources As Object, oldOwners As Object
-    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object
+    Dim oldBuckets As Object, oldSeen As Object, oldKnown As Object, oldHeads As Object, oldLookup As Object
     Dim inputStream As Object, outputStream As Object, source As String, stage As String, target As String, dir As String
     Dim line As String, reason As String, accepted As Long, rejected As Long, cached As Boolean
     Dim digest As String, bytes As Double, n As Long, detail As String
@@ -745,6 +826,7 @@ Private Function MBR_SalvageJournal(ByVal recoveryRoot As String) As String
     Set oldIndex = gIndex: Set oldExternal = gExternalRoots: Set oldMeta = gRecordMeta: Set oldStores = gStoreTokens
     Set oldBindings = gLegacyBindings: Set oldSources = gLegacySources: Set oldOwners = gLegacyOwners
     Set oldBuckets = gIdentityBuckets: Set oldSeen = gIdentitySeen: Set oldKnown = gWindowKnown
+    Set oldLookup = gIdentityLookupState
     Set oldHeads = gRevisionHeads
     cached = True
     Set gIndex = CreateObject("Scripting.Dictionary")
@@ -797,6 +879,7 @@ Cleanup:
         Set gIndex = oldIndex: Set gExternalRoots = oldExternal: Set gRecordMeta = oldMeta: Set gStoreTokens = oldStores
         Set gLegacyBindings = oldBindings: Set gLegacySources = oldSources: Set gLegacyOwners = oldOwners
         Set gIdentityBuckets = oldBuckets: Set gIdentitySeen = oldSeen: Set gWindowKnown = oldKnown
+        Set gIdentityLookupState = oldLookup
         Set gRevisionHeads = oldHeads
     End If
     On Error GoTo 0
@@ -866,9 +949,16 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
                 "Legacy interrupted recovery has preserved history outside a bound overlay. Review those originals before resuming; no proof may be discarded."
             baseReference = pending
         Else
-            manifest = MBR_FindSnapshot(recoveryRoot, accountRoot, storeId, files, chunks, True)
             baseReference = "MSG_ONLY"
-            If Len(manifest) > 0 Then baseReference = manifest
+            If Len(manifest) > 0 Then
+                ' Pin the newest readable history that StateHealthy compared.
+                ' An older valid snapshot may omit the very proof lost from the
+                ' live prefix. Missing/corrupt blocks must not downgrade history
+                ' to an older generation or a fresh MSG-only baseline.
+                If Not MBR_BlocksValid(recoveryRoot, files, chunks, reason) Then _
+                    Err.Raise MB_ERR + 1195, , "Newest readable recovery history is unavailable; preserve state and repair its blocks before retrying. " & reason
+                baseReference = manifest
+            End If
         End If
         intent = MBR_CaptureOverlay(recoveryRoot, accountRoot, storeId, baseReference)
     End If
@@ -900,6 +990,12 @@ Private Sub MBR_RestoreState(ByVal accountRoot As String, ByVal storeId As Strin
         gRecoveryRebased = True
     End If
     MBR_ApplyOverlay recoveryRoot, overlayFiles, accountRoot, storeId
+    ' A successful semantic merge may normalize harmless blank lines or older
+    ' serialization. Checkpoint those verified bytes before DONE so a restart
+    ' does not compare them repeatedly with an obsolete physical prefix. The
+    ' original snapshot and overlay stay immutable; a failed checkpoint keeps
+    ' START and its exact original plan available for retry.
+    MBR_SaveSnapshot accountRoot, storeId
     ' No DONE is emitted if valid historical proofs conflict or any owned
     ' merge could not be published. Both original byte sets remain available.
     MBR_WriteIntent recoveryRoot, accountRoot, storeId, intent, "DONE"

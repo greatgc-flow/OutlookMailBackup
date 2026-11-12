@@ -89,7 +89,7 @@ Private Sub MBS_CheckStoreRow(ByVal line As String, ByVal kind As String, ByVal 
         Case "JOURNAL"
             If Left$(line, 5) = "MBS2" & vbTab Then
                 fieldCount = 16
-            ElseIf Left$(line, 5) = "MBS3" & vbTab Then
+            ElseIf Left$(line, 5) = "MBS3" & vbTab Or Left$(line, 5) = "MBS4" & vbTab Then
                 fieldCount = 17
             Else
                 GoTo Unproven
@@ -151,9 +151,13 @@ Private Sub MBS_PreflightCandidateAccount(ByVal accountPath As String, ByVal sto
                                           ByVal rootPath As String, ByVal fso As Object)
     ' Only an exact checked sibling marker is evidence for this root. Unrelated
     ' malformed sibling files are not borrowed as authority to bind any store.
+    Dim leaf As Variant, recovery As String
     MBS_PreflightStoreFile MBH_JoinPath(accountPath, MBY_ACCOUNT_MARKER), "ACCOUNT", storeId, rootPath, fso, False, accountPath
-    MBS_PreflightStoreFile MBH_JoinPath(MBH_JoinPath(accountPath, MBR_FOLDER), MBR_OWNER_FILE), _
+    For Each leaf In Array(MBR_FOLDER, MBR_FOLDER_LEGACY)
+        recovery = MBH_JoinPath(accountPath, CStr(leaf))
+        MBS_PreflightStoreFile MBH_JoinPath(recovery, MBR_OWNER_FILE), _
                            "RECOVERY", storeId, rootPath, fso, False, accountPath
+    Next leaf
 End Sub
 
 Private Sub MBS_PreflightCandidateEvidence(ByVal rootPath As String, ByVal storeId As String, ByVal fso As Object)
@@ -161,7 +165,7 @@ Private Sub MBS_PreflightCandidateEvidence(ByVal rootPath As String, ByVal store
     ' The first upgrade of an old root has no MBSTORE1 marker. Inspect owned
     ' state before the chooser returns, so a different default store can choose
     ' its separate root through the same single public macro.
-    For Each stateLeaf In Array(MBS_DATA_LEAF, "_state")
+    For Each stateLeaf In Array(MBS_DATA_LEAF, MBS_DATA_LEAF_LEGACY, "_state")
         state = MBH_JoinPath(rootPath, CStr(stateLeaf))
         MBS_PreflightStoreFile MBH_JoinPath(state, "journal.tsv"), "JOURNAL", storeId, rootPath, fso, True
         MBS_PreflightStoreFile MBH_JoinPath(state, MBY_MAP_FILE), "ACCOUNT", storeId, rootPath, fso, True
@@ -200,9 +204,12 @@ Failed:
 End Sub
 
 Private Sub MBS_CheckAccountStoreEvidence(ByVal accountPath As String, ByVal storeId As String)
+    Dim leaf As Variant, recovery As String
     MBS_CheckStoreFile MBH_JoinPath(accountPath, MBY_ACCOUNT_MARKER), "ACCOUNT", storeId, accountPath
-    MBS_CheckStoreFile MBH_JoinPath(MBH_JoinPath(accountPath, MBR_FOLDER), MBR_OWNER_FILE), _
-                       "RECOVERY", storeId, accountPath
+    For Each leaf In Array(MBR_FOLDER, MBR_FOLDER_LEGACY)
+        recovery = MBH_JoinPath(accountPath, CStr(leaf))
+        MBS_CheckStoreFile MBH_JoinPath(recovery, MBR_OWNER_FILE), "RECOVERY", storeId, accountPath
+    Next leaf
 End Sub
 
 Private Sub MBS_CheckInitialStoreEvidence(ByVal storeId As String)

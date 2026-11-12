@@ -1,0 +1,262 @@
+' Bounded recovery uses only new disposable files. It never resets an archive,
+' deletes old reports, clears live handles or waives a failed acceptance check.
+Private Function MBT_RunStartupChecks(ByRef reportPath As String, ByRef detail As String) As Boolean
+    Dim attempt As Long, attemptReport As String, attemptDetail As String
+    Dim history As String, cleanup As String, passed As Boolean, clean As Boolean
+    Dim n As Long, errorText As String
+    On Error GoTo Failed
+    reportPath = "": detail = "": mbtStartupNote = ""
+    If gBusy Then detail = "A backup or native test is already running.": Exit Function
+    For attempt = 1 To MBT_MAX_ATTEMPTS
+        ' Check before MB_Reset can discard state from an unfinished operation.
+        clean = MBT_ResourcesClean(cleanup)
+        If Not clean Then
+            detail = "CLEANUP_PENDING: " & cleanup
+            Exit For
+        End If
+        mbtScratchParent = "": mbtFailureLines = ""
+        passed = MBT_RunAcceptanceReport(attemptReport, attemptDetail, attempt)
+        If Len(attemptReport) > 0 Then reportPath = attemptReport
+        history = history & "Attempt " & CStr(attempt) & "/" & CStr(MBT_MAX_ATTEMPTS) & ": " & _
+                  attemptDetail & vbCrLf & mbtFailureLines & "Report: " & attemptReport & vbCrLf & vbCrLf
+        clean = MBT_ResourcesClean(cleanup)
+        If passed And Not gCancel And clean Then
+            MBT_RunStartupChecks = True
+            detail = "Native checks passed on attempt " & CStr(attempt) & "."
+            Exit For
+        End If
+        detail = attemptDetail
+        If Len(mbtFailureLines) > 0 Then detail = detail & vbCrLf & mbtFailureLines
+        If Not clean Then detail = detail & vbCrLf & "CLEANUP_PENDING: " & cleanup
+        If gCancel Then detail = "Cancelled. Automatic retry was not started." & vbCrLf & detail
+        If Not MBT_CanRetry(attempt, gCancel, clean) Then Exit For
+    Next attempt
+Finish:
+    mbtScratchParent = ""
+    If Not MBT_RunStartupChecks Then
+        detail = "Startup checks stopped before backup." & vbCrLf & detail
+    End If
+    mbtStartupNote = MBT_WriteStartupNote(reportPath, detail & vbCrLf & vbCrLf & history)
+    If MBT_RunStartupChecks Then
+        If Not MBT_ResourcesClean(cleanup) Then
+            MBT_RunStartupChecks = False
+            detail = "CLEANUP_PENDING after diagnostic write: " & cleanup
+        End If
+    End If
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    MBT_RunStartupChecks = False
+    detail = "STARTUP_ERROR: " & CStr(n) & " - " & errorText
+    Resume Finish
+End Function
+
+Private Function MBT_CanRetry(ByVal completedAttempts As Long, ByVal cancelled As Boolean, _
+                              ByVal clean As Boolean) As Boolean
+    MBT_CanRetry = completedAttempts < MBT_MAX_ATTEMPTS And Not cancelled And clean
+End Function
+
+Private Function MBT_ResourcesClean(ByRef detail As String) As Boolean
+    On Error GoTo Unknown
+    detail = ""
+    If MBH_RunLock <> 0 Then detail = detail & " Root lock is still open."
+    If Not mbmAccountLocks Is Nothing Then
+        If mbmAccountLocks.Count > 0 Then detail = detail & " Account locks are still open."
+    End If
+    If Not gJournal Is Nothing Then detail = detail & " Journal stream is still open."
+    If Not gEvents Is Nothing Then detail = detail & " Event stream is still open."
+    If MBH_OpenHashes <> 0 Then detail = detail & " Hash objects are still active."
+    If Not MBH_Stages Is Nothing Then
+        If MBH_Stages.Count > 0 Then detail = detail & " Owned stage reservations remain."
+    End If
+    If gStageEnabled Then detail = detail & " Archive stage tracking is still active."
+    detail = detail & gCleanupIssue & mbtCleanupFault
+    If Len(detail) > 0 Then
+        detail = Trim$(detail) & " Restart Outlook to release unfinished resources, then run MB_01_RunBackup."
+        Exit Function
+    End If
+    MBT_ResourcesClean = True
+    Exit Function
+Unknown:
+    detail = "Cannot verify idle resources: " & CStr(Err.Number) & " - " & Err.Description
+End Function
+
+Private Sub MBT_NoteCleanup(ByVal operation As String, ByVal number As Long, ByVal description As String)
+    If number <> 0 Then mbtCleanupFault = mbtCleanupFault & " " & operation & ": " & CStr(number) & " - " & description
+End Sub
+
+Private Function MBT_FinishNativeAttempt(ByRef detail As String) As Boolean
+    On Error GoTo Failed
+    If Not MBT_ResourcesClean(detail) Then Exit Function
+    MBH_ReleaseCrypto
+    detail = "PASS: no live archive streams, locks, hash objects or stage reservations."
+    MBT_FinishNativeAttempt = True
+    Exit Function
+Failed:
+    detail = "Idle crypto cleanup: " & CStr(Err.Number) & " - " & Err.Description
+    mbtCleanupFault = mbtCleanupFault & " " & detail
+End Function
+
+Private Function MBT_TempParent(ByVal fso As Object) As String
+    On Error GoTo Unavailable
+    MBT_TempParent = CStr(fso.GetSpecialFolder(2).Path)
+Unavailable:
+End Function
+
+Private Function MBT_TestParent(ByVal fso As Object) As String
+    Dim path As String
+    path = mbtScratchParent
+    If Len(path) = 0 Then path = MBT_TempParent(fso)
+    path = MBH_NormalizePath(path)
+    MBP_NoReparse path, fso
+    If Not fso.FolderExists(path) Then Err.Raise MB_ERR + 720, , "Disposable test parent is unavailable."
+    MBT_TestParent = path
+End Function
+
+Private Function MBT_SelectTestParent(ByVal fso As Object, ByVal attempt As Long) As String
+    Dim candidates As Variant, candidate As Variant, path As String, reason As String, failures As String
+    If attempt = 1 Then
+        candidates = Array(MBT_TempParent(fso), Environ$("LOCALAPPDATA"))
+    Else
+        candidates = Array(Environ$("LOCALAPPDATA"), MBT_TempParent(fso))
+    End If
+    For Each candidate In candidates
+        If MBT_TryScratchParent(fso, CStr(candidate), path, reason) Then
+            MBT_SelectTestParent = path
+            Exit Function
+        End If
+        failures = failures & " " & reason
+        If Len(mbtCleanupFault) > 0 Then Exit For
+    Next candidate
+    Err.Raise MB_ERR + 720, , "No writable disposable test parent." & failures
+End Function
+
+Private Function MBT_TryScratchParent(ByVal fso As Object, ByVal candidate As String, _
+                                      ByRef path As String, ByRef reason As String) As Boolean
+    Dim probe As String, stream As Object, n As Long, errorText As String
+    On Error GoTo Failed
+    path = "": reason = ""
+    If Len(candidate) = 0 Then reason = "An environment path is unavailable.": Exit Function
+    candidate = MBH_NormalizePath(candidate)
+    MBP_NoReparse candidate, fso
+    If Not fso.FolderExists(candidate) Then Err.Raise MB_ERR + 720, , "Directory is unavailable: " & candidate
+    probe = MBH_JoinPath(candidate, "MBProbe_" & fso.GetTempName)
+    fso.CreateFolder probe
+    Set stream = fso.CreateTextFile(MBH_JoinPath(probe, "write.txt"), False, True)
+    stream.Write "Owned startup write probe."
+    stream.Close: Set stream = Nothing
+    MBP_NoReparse probe, fso
+    fso.DeleteFolder probe, True
+    path = candidate
+    MBT_TryScratchParent = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Probe stream close", Err.Number, Err.Description
+    On Error GoTo 0
+    ' An unsuccessful probe is left intact; never delete a pre-existing path.
+    reason = CStr(n) & " - " & errorText
+End Function
+
+Private Function MBT_CreateAcceptanceReport(ByVal fso As Object, ByVal attempt As Long) As String
+    Dim candidates As Variant, candidate As Variant, path As String, reason As String, failures As String
+    If attempt = 1 Then
+        candidates = Array(Environ$("LOCALAPPDATA"), MBT_TempParent(fso))
+    Else
+        candidates = Array(MBT_TempParent(fso), Environ$("LOCALAPPDATA"))
+    End If
+    For Each candidate In candidates
+        If MBT_TryReport(fso, CStr(candidate), path, reason) Then
+            MBT_CreateAcceptanceReport = path
+            Exit Function
+        End If
+        failures = failures & " " & reason
+        If Len(mbtCleanupFault) > 0 Then Exit For
+    Next candidate
+    Err.Raise MB_ERR + 721, , "Cannot create a native test report." & failures
+End Function
+
+Private Function MBT_TryReport(ByVal fso As Object, ByVal parent As String, _
+                               ByRef path As String, ByRef reason As String) As Boolean
+    Dim base As String, runFolder As String, candidate As String, stream As Object
+    Dim n As Long, errorText As String
+    On Error GoTo Failed
+    path = "": reason = ""
+    If Len(parent) = 0 Then reason = "An environment path is unavailable.": Exit Function
+    parent = MBH_NormalizePath(parent)
+    MBP_NoReparse parent, fso
+    If Not fso.FolderExists(parent) Then Err.Raise MB_ERR + 721, , "Report parent is unavailable: " & parent
+    base = MBH_JoinPath(parent, "OutlookMailBackupValidation")
+    MBP_NoReparse base, fso
+    MBH_EnsureDirectory base
+    runFolder = MBH_JoinPath(base, MBC_FileStamp(Now) & "_" & fso.GetTempName)
+    ' Exclusive creation preserves all previous reports, including the failed one.
+    fso.CreateFolder runFolder
+    MBP_NoReparse runFolder, fso
+    candidate = MBH_JoinPath(runFolder, "acceptance.tsv")
+    Set stream = fso.CreateTextFile(candidate, False, True)
+    stream.WriteLine "schema" & vbTab & "module_version" & vbTab & "local_time" & vbTab & _
+                     "check" & vbTab & "status" & vbTab & "seconds" & vbTab & "detail"
+    stream.Close: Set stream = Nothing
+    path = candidate: MBT_TryReport = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Report stream close", Err.Number, Err.Description
+    On Error GoTo 0
+    reason = CStr(n) & " - " & errorText
+End Function
+
+Private Function MBT_WriteStartupNote(ByVal reportPath As String, ByVal contents As String) As String
+    Dim fso As Object, path As String, stream As Object
+    On Error GoTo Unavailable
+    If Len(reportPath) = 0 Then Exit Function
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    path = MBH_JoinPath(CStr(fso.GetParentFolderName(reportPath)), "startup.txt")
+    MBP_NoReparse path, fso
+    Set stream = fso.CreateTextFile(path, False, True)
+    stream.Write "Outlook Mail Backup " & MB_VERSION & vbCrLf & contents
+    stream.Close: Set stream = Nothing
+    MBT_WriteStartupNote = path
+    Exit Function
+Unavailable:
+    On Error Resume Next
+    Err.Clear
+    If Not stream Is Nothing Then stream.Close
+    MBT_NoteCleanup "Startup note stream close", Err.Number, Err.Description
+    On Error GoTo 0
+End Function
+
+Private Function MBT_OpenDiagnostic(ByVal path As String) As Boolean
+    Dim fso As Object, program As String, task As Double
+    On Error GoTo Unavailable
+    If Len(path) = 0 Then Exit Function
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    path = MBH_NormalizePath(path)
+    MBP_NoReparse path, fso
+    If Not fso.FileExists(path) Then Exit Function
+    program = MBH_JoinPath(CStr(fso.GetSpecialFolder(1).Path), "notepad.exe")
+    If Not fso.FileExists(program) Then Exit Function
+    ' Explicit text viewer; no cmd.exe, file association or executable report.
+    task = Shell(Chr$(34) & program & Chr$(34) & " " & Chr$(34) & path & Chr$(34), vbNormalFocus)
+    MBT_OpenDiagnostic = (task <> 0)
+Unavailable:
+End Function
+
+Private Sub MBT_ShowStartupFailure(ByVal reportPath As String, ByVal detail As String)
+    Dim path As String, shown As String, opened As Boolean
+    path = mbtStartupNote
+    If Len(path) = 0 Then path = reportPath
+    opened = MBT_OpenDiagnostic(path)
+    shown = Left$(detail, 650)
+    If Len(detail) > 650 Then shown = shown & vbCrLf & "Full details are in the report."
+    If opened Then shown = shown & vbCrLf & "The report is open in Notepad. A screenshot is enough."
+    If Len(path) > 0 Then shown = shown & vbCrLf & "Report: " & path
+    MsgBox shown, vbExclamation, "Mail Backup " & MB_VERSION
+End Sub

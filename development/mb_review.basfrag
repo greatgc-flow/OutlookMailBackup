@@ -1,0 +1,228 @@
+' ======================= Per-run review guidance ===========================
+' This report explains observed events. It is not an outstanding-work ledger,
+' does not authorize SaveAs, and must never be read as recovery evidence.
+Private Sub MBG_Reset()
+    gReviewGuidePath = "": gReviewGuideState = "NOT_CREATED"
+    gReviewGuideDetail = "": gReviewGuideRows = 0
+    Set gReviewGuideCounts = Nothing
+End Sub
+
+Private Sub MBG_LogReview(ByVal stage As String, ByVal key As String, ByVal path As String, _
+                          ByVal errorNumber As Long, ByVal reason As String, ByVal subject As String)
+    ' An adjacent context event gives the user a searchable subject without
+    ' parsing it as an error reason or keeping every subject in memory.
+    MB_LogEvent "INFO", "REVIEW_SUBJECT", key, path, 0, subject
+    MB_LogEvent "WARNING", stage, key, path, errorNumber, reason
+End Sub
+
+Private Function MBG_Has(ByVal text As String, ByVal part As String) As Boolean
+    MBG_Has = (InStr(1, text, part, vbTextCompare) > 0)
+End Function
+
+Private Function MBG_Code(ByVal level As String, ByVal stage As String, ByVal reason As String) As String
+    ' Stable producer phrases are matched only in the reason, never subjects
+    ' or paths. An unfamiliar warning retains its full text under a fallback.
+    If level <> "WARNING" And level <> "WARN" And level <> "ERROR" Then Exit Function
+    If stage = "SPECIAL_ATTACHMENT_CONTENT_REVIEW" Then
+        MBG_Code = "CONTENT_LIMITED"
+    ElseIf stage = "SOURCE_CHANGED_RETRY" Or stage = "TYPE_CHANGED" Then
+        MBG_Code = "SOURCE_CHANGED"
+    ElseIf stage = "DOWNLOAD_STATE" And MBG_Has(reason, "Header-only message") Then
+        MBG_Code = "DOWNLOAD_REQUIRED"
+    ElseIf stage = "RECOVERY_NEW_BASELINE" Then
+        MBG_Code = "CURRENT_BASELINE"
+    ElseIf stage = "SCAN_TABLE_FALLBACK" Then
+        MBG_Code = "SCAN_FALLBACK"
+    ElseIf MBG_Has(reason, "No verified old-file match") And MBG_Has(reason, "latest write") Then
+        MBG_Code = "HISTORY_CUTOFF"
+    ElseIf stage = "LEGACY_LOOKUP_UNRESOLVED" Or MBG_Has(reason, "no readable filename/SentOn lookup") Then
+        MBG_Code = "LEGACY_UNREADABLE"
+    ElseIf MBG_Has(reason, "candidate limit reached") Or MBG_Has(reason, "bucket exceeds 512 files") Or _
+           MBG_Has(reason, "Legacy candidate budget exceeded") Then
+        MBG_Code = "CANDIDATE_LIMIT"
+    ElseIf MBG_Has(reason, "Indexed file is missing") Or MBG_Has(reason, "Referenced file is unavailable") Or _
+           MBG_Has(reason, "previously linked old MSG is unavailable") Then
+        MBG_Code = "FILE_MISSING"
+    ElseIf MBG_Has(reason, "SHA-256 mismatch") Or MBG_Has(reason, "changed SHA-256") Or _
+           MBG_Has(reason, "SHA-256 differs from") Or MBG_Has(reason, "Indexed file size mismatch") Or _
+           MBG_Has(reason, "Archived file size differs") Or MBG_Has(reason, "old MSG has changed size") Or _
+           MBG_Has(reason, "Recovered MSG differs from its recorded baseline") Then
+        MBG_Code = "FILE_CHANGED"
+    ElseIf MBG_Has(reason, "provider revision already has a file proof") Then
+        MBG_Code = "REVISION_CONFLICT"
+    ElseIf MBG_Has(reason, "conflicting") Or MBG_Has(reason, "different file proof") Or _
+           MBG_Has(reason, "Multiple content-equal MSG candidates have different file bytes") Or _
+           MBG_Has(reason, "Multiple matching legacy files have different bytes") Then
+        MBG_Code = "PROOF_CONFLICT"
+    ElseIf MBG_Has(reason, "Custom UserProperties are present") Or _
+           MBG_Has(reason, "Embedded/OLE/reference attachment") Or _
+           MBG_Has(reason, "special attachment or custom metadata equivalence") Then
+        MBG_Code = "CONTENT_LIMITED"
+    ElseIf MBG_Has(reason, "restored identity is uncertain") Or _
+           MBG_Has(reason, "provider/import rewriting requires review") Then
+        MBG_Code = "IDENTITY_UNCERTAIN"
+    ElseIf stage = "INVALID_INDEX_ROW" Or stage = "SOURCE_AUDIT_STATE_REVIEW" Or _
+           stage = "STAGE_LEDGER_REVIEW" Or stage = "SEMANTIC_INDEX_RECOVERY" Then
+        MBG_Code = "STATE_REVIEW"
+    ElseIf stage = "LEGACY_REVIEW_REQUIRED" Then
+        MBG_Code = "MATCH_UNPROVEN"
+    ElseIf level = "ERROR" Then
+        MBG_Code = "OPERATION_FAILED"
+    Else
+        MBG_Code = "REVIEW_REQUIRED"
+    End If
+End Function
+
+Private Function MBG_Action(ByVal code As String) As String
+    Select Case code
+        Case "HISTORY_CUTOFF"
+            MBG_Action = "Find this subject in the existing MSG archive and confirm the account folder. " & _
+                "Only if you confirm it was never backed up, save that source once as a Unicode MSG with an unused name in the selected account archive. " & _
+                "Keep the source and rerun MB_01_RunBackup; only verified content can clear review. Never overwrite old files, change dates or delete history."
+        Case "LEGACY_UNREADABLE"
+            MBG_Action = "Check the listed existing MSG in Outlook and make its drive available. " & _
+                "Restore an unreadable file from a known-good backup, then rerun MB_01_RunBackup. Preserve the current file for comparison."
+        Case "CANDIDATE_LIMIT"
+            MBG_Action = "Compare the same-subject candidates and their sender, dates and attachments. " & _
+                "Keep every candidate and the source mail; the tool has not selected a unique match. Do not remove files merely to reduce the count."
+        Case "FILE_MISSING"
+            MBG_Action = "Reconnect the archive drive or restore the original MSG to its recorded location from a known-good backup, " & _
+                "then rerun MB_01_RunBackup. Keep the index and recovery records."
+        Case "FILE_CHANGED"
+            MBG_Action = "Preserve the current MSG separately and compare it with a known-good backup. " & _
+                "Restore the expected original only after checking it. Do not replace the recorded hash with the current file hash."
+        Case "PROOF_CONFLICT", "REVISION_CONFLICT"
+            MBG_Action = "Keep both files and their operating records. Compare the source mail and known-good backups before choosing a recovery path. " & _
+                "Do not edit hashes, merge records by hand or delete one proof to make the conflict disappear."
+        Case "CONTENT_LIMITED"
+            MBG_Action = "Open the source and saved MSG in Outlook and inspect special attachments and custom properties. " & _
+                "Keep the source mail; manual inspection does not automatically certify unsupported properties or clear this review."
+        Case "IDENTITY_UNCERTAIN", "MATCH_UNPROVEN"
+            MBG_Action = "Search for this subject in the existing account archive and compare sender, dates, body and attachments. " & _
+                "Confirm the correct account folder and retain the source mail until a match or an explicit recovery decision is established."
+        Case "SOURCE_CHANGED"
+            MBG_Action = "Let Outlook finish moving, editing or synchronizing this mail, then rerun MB_01_RunBackup."
+        Case "DOWNLOAD_REQUIRED"
+            MBG_Action = "Download the complete mail and its attachments in Outlook, then rerun MB_01_RunBackup."
+        Case "CURRENT_BASELINE"
+            MBG_Action = "The readable MSG is recorded as it exists now. Keep the operating and recovery folders with the archive. " & _
+                "Only a known-good older copy can establish whether its bytes match the original backup."
+        Case "SCAN_FALLBACK"
+            MBG_Action = "Check the final folder-failure and scan-issue counts. The folder may have completed through a slower listing. " & _
+                "If failures remain, make the folder available in Outlook and rerun MB_01_RunBackup."
+        Case "STATE_REVIEW"
+            MBG_Action = "Keep the operating and recovery folders and the MSG files together. Make a separate copy before examining the named operating record. " & _
+                "Do not clear checksums or replace only one state file from another run."
+        Case "OPERATION_FAILED"
+            MBG_Action = "Resolve the reported drive, free-space, permission or Outlook error, then rerun MB_01_RunBackup. " & _
+                "Keep existing MSG and operating records while investigating."
+        Case Else
+            MBG_Action = "Read the reason and final summary, then inspect the named mail or file. " & _
+                "Keep the existing MSG and operating records; a warning event may already have been resolved later in the same run."
+    End Select
+End Function
+
+Private Function MBG_CreateReviewReport(ByRef detail As String) As Boolean
+    Dim reader As Object, writer As Object, counts As Object, fields As Variant
+    Dim source As String, target As String, partial As String, line As String, code As String
+    Dim contextKey As String, contextSubject As String, subject As String, row As Long, recorded As Long
+    Dim n As Long, errorText As String
+    detail = ""
+    If gReviewGuideState = "COMPLETE" Then MBG_CreateReviewReport = True: Exit Function
+    If gReviewGuideState = "FAILED" Then detail = gReviewGuideDetail: Exit Function
+    If Len(gRunDir) = 0 Then MBG_CreateReviewReport = True: Exit Function
+    On Error GoTo Failed
+    If Not gEvents Is Nothing Then Err.Raise MB_ERR + 1260, , "Close the event stream before building review guidance."
+    source = MBH_JoinPath(gRunDir, "events.tsv")
+    target = MBH_JoinPath(gRunDir, "review.tsv")
+    partial = MBH_JoinPath(gRunDir, "review.partial.tsv")
+    gReviewGuidePath = partial
+    MBY_NoReparse source, True
+    MBY_NoReparse partial, False
+    MBY_NoReparse target, False
+    If gFSO.FileExists(target) Or gFSO.FolderExists(target) Or gFSO.FileExists(partial) Or gFSO.FolderExists(partial) Then _
+        Err.Raise MB_ERR + 1261, , "An existing review report was retained; report overwrite is not permitted."
+    Set reader = gFSO.OpenTextFile(source, 1, False, -1)
+    If reader.AtEndOfStream Then Err.Raise MB_ERR + 1262, , "The event log has no header."
+    line = reader.ReadLine
+    If line <> "time" & vbTab & "level" & vbTab & "stage" & vbTab & "key" & vbTab & _
+               "path" & vbTab & "error" & vbTab & "detail" Then _
+        Err.Raise MB_ERR + 1262, , "The event log header is not recognized."
+    Set writer = gFSO.CreateTextFile(partial, False, True)
+    writer.WriteLine "event_row" & vbTab & "time" & vbTab & "code" & vbTab & "subject" & vbTab & _
+                     "location" & vbTab & "source_key" & vbTab & "reason" & vbTab & "action" & vbTab & _
+                     "stage" & vbTab & "error"
+    Set counts = CreateObject("Scripting.Dictionary")
+    counts.CompareMode = vbBinaryCompare
+    row = 1
+    Do Until reader.AtEndOfStream
+        line = reader.ReadLine: row = row + 1
+        If Len(line) = 0 Then Err.Raise MB_ERR + 1263, , "An empty event row prevents a complete guidance report."
+        fields = MBM_Unpack(line, 7)
+        If fields(1) <> "INFO" And fields(1) <> "WARNING" And fields(1) <> "WARN" And fields(1) <> "ERROR" Then _
+            Err.Raise MB_ERR + 1263, , "An unknown event level prevents a complete guidance report."
+        If fields(1) = "INFO" And fields(2) = "REVIEW_SUBJECT" Then
+            contextKey = CStr(fields(3)): contextSubject = CStr(fields(6))
+        Else
+            subject = ""
+            If Len(contextKey) > 0 And CStr(fields(3)) = contextKey Then subject = contextSubject
+            contextKey = "": contextSubject = ""
+            code = MBG_Code(CStr(fields(1)), CStr(fields(2)), CStr(fields(6)))
+            If Len(code) > 0 Then
+                writer.WriteLine MB_EncodeFields(Array(CStr(row), fields(0), code, subject, fields(4), fields(3), _
+                    fields(6), MBG_Action(code), fields(2), fields(5)))
+                recorded = recorded + 1
+                If Not counts.Exists(code) Then counts.Add code, 0&
+                counts(code) = CLng(counts(code)) + 1
+            End If
+        End If
+        ' Finish the already-written log even after cancellation. This bounded
+        ' streaming cleanup does not query mail, authorize export or change state.
+        If row Mod 256 = 0 Then DoEvents
+    Loop
+    reader.Close: Set reader = Nothing
+    writer.WriteLine MB_EncodeFields(Array("END", "", "END_OF_REPORT", "", "", "", _
+        "event_rows=" & CStr(recorded), "Observed events, not unique unresolved mails. Use the final summary for completion status.", "", ""))
+    writer.Close: Set writer = Nothing
+    MBM_FlushPath partial
+    MBY_NoReparse partial, True
+    MBY_NoReparse target, False
+    If MBM_MoveFileExW(StrPtr(partial), StrPtr(target), 8) = 0 Then
+        n = Err.LastDllError
+        Err.Raise MB_ERR + 1264, , "Cannot publish the review report; Win32=" & CStr(n)
+    End If
+    gReviewGuidePath = target
+    MBM_FlushPath target
+    gReviewGuideRows = recorded
+    Set gReviewGuideCounts = counts
+    gReviewGuideState = "COMPLETE"
+    MBG_CreateReviewReport = True
+    Exit Function
+Failed:
+    n = Err.Number: errorText = Err.Description
+    On Error Resume Next
+    If Not reader Is Nothing Then reader.Close
+    If Not writer Is Nothing Then writer.Close
+    On Error GoTo 0
+    gReviewGuideState = "FAILED"
+    gReviewGuideDetail = "Review guidance could not be completed: " & CStr(n) & " - " & errorText
+    detail = gReviewGuideDetail
+End Function
+
+Private Function MBG_Summary() As String
+    Dim result As String, code As Variant
+    If gReviewGuideState = "COMPLETE" Then
+        result = vbCrLf & "Review guidance: " & gReviewGuidePath & vbCrLf & _
+                 "Observed warning/error event rows: " & CStr(gReviewGuideRows) & _
+                 " (not unique unresolved mail count)."
+        If Not gReviewGuideCounts Is Nothing Then
+            For Each code In gReviewGuideCounts.Keys
+                result = result & vbCrLf & "  " & CStr(code) & ": " & CStr(gReviewGuideCounts(code))
+            Next code
+        End If
+    ElseIf gReviewGuideState = "FAILED" Then
+        result = vbCrLf & gReviewGuideDetail
+        If Len(gReviewGuidePath) > 0 Then result = result & vbCrLf & "Report output path (inspect if present): " & gReviewGuidePath
+    End If
+    MBG_Summary = result
+End Function

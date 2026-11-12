@@ -1,4 +1,5 @@
-' MBS3 adds an immutable absolute account-root binding for N/T output records.
+' MBS4 stores file references relative to an exact account-root binding.
+' MBS3 absolute records are still readable; normalization is only in memory.
 ' M/A keys remain the lookup namespace so MBS2 backups are still reusable.
 Private gExternalRoots As Object
 Private gRecordMeta As Object

@@ -47,6 +47,7 @@ Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
     Dim startTick As Double, errNo As Long, errText As String, rootIndex As Long
     Dim lockHeld As Boolean, attached As String, autoReady As Boolean
     Dim savedCalendar As Long, calendarEntered As Boolean
+    Dim guideDetail As String
     If gBusy Then
         MsgBox "A backup/verification is already running. Use MB_CancelBackup.", vbInformation
         Exit Sub
@@ -109,18 +110,23 @@ Private Sub MB_Run(ByVal mode As String, ByVal allStores As Boolean, _
             gScope = folder.FolderPath
         End If
     Else
-        gScope = "Every committed file indexed in SafeV2"
+        gScope = "Every committed file in the selected managed archive"
     End If
     baseRoot = MBP_ResolveBackupRoot(gSelectedBase)
     If Len(baseRoot) = 0 Then
         gCancel = True
         GoTo CleanUp
     End If
+    ' Recheck after selection: the derived root/ancestors may have changed
+    ' since preflight. No link target may be initialized as an owned archive.
+    MBP_NoReparse baseRoot, gFSO
     MBH_EnsureDirectory baseRoot
+    MBP_NoReparse MBH_JoinPath(baseRoot, "backup.lock"), gFSO
     MBH_AcquireRunLock MBH_JoinPath(baseRoot, "backup.lock")
     lockHeld = True
     gRoot = baseRoot
     gBaseRoot = baseRoot
+    MBP_NoReparse baseRoot, gFSO
     MB_CheckOwnership gRoot
     gLegacyRoot = MBP_ResolveLegacyRoot(gSelectedBase, gBaseRoot)
     If gFSO.FileExists(MBH_JoinPath(baseRoot, "STOP.txt")) Then
@@ -303,6 +309,9 @@ CleanUp:
     If Err.Number <> 0 Then gCleanupIssue = gCleanupIssue & " Calendar restore: " & Err.Description
     On Error GoTo 0
     MB_CloseResources
+    If Len(gRunDir) > 0 Then
+        If Not MBG_CreateReviewReport(guideDetail) Then gCleanupIssue = gCleanupIssue & " Review guidance: " & guideDetail
+    End If
     ' Coverage advances under the same locks, only after the durable message
     ' journal and both streams closed successfully. Interrupted work replays.
     On Error Resume Next
@@ -314,6 +323,7 @@ CleanUp:
         gFatalText = gFatalText & " UTC checkpoint: " & Err.Description
     End If
     On Error GoTo 0
+    If mode = "AUTO" Then MBW_SaveSelectionCache
     If mode = "AUTO" And Len(gRunDir) > 0 Then summary = MB_Summary()
     If mode = "AUTO" And gMaintenanceReady And gJournalIssues = 0 Then
         On Error Resume Next
@@ -398,6 +408,7 @@ Private Sub MB_Reset()
     gReuseBlocked = False: gReuseReason = ""
     MBP_Reset
     MBF_Reset
+    MBG_Reset
     MBU_Reset
     MBS_Reset
     MBR_Reset
@@ -427,10 +438,14 @@ End Sub
 
 Private Sub MB_CheckOwnership(ByVal rootPath As String)
     Dim p As String, ts As Object, value As String, f As Object, subFolder As Object
+    Dim expectedOwner As String
+    MBS_ValidateLayout rootPath, gFSO
+    expectedOwner = MBS_LayoutOwner(rootPath)
     p = MBH_JoinPath(rootPath, "owner.txt")
     If Not gFSO.FileExists(p) Then
         If MBS_CanRecoverOwner(rootPath, gFSO) Then
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
+            MBS_RememberLayout rootPath
             Exit Sub
         End If
     End If
@@ -439,32 +454,35 @@ Private Sub MB_CheckOwnership(ByVal rootPath As String)
         value = ts.ReadAll
         ts.Close
         If value <> MB_OWNER & vbCrLf And value <> MB_OWNER_LEGACY & vbCrLf And _
-           value <> MB_OWNER_PREVIOUS & vbCrLf Then
+           value <> MB_OWNER_PREVIOUS & vbCrLf And value <> MB_OWNER_V34 & vbCrLf And _
+           value <> MB_OWNER_LAYOUT_MODERN & vbCrLf And value <> MB_OWNER_LAYOUT_LEGACY & vbCrLf Then
             Err.Raise MB_ERR + 10, "MB_CheckOwnership", "Output owner marker is invalid: " & p
         End If
-        If value = MB_OWNER_LEGACY & vbCrLf Or value = MB_OWNER_PREVIOUS & vbCrLf Then
+        If value <> expectedOwner & vbCrLf Then
             ' Preserve the old marker, then reject unsupported downgrade writers.
             If Not gFSO.FileExists(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt")) Then
                 Set ts = gFSO.CreateTextFile(MBH_JoinPath(rootPath, "owner-previous-" & Left$(MBH_HashText(value), 16) & ".txt"), False, True)
                 ts.Write value: ts.Close
             End If
-            MBS_WriteAtomic p, MB_OWNER & vbCrLf
+            MBS_WriteAtomic p, expectedOwner & vbCrLf
         End If
+        MBS_RememberLayout rootPath
         Exit Sub
     End If
     For Each f In gFSO.GetFolder(rootPath).Files
         If LCase$(f.Name) <> "backup.lock" Then
             Err.Raise MB_ERR + 11, "MB_CheckOwnership", _
-                      "Unowned output folder contains files. Choose a new empty SafeV2 folder."
+                      "Unowned output folder contains files. Choose a new empty managed backup folder."
         End If
     Next f
     For Each subFolder In gFSO.GetFolder(rootPath).SubFolders
         Err.Raise MB_ERR + 12, "MB_CheckOwnership", _
-                  "Unowned output folder contains directories. Choose a new empty SafeV2 folder."
+                  "Unowned output folder contains directories. Choose a new empty managed backup folder."
     Next subFolder
     Set ts = gFSO.CreateTextFile(p, False, True)
-    ts.WriteLine MB_OWNER
+    ts.WriteLine expectedOwner
     ts.Close
+    MBS_RememberLayout rootPath
 End Sub
 
 ' ======================= Journal / metadata utilities =======================
@@ -618,14 +636,7 @@ End Sub
 Private Sub MB_LoadIndexRow(ByVal line As String, ByVal rowNumber As Long)
     Dim f As Variant, errNo As Long, errText As String
     On Error GoTo Invalid
-    If Left$(line, 6) = "MBS3" & vbTab & "N" Or Left$(line, 6) = "MBS3" & vbTab & "T" Or _
-       Left$(line, 6) = "MBS3" & vbTab & "R" Then
-        f = MB_ReadCheckedLine(line, 17)
-        If CStr(f(0)) <> "MBS3" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    Else
-        f = MB_ReadCheckedLine(line, 16)
-        If CStr(f(0)) <> "MBS2" Then Err.Raise MB_ERR + 23, , "Wrong index schema."
-    End If
+    f = MBR_ParseIndexFields(line)
     If Not MB_IsHexKey(f(2)) Or Not MB_IsHexKey(f(5)) Or Not MB_IsHexKey(f(6)) Then
         Err.Raise MB_ERR + 25, , "Invalid index key/hash."
     End If
@@ -662,12 +673,17 @@ Private Sub MB_RecordCommit(ByVal kind As String, ByVal key As String, ByVal rel
     Dim payload As String, fields As Variant, indexKey As String
     On Error GoTo Failed
     If kind = "N" Or kind = "T" Or kind = "R" Then
-        fields = Array("MBS3", kind, key, relativePath, Format$(bytes, "0"), digest, _
+        fields = Array("MBS4", kind, key, MBX_AccountRelative(relativePath, accountRoot), Format$(bytes, "0"), digest, _
                        q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation, accountRoot)
+    ElseIf kind = "L" Then
+        fields = Array("MBS4", kind, key, MBX_AccountRelative(relativePath, originalName), Format$(bytes, "0"), digest, _
+                       q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), "", validation, originalName)
     Else
         fields = Array("MBS2", kind, key, relativePath, Format$(bytes, "0"), digest, _
                        q(7), q(1), q(2), q(3), q(4), q(6), subject, CStr(attNo), originalName, validation)
     End If
+    ' Reject an incompatible repeat before it becomes durable journal history.
+    MBR_RejectIndexConflict fields
     payload = MB_EncodeFields(fields)
     MB_OpenJournal
     MB_WriteCheckedLine gJournal, payload
@@ -882,7 +898,11 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
     If MB_ExistingValid("M|" & revision, relativePath) Then
         stage = "UPGRADE_EXISTING_VALIDATION_NO_SAVEAS"
         validation = MB_UpgradeMsgValidation(mail, q, revision)
-        If validation = MB_NEW_BASIC_VALIDATION Then gContentReview = gContentReview + 1
+        If validation = MB_NEW_BASIC_VALIDATION Then
+            gContentReview = gContentReview + 1
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), q(3), 0, _
+                "Existing MSG retained; special attachment or custom metadata equivalence is not fully proven.", subject
+        End If
         wasNew = False
     Else
         If gReuseBlocked Then
@@ -992,8 +1012,8 @@ Private Function MB_ProcessOne(ByVal q As Variant) As Long
         gBytesNew = gBytesNew + bytes
         If validation = MB_NEW_BASIC_VALIDATION Then
             gContentReview = gContentReview + 1
-            MB_LogEvent "WARNING", "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
-                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven."
+            MBG_LogReview "SPECIAL_ATTACHMENT_CONTENT_REVIEW", q(7), finalPath, 0, _
+                        "MSG saved and reopened; special attachment or custom metadata equivalence is not fully proven.", subject
         End If
         wasNew = True
     End If
@@ -1034,7 +1054,7 @@ MessageReady:
     End If
     Exit Function
 LegacyReview:
-    MB_LogEvent "WARNING", "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason
+    MBG_LogReview "LEGACY_REVIEW_REQUIRED", q(7), q(3), 0, legacyReason, subject
     MB_ProcessOne = 7
     Exit Function
 Changed:
@@ -1609,7 +1629,7 @@ Private Function MB_Summary() As String
     s = s & vbCrLf & "Content-verified restored/moved identity aliases (no SaveAs): " & CStr(gIdentityAliases)
     s = s & vbCrLf & "Verified identity-header reads/cache hits: " & CStr(gIdentityHeaderReads) & "/" & CStr(gIdentityHeaderHits)
     s = s & MBV_Summary() & MBF_Summary(gMode)
-    s = s & MBW_Summary()
+    s = s & MBW_Summary() & MBW_SelectionSummary() & MBG_Summary()
     s = s & MBA_Summary() & MBR_Summary() & MBS_Summary()
     If Len(gAutoSetupPhase) > 0 Then
         s = s & vbCrLf & "Automatic setup phase: " & gAutoSetupPhase & vbCrLf & _
@@ -1678,18 +1698,18 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
         Err.Raise MB_ERR + 66, , "Calendar-month boundary test failed."
     End If
     Set fso = CreateObject("Scripting.FileSystemObject")
-    testDir = MBH_JoinPath(fso.GetSpecialFolder(2).Path, "MBTest_" & fso.GetTempName)
+    testDir = MBH_JoinPath(MBT_TestParent(fso), "MBTest_" & fso.GetTempName)
     ' Claim a NEW directory; never clean up an existing directory on collision.
     fso.CreateFolder testDir
     ownsTestDir = True
     finalPath = MBH_JoinPath(testDir, "test.txt")
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "first": ts.Close
+    ts.Write "first": ts.Close: Set ts = Nothing
     MBH_CommitStage stagePath, finalPath
     stagePath = MBH_NewStagePath(finalPath)
     Set ts = fso.OpenTextFile(stagePath, 2, False, 0)
-    ts.Write "second": ts.Close
+    ts.Write "second": ts.Close: Set ts = Nothing
     On Error Resume Next
     Err.Clear
     MBH_CommitStage stagePath, finalPath
@@ -1698,7 +1718,7 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
     On Error GoTo Failed
     If Not rejected Then Err.Raise MB_ERR + 67, , "Existing final file was overwritten."
     Set ts = fso.OpenTextFile(finalPath, 1, False, 0)
-    s = ts.ReadAll: ts.Close
+    s = ts.ReadAll: ts.Close: Set ts = Nothing
     If s <> "first" Then Err.Raise MB_ERR + 68, , "Existing bytes were changed."
     MBH_DeleteStage stagePath: stagePath = ""
     fso.DeleteFolder testDir, True: testDir = "": ownsTestDir = False
@@ -1710,10 +1730,14 @@ Private Function MBT_HelperSelfTest(ByRef detail As String) As Boolean
 Failed:
     errNo = Err.Number: errText = Err.Description
     On Error Resume Next
+    Err.Clear
     If Not ts Is Nothing Then ts.Close
+    MBT_NoteCleanup "Helper stream close", Err.Number, Err.Description
     If Len(stagePath) > 0 Then MBH_DeleteStage stagePath
     If ownsTestDir Then fso.DeleteFolder testDir, True
+    Err.Clear
     MBH_ReleaseCrypto
+    MBT_NoteCleanup "Helper crypto cleanup", Err.Number, Err.Description
     On Error GoTo 0
     detail = "FAIL: " & CStr(errNo) & " - " & errText
 End Function

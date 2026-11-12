@@ -1,0 +1,6 @@
+' Optional selection progress; never a replacement for successful coverage.
+Private gSelectionRequired As Object
+Private gSelectionUsed As Boolean
+Private gSelectionSaved As Boolean
+Private gSelectionPreviousUTC As Date
+Private gSelectionNote As String

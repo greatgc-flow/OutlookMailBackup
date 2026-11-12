@@ -1,200 +1,381 @@
 {
-  "scope": "Recorded v3.4.0 release checks. Python models and source checks are not Outlook VBA compilation or runtime verification.",
+  "scope": "v3.5.2 exact artifact. Startup recovery and full-HRESULT correction; Python and grammar checks are not Outlook VBA execution.",
   "artifact": {
     "name": "OutlookMailBackup.bas",
-    "version": "3.4.0",
-    "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
-    "bytes": 666337,
-    "lines": 13274,
+    "version": "3.5.2",
+    "sha256": "7e8d6ee1db2d0067244fd384d42f3dce1d2f50275a664d713f5789540b1127d8",
+    "bytes": 749746,
+    "lines": 14765,
     "public_macros": [
       "MB_01_RunBackup"
     ]
   },
   "reproduce": {
+    "all_gates": "python -B tools/verify.py",
     "build": "python tools/build.py --check",
-    "models": "python tools/test.py",
+    "structural": "python tools/validate.py --json",
+    "models": "python tools/test.py --json",
+    "evidence": "python tools/release_evidence.py",
     "dependencies": "Python 3.10+ standard library"
   },
-  "new_models": {
-    "settings": {
-      "tests": 43,
-      "result": "PASS",
-      "source": "development/v34_settings_models.py"
-    },
-    "revision": {
-      "tests": 35,
-      "result": "PASS",
-      "source": "development/v34_revision_models.py"
-    },
-    "metrics": {
-      "tests": 27,
-      "result": "PASS",
-      "source": "development/v34_metrics_models.py"
-    },
-    "fidelity": {
-      "tests": 28,
-      "result": "PASS",
-      "source": "development/v34_fidelity_models.py"
-    },
-    "recovery_merge": {
-      "tests": 44,
-      "result": "PASS",
-      "source": "development/v34_recovery_merge_models.py"
-    },
-    "recovery_proof": {
-      "tests": 41,
-      "result": "PASS",
-      "source": "development/v34_recovery_proof_models.py"
-    },
-    "policy_upgrade": {
-      "tests": 25,
-      "result": "PASS",
-      "source": "development/v34_policy_upgrade_models.py"
-    }
+  "local_environment": {
+    "system": "Linux",
+    "python": "3.12.14"
   },
-  "new_models_total": 243,
-  "new_models_passed": 243,
-  "recorded_release_grammar": {
-    "check": "ANTLR grammar over every declaration/procedure unit, plus full-module packaging/linkage.",
-    "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
-    "bytes": 666337,
+  "model_results": {
+    "check": "Python models/source contracts, not VBA execution",
+    "sha256": "7e8d6ee1db2d0067244fd384d42f3dce1d2f50275a664d713f5789540b1127d8",
+    "suites": [
+      {
+        "suite": "v34_settings_models.py",
+        "tests": 43,
+        "expected": 43,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_revision_models.py",
+        "tests": 35,
+        "expected": 35,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_metrics_models.py",
+        "tests": 27,
+        "expected": 27,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_fidelity_models.py",
+        "tests": 28,
+        "expected": 28,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_recovery_merge_models.py",
+        "tests": 44,
+        "expected": 44,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_recovery_proof_models.py",
+        "tests": 41,
+        "expected": 41,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v34_policy_upgrade_models.py",
+        "tests": 25,
+        "expected": 25,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v341_path_models.py",
+        "tests": 16,
+        "expected": 16,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v341_index_alias_models.py",
+        "tests": 41,
+        "expected": 41,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v35_layout_models.py",
+        "tests": 32,
+        "expected": 32,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v35_relative_models.py",
+        "tests": 48,
+        "expected": 48,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_recovery_continuity_models.py",
+        "tests": 39,
+        "expected": 39,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_layout_binding_models.py",
+        "tests": 57,
+        "expected": 57,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_review_guidance_models.py",
+        "tests": 46,
+        "expected": 46,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v351_selection_models.py",
+        "tests": 36,
+        "expected": 36,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "test_hresult_contract.py",
+        "tests": 21,
+        "expected": 21,
+        "passed": true,
+        "exit_code": 0
+      },
+      {
+        "suite": "v352_startup_models.py",
+        "tests": 31,
+        "expected": 31,
+        "passed": true,
+        "exit_code": 0
+      }
+    ],
+    "passed": 610,
+    "expected": 610,
+    "failed_suites": 0,
+    "outlook_runtime": "NOT_RUN",
+    "real_100000_benchmark": "NOT_RUN"
+  },
+  "validator_mutations": {
+    "tests": 47,
+    "passed": 47,
+    "skipped": 0,
+    "result": "PASS",
+    "command": "python -B -m unittest discover -s development -p test_validation_tools.py"
+  },
+  "total_executed_tests": 657,
+  "structural_results": {
+    "check": "Project structural checks; NOT Outlook VBA compilation or runtime",
+    "sha256": "7e8d6ee1db2d0067244fd384d42f3dce1d2f50275a664d713f5789540b1127d8",
+    "bytes": 749746,
+    "errors": [],
+    "platforms": {
+      "vba7_32": {
+        "errors": [],
+        "warnings": [],
+        "procedures": 537,
+        "public_entries": [
+          "MB_01_RunBackup"
+        ],
+        "max_line_continuations": 18,
+        "largest_procedure": {
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 19130,
+          "physical_lines": 295
+        }
+      },
+      "vba7_64": {
+        "errors": [],
+        "warnings": [],
+        "procedures": 537,
+        "public_entries": [
+          "MB_01_RunBackup"
+        ],
+        "max_line_continuations": 18,
+        "largest_procedure": {
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 19130,
+          "physical_lines": 295
+        }
+      },
+      "legacy32": {
+        "errors": [],
+        "warnings": [],
+        "procedures": 537,
+        "public_entries": [
+          "MB_01_RunBackup"
+        ],
+        "max_line_continuations": 18,
+        "largest_procedure": {
+          "name": "MBS_NativeRecoverySelfTest",
+          "source_bytes": 19130,
+          "physical_lines": 295
+        }
+      }
+    },
+    "physical_lines": 14765,
+    "max_physical_line": 326
+  },
+  "ci_configuration": {
+    "file": ".github/workflows/validate.yml",
+    "matrix": {
+      "os": [
+        "ubuntu-latest",
+        "windows-latest"
+      ],
+      "python": [
+        "3.10",
+        "3.14"
+      ]
+    },
+    "results_source": "GitHub Actions results attached to the exact commit; configuration alone is not a passing run."
+  },
+  "not_run": [
+    "Actual Outlook VBA compiler/import",
+    "Outlook/MAPI real archive compatibility",
+    "Native disposable selftests in Outlook, including relative journal codec",
+    "Windows junction/Win32 file handles/HKCU runtime",
+    "Real 100000-mail end-to-end performance",
+    "Actual power-loss/filesystem hardware durability",
+    "Full arbitrary MAPI fidelity"
+  ],
+  "format_contract": {
+    "new_record_schema": "MBS4",
+    "readable_older_schemas": [
+      "MBS2",
+      "MBS3"
+    ],
+    "relative_field": "account-relative file path",
+    "absolute_bindings_retained": [
+      "account root",
+      "managed root/locator",
+      "historical move and recovery proof"
+    ],
+    "owner": "OutlookMailBackup.Schema4.Modern or OutlookMailBackup.Schema4.Legacy",
+    "older_writers": "Unsupported after upgrade",
+    "previous_owner_readable": "OutlookMailBackup.Schema4"
+  },
+  "layout": {
+    "new": {
+      "managed": "MailBackup",
+      "state": "State",
+      "recovery": "_Recovery"
+    },
+    "legacy": {
+      "managed": "SafeV2",
+      "state": "_MailBackup_Data",
+      "recovery": "_MailBackup_Recovery"
+    },
+    "msg": "account/yyyy/mm/*.msg",
+    "selection": "Explicit owner layout with checked HKCU copy and exact surviving state/recovery evidence; name is only the fresh-root default."
+  },
+  "historical_reports": [
+    "docs/history/validation-v3.4.0.json",
+    "docs/history/validation-v3.5.0.json",
+    "docs/history/validation-v3.5.1.json"
+  ],
+  "independent_review": {
+    "startup_retry_and_original_mail_safety": "reviewed-no-additional-blockers; source review only",
+    "hresult_contract": "primary Microsoft CVErr/VARIANT contract review; native NOT_RUN"
+  },
+  "prior_user_report": {
+    "status": "USER_REPORTED",
+    "reported_after_release": "3.5.1",
+    "installed_version": "UNCONFIRMED",
+    "message": "fail; failed checks=1, remain NOT_RUN",
+    "failed_check": "UNKNOWN",
+    "acceptance_report_received": false,
+    "same_cause_as_cverr_defect": "UNCONFIRMED"
+  },
+  "startup_recovery": {
+    "maximum_attempts": 2,
+    "original_mail_mutation": false,
+    "archive_reset": false,
+    "existing_report_deletion": false,
+    "cancel_prevents_retry": true,
+    "unclean_resources_prevent_retry": true,
+    "path_candidates": [
+      "LOCALAPPDATA",
+      "TEMP"
+    ],
+    "terminal_diagnostics": "check/detail popup and best-effort Notepad startup.txt",
+    "target_outlook_runtime": "NOT_RUN"
+  },
+  "grammar_results": {
+    "check": "ANTLR grammar over changed/new procedures and full selected declarations only.",
+    "sha256": "7e8d6ee1db2d0067244fd384d42f3dce1d2f50275a664d713f5789540b1127d8",
+    "bytes": 749746,
+    "baseline_commit": "188213b2458b4f9e1688caeebf4a932b70f33fc0",
     "results": [
       {
+        "configuration": "VBA7_x86",
         "platform": {
           "vba7": true,
           "win64": false,
           "win32": true,
           "mac": false
         },
-        "units": 478,
-        "ll_fallbacks": 277,
-        "errors": [],
-        "seconds": 136.048
+        "units": 28,
+        "lexer_errors": 0,
+        "parser_errors": 0,
+        "ll_fallbacks": 16
       },
       {
+        "configuration": "VBA7_x64",
         "platform": {
           "vba7": true,
           "win64": true,
           "win32": true,
           "mac": false
         },
-        "units": 478,
-        "ll_fallbacks": 277,
-        "errors": [],
-        "seconds": 63.775
+        "units": 28,
+        "lexer_errors": 0,
+        "parser_errors": 0,
+        "ll_fallbacks": 16
       },
       {
+        "configuration": "legacy32",
         "platform": {
           "vba7": false,
           "win64": false,
           "win32": true,
           "mac": false
         },
-        "units": 478,
-        "ll_fallbacks": 277,
-        "errors": [],
-        "seconds": 59.163
+        "units": 28,
+        "lexer_errors": 0,
+        "parser_errors": 0,
+        "ll_fallbacks": 16
       }
     ],
-    "office_compile": "NOT_RUN"
-  },
-  "recorded_release_static": {
-    "32": {
-      "check": "static symbol linkage and packaging, NOT VBA compile",
-      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
-      "bytes": 666337,
-      "lines": 13274,
-      "platform": "vba7_32",
-      "non_crlf_newlines": 0,
-      "max_line": 326,
-      "max_line_continuations": 18,
-      "excessive_continuations_at": [],
-      "undefined_mb_symbols": [],
-      "undefined_module_globals": [],
-      "duplicate_procedures": [],
-      "public_macros": [
-        "MB_01_RunBackup"
-      ],
-      "standalone_end": false
-    },
-    "64": {
-      "check": "static symbol linkage and packaging, NOT VBA compile",
-      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
-      "bytes": 666337,
-      "lines": 13274,
-      "platform": "vba7_64",
-      "non_crlf_newlines": 0,
-      "max_line": 326,
-      "max_line_continuations": 18,
-      "excessive_continuations_at": [],
-      "undefined_mb_symbols": [],
-      "undefined_module_globals": [],
-      "duplicate_procedures": [],
-      "public_macros": [
-        "MB_01_RunBackup"
-      ],
-      "standalone_end": false
-    },
-    "legacy": {
-      "check": "static symbol linkage and packaging, NOT VBA compile",
-      "sha256": "6507232ed10a58d93a88b1af46f8dde89d7d63c198293e0875b98c42eb9811db",
-      "bytes": 666337,
-      "lines": 13274,
-      "platform": "legacy32",
-      "non_crlf_newlines": 0,
-      "max_line": 306,
-      "max_line_continuations": 18,
-      "excessive_continuations_at": [],
-      "undefined_mb_symbols": [],
-      "undefined_module_globals": [],
-      "duplicate_procedures": [],
-      "public_macros": [
-        "MB_01_RunBackup"
-      ],
-      "standalone_end": false
-    }
-  },
-  "grammar_and_static_reproducibility": "These recorded release checks used a separate ANTLR grammar environment. The grammar runtime, generated parser and historical check scripts are not bundled here; tools/test.py only runs the seven Python model/source-contract suites.",
-  "recorded_retained_regressions": {
-    "v33_integrity": 31,
-    "recovery": 18,
-    "v33_audit": 16,
-    "operating": {
-      "passed": 17,
-      "superseded_skipped": 1
-    },
-    "v33_store_binding": 12,
-    "v33_stage_repair": 10,
-    "names": 17,
-    "assertion_suites": {
-      "acceptance": 732,
-      "compatibility": 85,
-      "year_month": 140,
-      "v31_integrity": 18015,
-      "legacy_with_V3_V2_compatibility": 96,
-      "locale": 256,
-      "identity": 61
-    }
-  },
-  "retained_regression_reproducibility": "Historical regression results are recorded for context. Those older suites are not included in this initial repository package and are not counted in the 243 reproducible release tests.",
-  "implemented_native_disposable_checks": "Windows-only, invoked by the single macro before real archive work; includes ancillary-only loss and interrupted overlay resume plus fidelity cases",
-  "not_run": [
-    "Actual Outlook VBA compiler/import",
-    "Outlook/MAPI real archive compatibility",
-    "Win32/HKCU/FSO runtime",
-    "Native disposable selftests in Outlook",
-    "Real100000item end-to-end performance",
-    "Actual power-loss/filesystem hardware durability",
-    "Full arbitrary MAPI fidelity"
-  ],
-  "known_deliberate_review_boundaries": [
-    "Conflicting historical expected bytes",
-    "Unknown checked schemas/orphan semantic references",
-    "Unproven partial stage records",
-    "Divergent or odd-byte move/journal history",
-    "Legacy interrupted restore with unbound preserved proof",
-    "Foreign StoreID and conflicting ownership",
-    "Unmatched old mail under conservative cutoff",
-    "UserProperties equality and unsupported special attachments"
-  ]
+    "checked_units": [
+      "<module declarations>",
+      "mb_01_runbackup",
+      "mbt_runstartupchecks",
+      "mbt_canretry",
+      "mbt_resourcesclean",
+      "mbt_notecleanup",
+      "mbt_finishnativeattempt",
+      "mbt_tempparent",
+      "mbt_testparent",
+      "mbt_selecttestparent",
+      "mbt_tryscratchparent",
+      "mbt_createacceptancereport",
+      "mbt_tryreport",
+      "mbt_writestartupnote",
+      "mbt_opendiagnostic",
+      "mbt_showstartupfailure",
+      "mbt_runacceptancereport",
+      "mbt_reportrow",
+      "mbt_syntheticmsgselftest",
+      "mbt_helperselftest",
+      "mbl_errorhresult",
+      "mbl_hresulterror",
+      "mbl_missingproperty",
+      "mbl_propertyselftest",
+      "mbt_yearmonthselftest",
+      "mbh_hashselftest",
+      "mbs_nativerecoveryselftest",
+      "mbe_categoryselftest"
+    ],
+    "scope": "Not Microsoft Office compilation, binding/type checking, Outlook execution, or full-module reparse.",
+    "seconds": 17.539,
+    "office_compile": "NOT_RUN",
+    "reproduction": "Supplemental existing external ANTLR parser; not bundled and not run by tools/verify.py."
+  }
 }

@@ -1,0 +1,35 @@
+VERIFY: tools/build.py --check
+PASS: byte-identical BAS (732,134 bytes)
+SHA256: d58d92fa35541d8ccbcacb6e91aef14317973d3cbaa93e1819b15a87b4a39349
+VERIFY: tools/validate.py
+PASS: vba7_32: 521 procedures
+PASS: vba7_64: 521 procedures
+PASS: legacy32: 521 procedures
+Outlook VBA compiler/runtime: NOT_RUN
+VERIFY: tools/release_evidence.py
+PASS: current release metadata/evidence refers to the shipped BAS
+VERIFY: -m unittest discover -s development -p test_validation_tools.py
+...............................................
+----------------------------------------------------------------------
+Ran 47 tests in 0.049s
+
+OK
+VERIFY: tools/test.py
+PASS: v34_settings_models.py: 43/43
+PASS: v34_revision_models.py: 35/35
+PASS: v34_metrics_models.py: 27/27
+PASS: v34_fidelity_models.py: 28/28
+PASS: v34_recovery_merge_models.py: 44/44
+PASS: v34_recovery_proof_models.py: 41/41
+PASS: v34_policy_upgrade_models.py: 25/25
+PASS: v341_path_models.py: 16/16
+PASS: v341_index_alias_models.py: 41/41
+PASS: v35_layout_models.py: 32/32
+PASS: v35_relative_models.py: 48/48
+PASS: v351_recovery_continuity_models.py: 39/39
+PASS: v351_layout_binding_models.py: 57/57
+PASS: v351_review_guidance_models.py: 46/46
+PASS: v351_selection_models.py: 36/36
+Release models: 558/558 passed; 0 failed suites.
+Outlook VBA compilation/runtime and real 100,000-mail benchmark: NOT_RUN.
+Repository gates: PASS. Actual Outlook compilation/runtime: NOT_RUN.
